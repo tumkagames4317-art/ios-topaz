@@ -676,7 +676,6 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
  #include <sys/topaz_wlan.h>
  
  void (*topaz_wlan_ready_hook)(void);
-
 @@ -4675,6 +5286,10 @@ wmi_rx(const uint8_t *d, uint32_t len)
  	case WMI_EV_MGMT_RX:
  		scan_mgmt_rx(d + 4, len - 4);

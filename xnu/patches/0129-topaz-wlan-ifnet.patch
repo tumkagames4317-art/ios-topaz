@@ -286,3 +286,16 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
  bool
  topaz_wlan_ready(void)
  {
+diff --git a/bsd/sys/Makefile b/bsd/sys/Makefile
+--- a/bsd/sys/Makefile
++++ b/bsd/sys/Makefile
+@@ -248,7 +248,8 @@ XNU_ONLY_EXPORTS = \
+ 	ux_exception.h \
+ 	vnode_internal.h \
+ 	vsock_domain.h \
+-	code_signing_internal.h
++	code_signing_internal.h \
++	topaz_wlan.h
+ 
+ 
+ # /usr/include
