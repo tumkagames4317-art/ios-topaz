@@ -13,11 +13,11 @@
 - WLAN: 0113–0126 bring-up; **0129–0143** stack; **0144–0146** IONetworkingFamily (`sweet_ionet` + `iokitcpp` + `.cpo` flags); **0145** `TopazWlan` is `IOEthernetController`. `tw0` still attaches unless `sweetwlanif=0`. Offline header check (below) did not find a missing KPI symbol in the previously suspected set. No IO80211 / configd confirmation / resolv apply.
 - Phone-side confirmation of input/battery/scanout/RTC/MEMFDT/WLAN is **not recorded here** (no device in this session). Prefer `SWEET TOUCH:`, `SWEET KEYS:`, `SWEET RTC:`, `SWEET WLAN:`, `assoc:`, `SWEET WLAN WPA:`, shim `MEMFDT`/`MEMSZ`.
 - `sweethw=1` still means sweet SM7150 USB MMIO — **do not enable on topaz**.
-- `gh` 2.102.0 is logged in as `turgayasuk-sketch` with `workflow` scope. Public repo `https://github.com/turgayasuk-sketch/ios-topaz`, default branch `topaz`. Kernel CI run **39378826721** is in progress on `9eea050` (patches through 0146): https://github.com/turgayasuk-sketch/ios-topaz/actions/runs/39378826721. No `xnu/out-*` downloaded yet.
+- `gh` 2.102.0 is logged in as `turgayasuk-sketch` with `workflow` scope. Public repo `https://github.com/turgayasuk-sketch/ios-topaz`, default branch `topaz`. CI **39378826721** PASSED in 7m13s (https://github.com/turgayasuk-sketch/ios-topaz/actions/runs/39378826721) but dxb skipped patches **0127–0146**. First break: `0127` corrupt (`@@ -0,0 +1,252 @@` had 203 lines). `0129` had an extra context line after `@@ -39,6 +39,7 @@`. Those two hunk counts are corrected locally; later patches still have short hunks (`0130`, `0132`, `0133`) and were not in this kernel. No `xnu/out-*` downloaded.
 
 ### Next concrete action
 
-1. CI: when run `39378826721` finishes, read the log and fix the first real compile error. Header comparison against xnu-8796.141.3 (observation, not a compile) did not justify a 0147 shim.
+1. CI: push the 0127/0129 hunk-count fixes and keep repairing skipped patches (`0130`, `0132`, `0133`, then 0144 `files.arm64`) until 0146 is actually compiled. The green run `39378826721` did not build IONetworkingFamily.
 2. Phone (after a green kernel): `sweetwlanif=0 modem=1 wifi=1`, join, confirm ioreg `IOEthernetInterface` link up when authorized and traffic on that ifnet (not `tw0`). IO80211 still closed-source.
 
 ### Docs sync (2026-10-20)

@@ -8,7 +8,7 @@ API: topaz_wlan_connect_bss(index), topaz_wlan_associated().
 diff --git a/bsd/sys/topaz_wlan.h b/bsd/sys/topaz_wlan.h
 --- a/bsd/sys/topaz_wlan.h
 +++ b/bsd/sys/topaz_wlan.h
-@@ -1,8 +1,9 @@
+@@ -1,7 +1,7 @@
  /*
   * topaz: WCN3988 radio C API (implemented in iokit/Kernel/arm/TopazModem.cpp
 - * when boot-arg wifi=1). Scan + BSS list with beacon IEs; ready hook for

@@ -227,7 +227,7 @@ new file mode 100644
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -39,6 +39,7 @@
+@@ -39,7 +39,8 @@
  extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
  extern "C" void sweet_console_retarget(vm_offset_t va);   /* osfmk/console/video_console.c */
  extern "C" void (*sweet_console_show_hook)(void);

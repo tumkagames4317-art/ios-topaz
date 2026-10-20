@@ -25,7 +25,7 @@ diff --git a/bsd/dev/sweet_rtc.c b/bsd/dev/sweet_rtc.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_rtc.c
-@@ -0,0 +1,252 @@
+@@ -0,0 +1,203 @@
 +/*
 + * topaz: PM6125 RTC (qcom,pm8941-rtc at SPMI 0x6000). Read-only wall clock
 + * for XNU PEGetUTCTimeOfDay / calendar init. SPMI MMIO matches patch 0087
@@ -252,7 +252,7 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
 --- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
 +++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-@@ -16,12 +16,36 @@
+@@ -16,12 +16,37 @@
  	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
  	void processTopLevel(IORegistryEntry *root) APPLE_KEXT_OVERRIDE;
  	const char *deleteList(void) APPLE_KEXT_OVERRIDE;
