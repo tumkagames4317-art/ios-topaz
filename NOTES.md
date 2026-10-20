@@ -13,11 +13,11 @@
 - WLAN: 0113–0126 bring-up; **0129–0143** stack; **0144–0146** IONetworkingFamily (`sweet_ionet` + `iokitcpp` + `.cpo` flags); **0145** `TopazWlan` is `IOEthernetController`. `tw0` still attaches unless `sweetwlanif=0`. Offline header check (below) did not find a missing KPI symbol in the previously suspected set. No IO80211 / configd confirmation / resolv apply.
 - Phone-side confirmation of input/battery/scanout/RTC/MEMFDT/WLAN is **not recorded here** (no device in this session). Prefer `SWEET TOUCH:`, `SWEET KEYS:`, `SWEET RTC:`, `SWEET WLAN:`, `assoc:`, `SWEET WLAN WPA:`, shim `MEMFDT`/`MEMSZ`.
 - `sweethw=1` still means sweet SM7150 USB MMIO — **do not enable on topaz**.
-- Local artifacts / flashed image versions: **unknown in this workspace** (no `xnu/out-*`). `gh` 2.102.0 is logged in as `turgayasuk-sketch` with `workflow` scope. Public repo `https://github.com/turgayasuk-sketch/ios-topaz`, default branch `topaz`. First push `c6940af` did not start Actions: `workflow_dispatch` was not registered yet, and the `main` push had an empty diff against `topaz`, so the path filter skipped it.
+- `gh` 2.102.0 is logged in as `turgayasuk-sketch` with `workflow` scope. Public repo `https://github.com/turgayasuk-sketch/ios-topaz`, default branch `topaz`. Kernel CI run **39378826721** is in progress on `9eea050` (patches through 0146): https://github.com/turgayasuk-sketch/ios-topaz/actions/runs/39378826721. No `xnu/out-*` downloaded yet.
 
 ### Next concrete action
 
-1. CI: read the `xnu` Actions run on `topaz` (workflow now also triggers on push to `topaz`) and fix the first real compile error. Header comparison against xnu-8796.141.3 (observation, not a compile) did not justify a 0147 shim.
+1. CI: when run `39378826721` finishes, read the log and fix the first real compile error. Header comparison against xnu-8796.141.3 (observation, not a compile) did not justify a 0147 shim.
 2. Phone (after a green kernel): `sweetwlanif=0 modem=1 wifi=1`, join, confirm ioreg `IOEthernetInterface` link up when authorized and traffic on that ifnet (not `tw0`). IO80211 still closed-source.
 
 ### Docs sync (2026-10-20)
