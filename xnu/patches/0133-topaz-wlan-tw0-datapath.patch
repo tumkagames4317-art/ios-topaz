@@ -82,7 +82,7 @@ diff --git a/bsd/dev/topaz_wlan_if.c b/bsd/dev/topaz_wlan_if.c
  	    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
  }
  
-@@ -128,6 +147,39 @@ tw_on_ready(void)
+@@ -128,6 +147,37 @@ tw_on_ready(void)
  	tw_attach_ifnet();
  }
  
@@ -143,7 +143,7 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
  
  #define CMD_VDEV_START      0x5003
  #define CMD_VDEV_UP         0x5005
-@@ -5165,54 +5166,120 @@ topaz_wlan_install_key(bool group, unsigned key_idx, unsigned cipher,
+@@ -5165,48 +5166,102 @@ topaz_wlan_install_key(bool group, unsigned key_idx, unsigned cipher,
  static void
  assoc_on_rx_msdu(const uint8_t *frame, uint32_t len)
  {
@@ -288,7 +288,7 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
  }
  
  /* HTT native-wifi TX (topaz-woa htt.c TxOne); EAPOL / data once associated. */
-@@ -5280,6 +5346,48 @@ topaz_wlan_tx(const uint8_t *frame, unsigned len)
+@@ -5280,6 +5346,43 @@ topaz_wlan_tx(const uint8_t *frame, unsigned len)
  	return true;
  }
  

@@ -806,7 +806,7 @@ new file mode 100644
 diff --git a/bsd/conf/files b/bsd/conf/files
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,7 @@ bsd/dev/sweet_rtc.c			standard
+@@ -109,4 +109,5 @@ bsd/dev/sweet_rtc.c			standard
  bsd/dev/topaz_wlan_if.c			standard
 +bsd/dev/topaz_wlan_wpa.c			standard
  bsd/dev/sweet_cpufreq.c			standard
@@ -816,7 +816,7 @@ diff --git a/bsd/conf/files b/bsd/conf/files
 diff --git a/bsd/sys/topaz_wlan.h b/bsd/sys/topaz_wlan.h
 --- a/bsd/sys/topaz_wlan.h
 +++ b/bsd/sys/topaz_wlan.h
-@@ -1,9 +1,9 @@
+@@ -1,8 +1,8 @@
  /*
   * topaz: WCN3988 radio C API (implemented in iokit/Kernel/arm/TopazModem.cpp
   * when boot-arg wifi=1). Scan + BSS list with beacon IEs; open-network
@@ -830,7 +830,7 @@ diff --git a/bsd/sys/topaz_wlan.h b/bsd/sys/topaz_wlan.h
 diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
 --- a/iokit/Kernel/arm/TopazModem.cpp
 +++ b/iokit/Kernel/arm/TopazModem.cpp
-@@ -4586,6 +4586,7 @@
+@@ -4586,7 +4586,8 @@
  	    b->bssid[2], b->chan, b->rssi, b->ssid);
  }
  
@@ -839,14 +839,14 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
  
  #define CMD_VDEV_START      0x5003
  #define CMD_VDEV_UP         0x5005
-@@ -4888,6 +4889,7 @@ a_teardown(void)
+@@ -4888,5 +4889,6 @@ a_teardown(void)
  	}
  	a_state = A_IDLE;
  	a_up = false;
  	a_ptk = false;
 +	topaz_wlan_wpa_reset();
  }
-@@ -4965,6 +4967,16 @@ a_on_up(void)
+@@ -4965,5 +4967,14 @@ a_on_up(void)
  	a_state = A_UP;
  	a_up = true;
  	LOG("t=%u ms: *** associated aid %u (%s) ***", g_ms, a_aid,
@@ -870,7 +870,7 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
  			    g_ms, (unsigned)strlen(a_boot_psk));
  		} else {
  			a_boot_psk_set = false;
-@@ -5165,12 +5177,54 @@ topaz_wlan_install_key(bool group, unsigned key_idx, unsigned cipher,
+@@ -5165,9 +5177,46 @@ topaz_wlan_install_key(bool group, unsigned key_idx, unsigned cipher,
  static void
  assoc_on_rx_msdu(const uint8_t *frame, uint32_t len)
  {
