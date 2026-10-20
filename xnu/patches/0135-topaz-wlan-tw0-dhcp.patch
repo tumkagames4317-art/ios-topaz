@@ -1,0 +1,552 @@
+Subject: [PATCH] topaz-0135: in-kernel DHCP client for tw0 (wifiip=dhcp)
+
+When wifiip=dhcp (or wifidhcp=1), after authorize send DISCOVER/REQUEST
+over HTT ethernet, parse OFFER/ACK on RX, then SIOCAIFADDR like 0134.
+Retransmit via topaz_wlan_if_poll(g_ms) from the modem radio thread.
+diff --git a/bsd/sys/topaz_wlan.h b/bsd/sys/topaz_wlan.h
+--- a/bsd/sys/topaz_wlan.h
++++ b/bsd/sys/topaz_wlan.h
+@@ -2,7 +2,7 @@
+  * topaz: WCN3988 radio C API (implemented in iokit/Kernel/arm/TopazModem.cpp
+  * when boot-arg wifi=1). Scan + BSS list with beacon IEs; open-network
+  * association (0130); WPA2-PSK assoc + key install (0131); ready hook for
+- * ifnet tw0 datapath (0133) + wifiip= (0134); 4-way when wifipsk= (0132).
++ * ifnet tw0 + wifiip=/dhcp (0133-0135); 4-way when wifipsk= (0132).
+  */
+ #ifndef _BSD_SYS_TOPAZ_WLAN_H_
+ #define _BSD_SYS_TOPAZ_WLAN_H_
+@@ -41,6 +41,7 @@ bool topaz_wlan_tx_ethernet(const uint8_t *eth, unsigned len);
+ void topaz_wlan_if_init(void);
+ void topaz_wlan_if_input(const uint8_t *eth, unsigned len);
+ void topaz_wlan_if_on_authorized(void); /* apply wifiip= after PTK/open */
++void topaz_wlan_if_poll(uint32_t ms); /* DHCP retransmit */
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/bsd/dev/topaz_wlan_if.c b/bsd/dev/topaz_wlan_if.c
+--- a/bsd/dev/topaz_wlan_if.c
++++ b/bsd/dev/topaz_wlan_if.c
+@@ -1,6 +1,6 @@
+ /*
+  * topaz: ifnet tw0 when TopazModem WLAN radio is ready.
+- * 0133: HTT ethernet datapath. 0134: optional wifiip=/wifimask=/wifigw=.
++ * 0133: HTT ethernet. 0134: wifiip= static. 0135: wifiip=dhcp client.
+  * sweetwlanif=0 skips. Datapath needs assoc (+ PTK for WPA2).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+@@ -30,6 +30,29 @@ static bool tw_hooked;
+ static bool tw_attached;
+ static bool tw_addr_done;
+ 
++enum { TW_DHCP_IDLE, TW_DHCP_DISCOVER, TW_DHCP_REQUEST, TW_DHCP_DONE };
++static int tw_dhcp_state;
++static uint32_t tw_dhcp_xid;
++static uint32_t tw_dhcp_server;   /* host order */
++static uint32_t tw_dhcp_yiaddr;   /* host order */
++static uint32_t tw_dhcp_mask;
++static uint32_t tw_dhcp_gw;
++static uint32_t tw_dhcp_last_ms;
++static unsigned tw_dhcp_tries;
++
++#define DHCP_MAGIC      0x63825363u
++#define DHCPDISCOVER    1
++#define DHCPOFFER       2
++#define DHCPREQUEST     3
++#define DHCPACK         5
++#define DHCP_OPT_MSG    53
++#define DHCP_OPT_REQIP  50
++#define DHCP_OPT_SERVER 54
++#define DHCP_OPT_MASK   1
++#define DHCP_OPT_ROUTER 3
++#define DHCP_OPT_END    255
++#define DHCP_RETRANS_MS 3000
++
+ static int
+ tw_parse_ipv4(const char *s, uint32_t *host_order)
+ {
+@@ -75,41 +98,38 @@ tw_parse_ipv4(const char *s, uint32_t *host_order)
+ 	return 0;
+ }
+ 
++static uint16_t
++tw_ip_cksum(const void *data, unsigned len)
++{
++	const uint16_t *w = (const uint16_t *)data;
++	uint32_t sum = 0;
++
++	while (len > 1) {
++		sum += ntohs(*w++);
++		len -= 2;
++	}
++	if (len != 0) {
++		sum += *(const uint8_t *)w << 8;
++	}
++	while (sum >> 16) {
++		sum = (sum & 0xffff) + (sum >> 16);
++	}
++	return htons((uint16_t)~sum);
++}
++
+ static void
+-tw_configure_ipv4(void)
++tw_apply_ipv4(uint32_t ip, uint32_t mask, uint32_t gw)
+ {
+-	char ipstr[32], maskstr[32], gwstr[32];
+-	uint32_t ip = 0, mask = 0xffffff00, gw = 0;
+ 	errno_t err;
+ 	socket_t so = NULL;
+ 	struct ifaliasreq ifra;
+ 	struct sockaddr_in *sin;
+ 
+-	if (!tw_attached || tw_ifp == NULL || tw_addr_done) {
+-		return;
+-	}
+-	if (!PE_parse_boot_argn("wifiip", ipstr, sizeof(ipstr)) ||
+-	    ipstr[0] == '\0') {
+-		printf("SWEET WLAN: no wifiip= (tw0 link only)\n");
++	if (!tw_attached || tw_ifp == NULL || tw_addr_done || ip == 0) {
+ 		return;
+ 	}
+-	if (tw_parse_ipv4(ipstr, &ip) != 0) {
+-		printf("SWEET WLAN: bad wifiip='%s'\n", ipstr);
+-		return;
+-	}
+-	if (PE_parse_boot_argn("wifimask", maskstr, sizeof(maskstr)) &&
+-	    maskstr[0] != '\0') {
+-		if (tw_parse_ipv4(maskstr, &mask) != 0) {
+-			printf("SWEET WLAN: bad wifimask='%s'\n", maskstr);
+-			return;
+-		}
+-	}
+-	if (PE_parse_boot_argn("wifigw", gwstr, sizeof(gwstr)) &&
+-	    gwstr[0] != '\0') {
+-		if (tw_parse_ipv4(gwstr, &gw) != 0) {
+-			printf("SWEET WLAN: bad wifigw='%s'\n", gwstr);
+-			gw = 0;
+-		}
++	if (mask == 0) {
++		mask = 0xffffff00;
+ 	}
+ 
+ 	err = proto_plumb(PF_INET, tw_ifp);
+@@ -158,6 +178,7 @@ tw_configure_ipv4(void)
+ 	ifnet_set_flags(tw_ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
+ 	if (err == 0) {
+ 		tw_addr_done = true;
++		tw_dhcp_state = TW_DHCP_DONE;
+ 		printf("SWEET WLAN: tw0 %u.%u.%u.%u mask %u.%u.%u.%u%s\n",
+ 		    (ip >> 24) & 0xff, (ip >> 16) & 0xff, (ip >> 8) & 0xff, ip & 0xff,
+ 		    (mask >> 24) & 0xff, (mask >> 16) & 0xff, (mask >> 8) & 0xff,
+@@ -167,6 +188,304 @@ tw_configure_ipv4(void)
+ 	}
+ }
+ 
++static void
++tw_dhcp_send(uint8_t msgtype)
++{
++	uint8_t frame[14 + 20 + 8 + 300];
++	uint8_t mac[6];
++	uint8_t *ip, *udp, *boot, *opt;
++	unsigned iplen, udplen, bootlen;
++
++	if (!topaz_wlan_authorized()) {
++		return;
++	}
++	topaz_wlan_address(mac);
++	bzero(frame, sizeof(frame));
++
++	/* Ethernet broadcast */
++	memset(frame, 0xff, 6);
++	memcpy(frame + 6, mac, 6);
++	frame[12] = 0x08;
++	frame[13] = 0x00;
++
++	ip = frame + 14;
++	udp = ip + 20;
++	boot = udp + 8;
++
++	boot[0] = 1; /* BOOTREQUEST */
++	boot[1] = 1; /* Ethernet */
++	boot[2] = 6;
++	boot[3] = 0;
++	boot[4] = (uint8_t)(tw_dhcp_xid >> 24);
++	boot[5] = (uint8_t)(tw_dhcp_xid >> 16);
++	boot[6] = (uint8_t)(tw_dhcp_xid >> 8);
++	boot[7] = (uint8_t)tw_dhcp_xid;
++	boot[10] = 0x80; /* broadcast flag */
++	memcpy(boot + 28, mac, 6);
++	/* options at offset 236 */
++	opt = boot + 236;
++	opt[0] = 99;
++	opt[1] = 130;
++	opt[2] = 83;
++	opt[3] = 99;
++	opt += 4;
++	*opt++ = DHCP_OPT_MSG;
++	*opt++ = 1;
++	*opt++ = msgtype;
++	if (msgtype == DHCPREQUEST) {
++		uint32_t yi = htonl(tw_dhcp_yiaddr);
++		uint32_t sid = htonl(tw_dhcp_server);
++
++		*opt++ = DHCP_OPT_REQIP;
++		*opt++ = 4;
++		memcpy(opt, &yi, 4);
++		opt += 4;
++		*opt++ = DHCP_OPT_SERVER;
++		*opt++ = 4;
++		memcpy(opt, &sid, 4);
++		opt += 4;
++	}
++	*opt++ = 55; /* parameter request list */
++	*opt++ = 3;
++	*opt++ = DHCP_OPT_MASK;
++	*opt++ = DHCP_OPT_ROUTER;
++	*opt++ = 6; /* DNS, ignored */
++	*opt++ = DHCP_OPT_END;
++	bootlen = (unsigned)(opt - boot);
++	if (bootlen < 300) {
++		bootlen = 300;
++	}
++
++	udplen = 8 + bootlen;
++	udp[0] = 0;
++	udp[1] = 68;
++	udp[2] = 0;
++	udp[3] = 67;
++	udp[4] = (uint8_t)(udplen >> 8);
++	udp[5] = (uint8_t)udplen;
++	udp[6] = 0;
++	udp[7] = 0; /* UDP checksum optional */
++
++	iplen = 20 + udplen;
++	ip[0] = 0x45;
++	ip[2] = (uint8_t)(iplen >> 8);
++	ip[3] = (uint8_t)iplen;
++	ip[8] = 64;
++	ip[9] = IPPROTO_UDP;
++	/* src 0.0.0.0 dst 255.255.255.255 */
++	ip[16] = ip[17] = ip[18] = ip[19] = 0xff;
++	ip[10] = ip[11] = 0;
++	{
++		uint16_t csum = tw_ip_cksum(ip, 20);
++
++		memcpy(ip + 10, &csum, 2);
++	}
++
++	if (!topaz_wlan_tx_ethernet(frame, 14 + iplen)) {
++		printf("SWEET WLAN: DHCP %s TX failed\n",
++		    msgtype == DHCPDISCOVER ? "DISCOVER" : "REQUEST");
++		return;
++	}
++	printf("SWEET WLAN: DHCP %s sent (try %u)\n",
++	    msgtype == DHCPDISCOVER ? "DISCOVER" : "REQUEST", tw_dhcp_tries);
++}
++
++static void
++tw_dhcp_parse_options(const uint8_t *opt, unsigned len, uint8_t *msg,
++    uint32_t *mask, uint32_t *gw, uint32_t *server)
++{
++	unsigned i = 0;
++
++	*msg = 0;
++	while (i + 1 < len) {
++		uint8_t code = opt[i++];
++		uint8_t olen;
++
++		if (code == DHCP_OPT_END) {
++			break;
++		}
++		if (code == 0) {
++			continue;
++		}
++		if (i >= len) {
++			break;
++		}
++		olen = opt[i++];
++		if (i + olen > len) {
++			break;
++		}
++		if (code == DHCP_OPT_MSG && olen >= 1) {
++			*msg = opt[i];
++		} else if (code == DHCP_OPT_MASK && olen >= 4) {
++			*mask = (opt[i] << 24) | (opt[i + 1] << 16) |
++			    (opt[i + 2] << 8) | opt[i + 3];
++		} else if (code == DHCP_OPT_ROUTER && olen >= 4) {
++			*gw = (opt[i] << 24) | (opt[i + 1] << 16) |
++			    (opt[i + 2] << 8) | opt[i + 3];
++		} else if (code == DHCP_OPT_SERVER && olen >= 4) {
++			*server = (opt[i] << 24) | (opt[i + 1] << 16) |
++			    (opt[i + 2] << 8) | opt[i + 3];
++		}
++		i += olen;
++	}
++}
++
++/* Returns true if the frame was a DHCP reply we consumed. */
++static bool
++tw_dhcp_rx(const uint8_t *eth, unsigned len)
++{
++	const uint8_t *ip, *udp, *boot, *opt;
++	unsigned iplen, udplen;
++	uint32_t xid, yiaddr, mask = 0xffffff00, gw = 0, server = 0;
++	uint8_t msg = 0;
++
++	if (tw_dhcp_state != TW_DHCP_DISCOVER && tw_dhcp_state != TW_DHCP_REQUEST) {
++		return false;
++	}
++	if (len < 14 + 20 + 8 + 240) {
++		return false;
++	}
++	if (eth[12] != 0x08 || eth[13] != 0x00) {
++		return false;
++	}
++	ip = eth + 14;
++	if ((ip[0] & 0xf0) != 0x40 || ip[9] != IPPROTO_UDP) {
++		return false;
++	}
++	iplen = ((unsigned)ip[0] & 0x0f) * 4;
++	if (len < 14 + iplen + 8) {
++		return false;
++	}
++	udp = ip + iplen;
++	if (udp[2] != 0 || udp[3] != 68) { /* dport 68 */
++		return false;
++	}
++	udplen = ((unsigned)udp[4] << 8) | udp[5];
++	if (udplen < 8 + 240 || 14 + iplen + udplen > len) {
++		return false;
++	}
++	boot = udp + 8;
++	if (boot[0] != 2) { /* BOOTREPLY */
++		return false;
++	}
++	xid = ((uint32_t)boot[4] << 24) | ((uint32_t)boot[5] << 16) |
++	    ((uint32_t)boot[6] << 8) | boot[7];
++	if (xid != tw_dhcp_xid) {
++		return false;
++	}
++	yiaddr = ((uint32_t)boot[16] << 24) | ((uint32_t)boot[17] << 16) |
++	    ((uint32_t)boot[18] << 8) | boot[19];
++	opt = boot + 236;
++	if (opt[0] != 99 || opt[1] != 130 || opt[2] != 83 || opt[3] != 99) {
++		return false;
++	}
++	tw_dhcp_parse_options(opt + 4, udplen - 8 - 240, &msg, &mask, &gw, &server);
++
++	if (msg == DHCPOFFER && tw_dhcp_state == TW_DHCP_DISCOVER) {
++		tw_dhcp_yiaddr = yiaddr;
++		tw_dhcp_server = server != 0 ? server :
++		    ((uint32_t)ip[12] << 24) | ((uint32_t)ip[13] << 16) |
++		    ((uint32_t)ip[14] << 8) | ip[15];
++		tw_dhcp_mask = mask;
++		tw_dhcp_gw = gw;
++		tw_dhcp_state = TW_DHCP_REQUEST;
++		tw_dhcp_tries = 0;
++		tw_dhcp_last_ms = 0;
++		printf("SWEET WLAN: DHCP OFFER %u.%u.%u.%u from %u.%u.%u.%u\n",
++		    (yiaddr >> 24) & 0xff, (yiaddr >> 16) & 0xff,
++		    (yiaddr >> 8) & 0xff, yiaddr & 0xff,
++		    (tw_dhcp_server >> 24) & 0xff, (tw_dhcp_server >> 16) & 0xff,
++		    (tw_dhcp_server >> 8) & 0xff, tw_dhcp_server & 0xff);
++		tw_dhcp_tries = 1;
++		tw_dhcp_send(DHCPREQUEST);
++		return true;
++	}
++	if (msg == DHCPACK && tw_dhcp_state == TW_DHCP_REQUEST) {
++		if (mask == 0xffffff00 && tw_dhcp_mask != 0) {
++			mask = tw_dhcp_mask;
++		}
++		if (gw == 0) {
++			gw = tw_dhcp_gw;
++		}
++		printf("SWEET WLAN: DHCP ACK %u.%u.%u.%u\n",
++		    (yiaddr >> 24) & 0xff, (yiaddr >> 16) & 0xff,
++		    (yiaddr >> 8) & 0xff, yiaddr & 0xff);
++		tw_apply_ipv4(yiaddr, mask != 0 ? mask : tw_dhcp_mask, gw);
++		return true;
++	}
++	return false;
++}
++
++static void
++tw_dhcp_start(uint32_t ms)
++{
++	uint8_t mac[6];
++
++	if (tw_addr_done || tw_dhcp_state == TW_DHCP_DONE) {
++		return;
++	}
++	topaz_wlan_address(mac);
++	tw_dhcp_xid = ((uint32_t)mac[2] << 24) | ((uint32_t)mac[3] << 16) |
++	    ((uint32_t)mac[4] << 8) | mac[5];
++	tw_dhcp_xid ^= ms;
++	if (tw_dhcp_xid == 0) {
++		tw_dhcp_xid = 0x544f5030; /* 'TOP0' */
++	}
++	tw_dhcp_state = TW_DHCP_DISCOVER;
++	tw_dhcp_tries = 1;
++	tw_dhcp_last_ms = 0; /* next poll() arms the retransmit timer */
++	tw_dhcp_server = tw_dhcp_yiaddr = tw_dhcp_gw = 0;
++	tw_dhcp_mask = 0xffffff00;
++	printf("SWEET WLAN: DHCP starting\n");
++	tw_dhcp_send(DHCPDISCOVER);
++}
++
++static void
++tw_configure_ipv4(void)
++{
++	char ipstr[32], maskstr[32], gwstr[32];
++	uint32_t ip = 0, mask = 0xffffff00, gw = 0;
++	int want_dhcp = 0;
++
++	if (!tw_attached || tw_ifp == NULL || tw_addr_done) {
++		return;
++	}
++	(void)PE_parse_boot_argn("wifidhcp", &want_dhcp, sizeof(want_dhcp));
++	if (PE_parse_boot_argn("wifiip", ipstr, sizeof(ipstr)) && ipstr[0] != '\0') {
++		if (strcmp(ipstr, "dhcp") == 0) {
++			want_dhcp = 1;
++		} else if (tw_parse_ipv4(ipstr, &ip) == 0) {
++			want_dhcp = 0;
++		} else {
++			printf("SWEET WLAN: bad wifiip='%s'\n", ipstr);
++			return;
++		}
++	}
++	if (want_dhcp) {
++		tw_dhcp_start(0);
++		return;
++	}
++	if (ip == 0) {
++		printf("SWEET WLAN: no wifiip= (tw0 link only; wifiip=dhcp for DHCP)\n");
++		return;
++	}
++	if (PE_parse_boot_argn("wifimask", maskstr, sizeof(maskstr)) &&
++	    maskstr[0] != '\0') {
++		if (tw_parse_ipv4(maskstr, &mask) != 0) {
++			printf("SWEET WLAN: bad wifimask='%s'\n", maskstr);
++			return;
++		}
++	}
++	if (PE_parse_boot_argn("wifigw", gwstr, sizeof(gwstr)) &&
++	    gwstr[0] != '\0') {
++		if (tw_parse_ipv4(gwstr, &gw) != 0) {
++			printf("SWEET WLAN: bad wifigw='%s'\n", gwstr);
++			gw = 0;
++		}
++	}
++	tw_apply_ipv4(ip, mask, gw);
++}
++
+ static errno_t
+ tw_output(ifnet_t ifp, mbuf_t m)
+ {
+@@ -269,7 +588,7 @@ tw_attach_ifnet(void)
+ 	ifnet_set_addrlen(tw_ifp, ETHER_ADDR_LEN);
+ 	ifnet_set_hdrlen(tw_ifp, sizeof(struct ether_header));
+ 	ifnet_set_mtu(tw_ifp, ETHERMTU);
+-	ifnet_set_baudrate(tw_ifp, 433000000); /* 802.11n-ish placeholder */
++	ifnet_set_baudrate(tw_ifp, 433000000);
+ 	ifnet_set_flags(tw_ifp, IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST, 0xffff);
+ 	if (ifnet_attach(tw_ifp, NULL) != 0) {
+ 		printf("SWEET WLAN: tw0 ifnet_attach failed\n");
+@@ -289,10 +608,6 @@ tw_attach_ifnet(void)
+ static void
+ tw_on_ready(void)
+ {
+-	/*
+-	 * Called from the modem/WLAN poll thread. Do not call topaz_wlan_scan()
+-	 * here (it sleeps waiting for that same thread). Attach only.
+-	 */
+ 	tw_attach_ifnet();
+ }
+ 
+@@ -306,6 +621,9 @@ topaz_wlan_if_input(const uint8_t *eth, unsigned len)
+ 	    len < ETHER_HDR_LEN || len > ETHER_MAX_LEN) {
+ 		return;
+ 	}
++	if (tw_dhcp_rx(eth, len)) {
++		return;
++	}
+ 	if (mbuf_allocpacket(MBUF_DONTWAIT, len, NULL, &m) != 0 || m == NULL) {
+ 		return;
+ 	}
+@@ -337,6 +655,35 @@ topaz_wlan_if_on_authorized(void)
+ 	tw_configure_ipv4();
+ }
+ 
++void
++topaz_wlan_if_poll(uint32_t ms)
++{
++	uint8_t msg;
++
++	if (tw_addr_done || !tw_attached) {
++		return;
++	}
++	if (tw_dhcp_state != TW_DHCP_DISCOVER && tw_dhcp_state != TW_DHCP_REQUEST) {
++		return;
++	}
++	if (tw_dhcp_last_ms == 0) {
++		tw_dhcp_last_ms = ms;
++		return;
++	}
++	if (ms - tw_dhcp_last_ms < DHCP_RETRANS_MS) {
++		return;
++	}
++	if (tw_dhcp_tries >= 12) {
++		printf("SWEET WLAN: DHCP gave up after %u tries\n", tw_dhcp_tries);
++		tw_dhcp_state = TW_DHCP_IDLE;
++		return;
++	}
++	msg = (tw_dhcp_state == TW_DHCP_REQUEST) ? DHCPREQUEST : DHCPDISCOVER;
++	tw_dhcp_tries++;
++	tw_dhcp_last_ms = ms;
++	tw_dhcp_send(msg);
++}
++
+ void
+ topaz_wlan_if_init(void)
+ {
+@@ -350,25 +697,15 @@ topaz_wlan_if_init(void)
+ 	}
+ 	tw_hooked = true;
+ 	topaz_wlan_ready_hook = tw_on_ready;
+-	/* Radio may already be up if init races past first scan_started. */
+ 	if (topaz_wlan_ready()) {
+ 		tw_attach_ifnet();
+ 	}
+ 	printf("SWEET WLAN: ifnet hook armed (need wifi=1)\n");
+ }
+ #else /* !ARM64_BOARD_CONFIG_SWEET */
+-void
+-topaz_wlan_if_init(void)
+-{
+-}
+-void
+-topaz_wlan_if_input(const uint8_t *eth, unsigned len)
+-{
+-	(void)eth;
+-	(void)len;
+-}
+-void
+-topaz_wlan_if_on_authorized(void)
+-{
+-}
++void topaz_wlan_if_init(void) {}
++void topaz_wlan_if_input(const uint8_t *eth, unsigned len)
++{ (void)eth; (void)len; }
++void topaz_wlan_if_on_authorized(void) {}
++void topaz_wlan_if_poll(uint32_t ms) { (void)ms; }
+ #endif
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -2,6 +2,7 @@
+ 	(void)ce_poll();
+ 	htt_poll();
+ 	assoc_poll();
++	topaz_wlan_if_poll(g_ms);
+ 	if (scan_started && !api_ready) {
+ 		api_ready = true;
+ 		LOG("t=%u ms: wlan: radio ready for the rest of the kernel", g_ms);

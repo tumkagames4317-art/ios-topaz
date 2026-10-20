@@ -1,0 +1,169 @@
+Subject: [PATCH] topaz-0140: TopazWlan IOService nub (ioreg, not IONetwork)
+
+Publish TopazWlanReady/Associated/Authorized/MAC and BSD Name=tw0 into
+the IORegistry from an IOResources-matched IOService. Poll every 2s.
+Does not satisfy configd (needs IONetworkInterface later).
+Disable with topazwlannub=0.
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -1,2 +1,3 @@
+ iokit/Kernel/arm/TopazModem.cpp                                  optional iokitcpp
++iokit/Kernel/arm/TopazWlan.cpp                                   optional iokitcpp
+ iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitcpp
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -6,6 +6,11 @@
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetBattery;"
+     "   },"
++    "   {"
++    "     'IOClass'         = TopazWlan;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = TopazWlan;"
++    "   },"
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"
+diff --git a/iokit/Kernel/arm/TopazWlan.cpp b/iokit/Kernel/arm/TopazWlan.cpp
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/TopazWlan.cpp
+@@ -0,0 +1,136 @@
++/*
++ * topaz: IOService nub publishing WCN3988 / tw0 state into the IORegistry (0140).
++ * Not an IONetworkInterface - configd/wifid still need IO80211 later.
++ * Match IOResources; poll topaz_wlan_* into properties. topazwlannub=0 skips.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++
++#include <IOKit/IOLib.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IOWorkLoop.h>
++#include <IOKit/IOTimerEventSource.h>
++#include <libkern/c++/OSBoolean.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSString.h>
++#include <libkern/c++/OSData.h>
++#include <pexpert/pexpert.h>
++#include <sys/topaz_wlan.h>
++
++class TopazWlan : public IOService {
++	OSDeclareDefaultStructors(TopazWlan);
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	void stop(IOService *provider) APPLE_KEXT_OVERRIDE;
++	void free(void) APPLE_KEXT_OVERRIDE;
++private:
++	IOWorkLoop *fLoop;
++	IOTimerEventSource *fTimer;
++	bool fTimerAdded;
++	void publish(void);
++	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
++};
++
++OSDefineMetaClassAndStructors(TopazWlan, IOService);
++
++void
++TopazWlan::publish(void)
++{
++	uint8_t mac[6];
++	char macstr[32];
++	bool ready = topaz_wlan_ready();
++	bool assoc = topaz_wlan_associated();
++	bool auth = topaz_wlan_authorized();
++
++	setProperty("TopazWlanReady", ready ? kOSBooleanTrue : kOSBooleanFalse);
++	setProperty("TopazWlanAssociated", assoc ? kOSBooleanTrue : kOSBooleanFalse);
++	setProperty("TopazWlanAuthorized", auth ? kOSBooleanTrue : kOSBooleanFalse);
++	setProperty("BSD Name", "tw0");
++
++	if (ready) {
++		topaz_wlan_address(mac);
++		snprintf(macstr, sizeof(macstr),
++		    "%02x:%02x:%02x:%02x:%02x:%02x",
++		    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
++		setProperty("TopazWlanMAC", macstr);
++		setProperty("IOMACAddress", (void *)mac, sizeof(mac));
++	}
++}
++
++void
++TopazWlan::timerFired(OSObject *owner, IOTimerEventSource *sender)
++{
++	TopazWlan *self = OSDynamicCast(TopazWlan, owner);
++
++	if (self == NULL) {
++		return;
++	}
++	self->publish();
++	if (sender != NULL) {
++		sender->setTimeoutMS(2000);
++	}
++}
++
++bool
++TopazWlan::start(IOService *provider)
++{
++	int enabled = 1;
++
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	(void)PE_parse_boot_argn("topazwlannub", &enabled, sizeof(enabled));
++	if (!enabled) {
++		IOLog("TopazWlan: disabled (topazwlannub=0)\n");
++		return false;
++	}
++
++	fLoop = NULL;
++	fTimer = NULL;
++	fTimerAdded = false;
++
++	fLoop = IOWorkLoop::workLoop();
++	if (fLoop == NULL) {
++		return false;
++	}
++	fTimer = IOTimerEventSource::timerEventSource(this, &TopazWlan::timerFired);
++	if (fTimer == NULL || fLoop->addEventSource(fTimer) != kIOReturnSuccess) {
++		return false;
++	}
++	fTimerAdded = true;
++
++	setName("TopazWlan");
++	publish();
++	registerService();
++	fTimer->setTimeoutMS(2000);
++	IOLog("TopazWlan: nub registered (ioreg; not IONetwork yet)\n");
++	return true;
++}
++
++void
++TopazWlan::stop(IOService *provider)
++{
++	if (fTimer != NULL) {
++		fTimer->cancelTimeout();
++		if (fTimerAdded && fLoop != NULL) {
++			fLoop->removeEventSource(fTimer);
++			fTimerAdded = false;
++		}
++		fTimer->release();
++		fTimer = NULL;
++	}
++	if (fLoop != NULL) {
++		fLoop->release();
++		fLoop = NULL;
++	}
++	IOService::stop(provider);
++}
++
++void
++TopazWlan::free(void)
++{
++	IOService::free();
++}
++
++#else /* !ARM64_BOARD_CONFIG_SWEET */
++static int topaz_wlan_nub_unused;
++#endif

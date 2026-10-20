@@ -1,0 +1,332 @@
+Subject: [PATCH] topaz-0136: DHCP lease T1 renew for tw0
+
+Parse option 51 (lease); at T1 (50%) send REQUEST with ciaddr
+(RENEW state). ACK refreshes the timer; NAK restarts DISCOVER.
+DNS option 6 is logged only. Retransmit still via topaz_wlan_if_poll.
+diff --git a/bsd/dev/topaz_wlan_if.c b/bsd/dev/topaz_wlan_if.c
+--- a/bsd/dev/topaz_wlan_if.c
++++ b/bsd/dev/topaz_wlan_if.c
+@@ -1,7 +1,7 @@
+ /*
+  * topaz: ifnet tw0 when TopazModem WLAN radio is ready.
+- * 0133: HTT ethernet. 0134: wifiip= static. 0135: wifiip=dhcp client.
+- * sweetwlanif=0 skips. Datapath needs assoc (+ PTK for WPA2).
++ * 0133: HTT ethernet. 0134: wifiip= static. 0135: dhcp client.
++ * 0136: dhcp lease T1 renew. sweetwlanif=0 skips.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -30,7 +30,13 @@ static bool tw_hooked;
+ static bool tw_attached;
+ static bool tw_addr_done;
+ 
+-enum { TW_DHCP_IDLE, TW_DHCP_DISCOVER, TW_DHCP_REQUEST, TW_DHCP_DONE };
++enum {
++	TW_DHCP_IDLE,
++	TW_DHCP_DISCOVER,
++	TW_DHCP_REQUEST,
++	TW_DHCP_DONE,
++	TW_DHCP_RENEW
++};
+ static int tw_dhcp_state;
+ static uint32_t tw_dhcp_xid;
+ static uint32_t tw_dhcp_server;   /* host order */
+@@ -38,20 +44,28 @@ static uint32_t tw_dhcp_yiaddr;   /* host order */
+ static uint32_t tw_dhcp_mask;
+ static uint32_t tw_dhcp_gw;
+ static uint32_t tw_dhcp_last_ms;
++static uint32_t tw_dhcp_now_ms;    /* last poll() time */
++static uint32_t tw_dhcp_lease_sec; /* option 51; 0 = unknown */
++static uint32_t tw_dhcp_t1_ms;     /* renew deadline (g_ms); 0 = none */
+ static unsigned tw_dhcp_tries;
+ 
+-#define DHCP_MAGIC      0x63825363u
+ #define DHCPDISCOVER    1
+ #define DHCPOFFER       2
+ #define DHCPREQUEST     3
+ #define DHCPACK         5
++#define DHCPNAK         6
+ #define DHCP_OPT_MSG    53
+ #define DHCP_OPT_REQIP  50
+ #define DHCP_OPT_SERVER 54
+ #define DHCP_OPT_MASK   1
+ #define DHCP_OPT_ROUTER 3
++#define DHCP_OPT_DNS    6
++#define DHCP_OPT_LEASE  51
+ #define DHCP_OPT_END    255
+ #define DHCP_RETRANS_MS 3000
++#define DHCP_DEFAULT_LEASE_SEC 3600
++
++static void tw_dhcp_start(uint32_t ms);
+ 
+ static int
+ tw_parse_ipv4(const char *s, uint32_t *host_order)
+@@ -178,7 +192,6 @@ tw_apply_ipv4(uint32_t ip, uint32_t mask, uint32_t gw)
+ 	ifnet_set_flags(tw_ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
+ 	if (err == 0) {
+ 		tw_addr_done = true;
+-		tw_dhcp_state = TW_DHCP_DONE;
+ 		printf("SWEET WLAN: tw0 %u.%u.%u.%u mask %u.%u.%u.%u%s\n",
+ 		    (ip >> 24) & 0xff, (ip >> 16) & 0xff, (ip >> 8) & 0xff, ip & 0xff,
+ 		    (mask >> 24) & 0xff, (mask >> 16) & 0xff, (mask >> 8) & 0xff,
+@@ -188,6 +201,23 @@ tw_apply_ipv4(uint32_t ip, uint32_t mask, uint32_t gw)
+ 	}
+ }
+ 
++static void
++tw_dhcp_arm_lease(uint32_t now_ms, uint32_t lease_sec)
++{
++	if (lease_sec == 0) {
++		lease_sec = DHCP_DEFAULT_LEASE_SEC;
++	}
++	if (lease_sec < 60) {
++		lease_sec = 60;
++	}
++	tw_dhcp_lease_sec = lease_sec;
++	/* T1 = 50% of lease (RFC 2131) */
++	tw_dhcp_t1_ms = now_ms + (lease_sec / 2) * 1000u;
++	tw_dhcp_state = TW_DHCP_DONE;
++	printf("SWEET WLAN: DHCP lease %u s (renew ~%u s)\n",
++	    lease_sec, lease_sec / 2);
++}
++
+ static void
+ tw_dhcp_send(uint8_t msgtype)
+ {
+@@ -195,6 +225,7 @@ tw_dhcp_send(uint8_t msgtype)
+ 	uint8_t mac[6];
+ 	uint8_t *ip, *udp, *boot, *opt;
+ 	unsigned iplen, udplen, bootlen;
++	int renew = (tw_dhcp_state == TW_DHCP_RENEW);
+ 
+ 	if (!topaz_wlan_authorized()) {
+ 		return;
+@@ -202,7 +233,7 @@ tw_dhcp_send(uint8_t msgtype)
+ 	topaz_wlan_address(mac);
+ 	bzero(frame, sizeof(frame));
+ 
+-	/* Ethernet broadcast */
++	/* L2 broadcast (no ARP for DHCP server MAC yet). */
+ 	memset(frame, 0xff, 6);
+ 	memcpy(frame + 6, mac, 6);
+ 	frame[12] = 0x08;
+@@ -220,7 +251,13 @@ tw_dhcp_send(uint8_t msgtype)
+ 	boot[5] = (uint8_t)(tw_dhcp_xid >> 16);
+ 	boot[6] = (uint8_t)(tw_dhcp_xid >> 8);
+ 	boot[7] = (uint8_t)tw_dhcp_xid;
+-	boot[10] = 0x80; /* broadcast flag */
++	if (renew) {
++		uint32_t ci = htonl(tw_dhcp_yiaddr);
++
++		memcpy(boot + 12, &ci, 4); /* ciaddr */
++	} else {
++		boot[10] = 0x80; /* broadcast flag */
++	}
+ 	memcpy(boot + 28, mac, 6);
+ 	/* options at offset 236 */
+ 	opt = boot + 236;
+@@ -232,7 +269,7 @@ tw_dhcp_send(uint8_t msgtype)
+ 	*opt++ = DHCP_OPT_MSG;
+ 	*opt++ = 1;
+ 	*opt++ = msgtype;
+-	if (msgtype == DHCPREQUEST) {
++	if (msgtype == DHCPREQUEST && !renew) {
+ 		uint32_t yi = htonl(tw_dhcp_yiaddr);
+ 		uint32_t sid = htonl(tw_dhcp_server);
+ 
+@@ -246,10 +283,11 @@ tw_dhcp_send(uint8_t msgtype)
+ 		opt += 4;
+ 	}
+ 	*opt++ = 55; /* parameter request list */
+-	*opt++ = 3;
++	*opt++ = 4;
+ 	*opt++ = DHCP_OPT_MASK;
+ 	*opt++ = DHCP_OPT_ROUTER;
+-	*opt++ = 6; /* DNS, ignored */
++	*opt++ = DHCP_OPT_DNS;
++	*opt++ = DHCP_OPT_LEASE;
+ 	*opt++ = DHCP_OPT_END;
+ 	bootlen = (unsigned)(opt - boot);
+ 	if (bootlen < 300) {
+@@ -272,8 +310,17 @@ tw_dhcp_send(uint8_t msgtype)
+ 	ip[3] = (uint8_t)iplen;
+ 	ip[8] = 64;
+ 	ip[9] = IPPROTO_UDP;
+-	/* src 0.0.0.0 dst 255.255.255.255 */
+-	ip[16] = ip[17] = ip[18] = ip[19] = 0xff;
++	if (renew && tw_dhcp_yiaddr != 0) {
++		uint32_t src = htonl(tw_dhcp_yiaddr);
++		uint32_t dst = tw_dhcp_server != 0 ? htonl(tw_dhcp_server) :
++		    0xffffffffu;
++
++		memcpy(ip + 12, &src, 4);
++		memcpy(ip + 16, &dst, 4);
++	} else {
++		/* src 0.0.0.0 dst 255.255.255.255 */
++		ip[16] = ip[17] = ip[18] = ip[19] = 0xff;
++	}
+ 	ip[10] = ip[11] = 0;
+ 	{
+ 		uint16_t csum = tw_ip_cksum(ip, 20);
+@@ -283,16 +330,19 @@ tw_dhcp_send(uint8_t msgtype)
+ 
+ 	if (!topaz_wlan_tx_ethernet(frame, 14 + iplen)) {
+ 		printf("SWEET WLAN: DHCP %s TX failed\n",
+-		    msgtype == DHCPDISCOVER ? "DISCOVER" : "REQUEST");
++		    msgtype == DHCPDISCOVER ? "DISCOVER" :
++		    (renew ? "RENEW" : "REQUEST"));
+ 		return;
+ 	}
+ 	printf("SWEET WLAN: DHCP %s sent (try %u)\n",
+-	    msgtype == DHCPDISCOVER ? "DISCOVER" : "REQUEST", tw_dhcp_tries);
++	    msgtype == DHCPDISCOVER ? "DISCOVER" :
++	    (renew ? "RENEW" : "REQUEST"), tw_dhcp_tries);
+ }
+ 
+ static void
+ tw_dhcp_parse_options(const uint8_t *opt, unsigned len, uint8_t *msg,
+-    uint32_t *mask, uint32_t *gw, uint32_t *server)
++    uint32_t *mask, uint32_t *gw, uint32_t *server, uint32_t *lease,
++    uint32_t *dns)
+ {
+ 	unsigned i = 0;
+ 
+@@ -325,6 +375,12 @@ tw_dhcp_parse_options(const uint8_t *opt, unsigned len, uint8_t *msg,
+ 		} else if (code == DHCP_OPT_SERVER && olen >= 4) {
+ 			*server = (opt[i] << 24) | (opt[i + 1] << 16) |
+ 			    (opt[i + 2] << 8) | opt[i + 3];
++		} else if (code == DHCP_OPT_LEASE && olen >= 4) {
++			*lease = (opt[i] << 24) | (opt[i + 1] << 16) |
++			    (opt[i + 2] << 8) | opt[i + 3];
++		} else if (code == DHCP_OPT_DNS && olen >= 4 && dns != NULL) {
++			*dns = (opt[i] << 24) | (opt[i + 1] << 16) |
++			    (opt[i + 2] << 8) | opt[i + 3];
+ 		}
+ 		i += olen;
+ 	}
+@@ -337,9 +393,11 @@ tw_dhcp_rx(const uint8_t *eth, unsigned len)
+ 	const uint8_t *ip, *udp, *boot, *opt;
+ 	unsigned iplen, udplen;
+ 	uint32_t xid, yiaddr, mask = 0xffffff00, gw = 0, server = 0;
++	uint32_t lease = 0, dns = 0;
+ 	uint8_t msg = 0;
+ 
+-	if (tw_dhcp_state != TW_DHCP_DISCOVER && tw_dhcp_state != TW_DHCP_REQUEST) {
++	if (tw_dhcp_state != TW_DHCP_DISCOVER && tw_dhcp_state != TW_DHCP_REQUEST &&
++	    tw_dhcp_state != TW_DHCP_RENEW) {
+ 		return false;
+ 	}
+ 	if (len < 14 + 20 + 8 + 240) {
+@@ -379,7 +437,8 @@ tw_dhcp_rx(const uint8_t *eth, unsigned len)
+ 	if (opt[0] != 99 || opt[1] != 130 || opt[2] != 83 || opt[3] != 99) {
+ 		return false;
+ 	}
+-	tw_dhcp_parse_options(opt + 4, udplen - 8 - 240, &msg, &mask, &gw, &server);
++	tw_dhcp_parse_options(opt + 4, udplen - 8 - 240, &msg, &mask, &gw,
++	    &server, &lease, &dns);
+ 
+ 	if (msg == DHCPOFFER && tw_dhcp_state == TW_DHCP_DISCOVER) {
+ 		tw_dhcp_yiaddr = yiaddr;
+@@ -389,7 +448,6 @@ tw_dhcp_rx(const uint8_t *eth, unsigned len)
+ 		tw_dhcp_mask = mask;
+ 		tw_dhcp_gw = gw;
+ 		tw_dhcp_state = TW_DHCP_REQUEST;
+-		tw_dhcp_tries = 0;
+ 		tw_dhcp_last_ms = 0;
+ 		printf("SWEET WLAN: DHCP OFFER %u.%u.%u.%u from %u.%u.%u.%u\n",
+ 		    (yiaddr >> 24) & 0xff, (yiaddr >> 16) & 0xff,
+@@ -400,17 +458,43 @@ tw_dhcp_rx(const uint8_t *eth, unsigned len)
+ 		tw_dhcp_send(DHCPREQUEST);
+ 		return true;
+ 	}
+-	if (msg == DHCPACK && tw_dhcp_state == TW_DHCP_REQUEST) {
++	if (msg == DHCPACK && (tw_dhcp_state == TW_DHCP_REQUEST ||
++	    tw_dhcp_state == TW_DHCP_RENEW)) {
++		uint32_t now = tw_dhcp_now_ms != 0 ? tw_dhcp_now_ms :
++		    (tw_dhcp_last_ms != 0 ? tw_dhcp_last_ms : 1);
++
++		if (server != 0) {
++			tw_dhcp_server = server;
++		}
+ 		if (mask == 0xffffff00 && tw_dhcp_mask != 0) {
+ 			mask = tw_dhcp_mask;
+ 		}
+ 		if (gw == 0) {
+ 			gw = tw_dhcp_gw;
+ 		}
+-		printf("SWEET WLAN: DHCP ACK %u.%u.%u.%u\n",
++		printf("SWEET WLAN: DHCP ACK %u.%u.%u.%u%s\n",
+ 		    (yiaddr >> 24) & 0xff, (yiaddr >> 16) & 0xff,
+-		    (yiaddr >> 8) & 0xff, yiaddr & 0xff);
+-		tw_apply_ipv4(yiaddr, mask != 0 ? mask : tw_dhcp_mask, gw);
++		    (yiaddr >> 8) & 0xff, yiaddr & 0xff,
++		    tw_dhcp_state == TW_DHCP_RENEW ? " (renew)" : "");
++		if (dns != 0) {
++			printf("SWEET WLAN: DHCP DNS %u.%u.%u.%u (not applied)\n",
++			    (dns >> 24) & 0xff, (dns >> 16) & 0xff,
++			    (dns >> 8) & 0xff, dns & 0xff);
++		}
++		if (!tw_addr_done) {
++			tw_apply_ipv4(yiaddr, mask != 0 ? mask : tw_dhcp_mask, gw);
++		}
++		tw_dhcp_yiaddr = yiaddr;
++		tw_dhcp_arm_lease(now, lease);
++		return true;
++	}
++	if (msg == DHCPNAK && (tw_dhcp_state == TW_DHCP_REQUEST ||
++	    tw_dhcp_state == TW_DHCP_RENEW)) {
++		printf("SWEET WLAN: DHCP NAK — restarting DISCOVER\n");
++		tw_dhcp_t1_ms = 0;
++		tw_dhcp_state = TW_DHCP_IDLE;
++		tw_addr_done = false;
++		tw_dhcp_start(tw_dhcp_last_ms);
+ 		return true;
+ 	}
+ 	return false;
+@@ -660,10 +744,25 @@ topaz_wlan_if_poll(uint32_t ms)
+ {
+ 	uint8_t msg;
+ 
+-	if (tw_addr_done || !tw_attached) {
++	if (!tw_attached) {
++		return;
++	}
++	tw_dhcp_now_ms = ms;
++
++	/* T1: begin renew while address stays up. */
++	if (tw_dhcp_state == TW_DHCP_DONE && tw_dhcp_t1_ms != 0 &&
++	    ms >= tw_dhcp_t1_ms) {
++		tw_dhcp_state = TW_DHCP_RENEW;
++		tw_dhcp_tries = 1;
++		tw_dhcp_last_ms = 0;
++		tw_dhcp_xid ^= ms | 1u;
++		printf("SWEET WLAN: DHCP T1 renew\n");
++		tw_dhcp_send(DHCPREQUEST);
+ 		return;
+ 	}
+-	if (tw_dhcp_state != TW_DHCP_DISCOVER && tw_dhcp_state != TW_DHCP_REQUEST) {
++
++	if (tw_dhcp_state != TW_DHCP_DISCOVER && tw_dhcp_state != TW_DHCP_REQUEST &&
++	    tw_dhcp_state != TW_DHCP_RENEW) {
+ 		return;
+ 	}
+ 	if (tw_dhcp_last_ms == 0) {
+@@ -674,11 +773,17 @@ topaz_wlan_if_poll(uint32_t ms)
+ 		return;
+ 	}
+ 	if (tw_dhcp_tries >= 12) {
++		if (tw_dhcp_state == TW_DHCP_RENEW) {
++			printf("SWEET WLAN: DHCP renew gave up; keeping address\n");
++			tw_dhcp_arm_lease(ms, tw_dhcp_lease_sec != 0 ?
++			    tw_dhcp_lease_sec : DHCP_DEFAULT_LEASE_SEC);
++			return;
++		}
+ 		printf("SWEET WLAN: DHCP gave up after %u tries\n", tw_dhcp_tries);
+ 		tw_dhcp_state = TW_DHCP_IDLE;
+ 		return;
+ 	}
+-	msg = (tw_dhcp_state == TW_DHCP_REQUEST) ? DHCPREQUEST : DHCPDISCOVER;
++	msg = (tw_dhcp_state == TW_DHCP_DISCOVER) ? DHCPDISCOVER : DHCPREQUEST;
+ 	tw_dhcp_tries++;
+ 	tw_dhcp_last_ms = ms;
+ 	tw_dhcp_send(msg);

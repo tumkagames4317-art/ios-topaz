@@ -1,0 +1,288 @@
+Subject: [PATCH] topaz-0129: WLAN ifnet stub (tw0) on radio ready
+
+Expose the 0126 TopazModem C API via <sys/topaz_wlan.h> and attach a
+legacy ethernet ifnet `tw0` when the WCN radio reports ready (wifi=1).
+No association or data path yet: output drops frames. Lets configd and
+kernel code see a MAC and proves the ready hook. Boot-arg sweetwlanif=0
+skips the ifnet (API header still available).
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -109,6 +109,7 @@ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_i2c1.c			standard
+ bsd/dev/sweet_rtc.c			standard
++bsd/dev/topaz_wlan_if.c			standard
+ bsd/dev/sweet_cpufreq.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+diff --git a/bsd/sys/topaz_wlan.h b/bsd/sys/topaz_wlan.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/sys/topaz_wlan.h
+@@ -0,0 +1,41 @@
++/*
++ * topaz: WCN3988 radio C API (implemented in iokit/Kernel/arm/TopazModem.cpp
++ * when boot-arg wifi=1). Scan + BSS list with beacon IEs; ready hook for
++ * ifnet / future IO80211. No association yet.
++ */
++#ifndef _BSD_SYS_TOPAZ_WLAN_H_
++#define _BSD_SYS_TOPAZ_WLAN_H_
++
++#include <sys/types.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++struct topaz_wlan_bss {
++	uint8_t bssid[6];
++	uint8_t ssid[32], ssid_length;
++	uint16_t frequency;                         /* MHz */
++	int16_t rssi;                               /* dBm */
++	uint16_t beacon_interval, capability;
++	uint32_t age_ms;
++	uint16_t elements_length;
++	uint8_t elements[768];
++};
++
++/* Set by a consumer before the radio comes up; called once from the modem thread. */
++extern void (*topaz_wlan_ready_hook)(void);
++
++bool topaz_wlan_ready(void);
++int topaz_wlan_scan(void);                          /* 0 ok, ENXIO/ETIMEDOUT */
++bool topaz_wlan_heard(unsigned index, struct topaz_wlan_bss *bss);
++void topaz_wlan_address(uint8_t address[6]);
++
++/* bsd/dev/topaz_wlan_if.c — register hook early (before topaz_modem_init). */
++void topaz_wlan_if_init(void);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* _BSD_SYS_TOPAZ_WLAN_H_ */
+diff --git a/bsd/dev/topaz_wlan_if.c b/bsd/dev/topaz_wlan_if.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/topaz_wlan_if.c
+@@ -0,0 +1,155 @@
++/*
++ * topaz: attach ifnet tw0 when TopazModem WLAN radio is ready (0126 API).
++ * Stub only — no assoc / datapath. Output frees mbufs. sweetwlanif=0 skips.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/socket.h>
++#include <sys/sockio.h>
++#include <sys/kpi_mbuf.h>
++#include <sys/topaz_wlan.h>
++#include <net/ethernet.h>
++#include <net/if.h>
++#include <net/if_types.h>
++#include <net/if_ether.h>
++#include <net/ether_if_module.h>
++#include <net/kpi_interface.h>
++#include <pexpert/pexpert.h>
++#include <kern/locks.h>
++
++static ifnet_t tw_ifp;
++static lck_mtx_t *tw_lock;
++static int tw_enabled = 1;
++static bool tw_hooked;
++static bool tw_attached;
++
++static errno_t
++tw_output(ifnet_t ifp, mbuf_t m)
++{
++	(void)ifp;
++	if (m != NULL) {
++		ifnet_stat_increment_out(ifp, 0, 0, 1);
++		mbuf_freem(m);
++	}
++	return 0;
++}
++
++static errno_t
++tw_ioctl(ifnet_t ifp, unsigned long cmd, void *data __unused)
++{
++	switch (cmd) {
++	case SIOCSIFADDR:
++	case SIOCSIFFLAGS:
++		ifnet_set_flags(ifp, IFF_UP, IFF_UP);
++		return 0;
++	default:
++		return EOPNOTSUPP;
++	}
++}
++
++static void
++tw_detach(ifnet_t ifp __unused)
++{
++}
++
++static void
++tw_attach_ifnet(void)
++{
++	struct ifnet_init_eparams init;
++	uint8_t mac[6];
++	static lck_grp_t *grp;
++
++	if (tw_attached || tw_ifp != NULL) {
++		return;
++	}
++	if (!topaz_wlan_ready()) {
++		return;
++	}
++	topaz_wlan_address(mac);
++
++	if (grp == NULL) {
++		grp = lck_grp_alloc_init("topaz_wlan", LCK_GRP_ATTR_NULL);
++	}
++	if (tw_lock == NULL) {
++		tw_lock = lck_mtx_alloc_init(grp, LCK_ATTR_NULL);
++	}
++
++	bzero(&init, sizeof(init));
++	init.ver = IFNET_INIT_CURRENT_VERSION;
++	init.len = sizeof(init);
++	init.flags = IFNET_INIT_LEGACY;
++	init.uniqueid = "topaz-wlan";
++	init.uniqueid_len = sizeof("topaz-wlan") - 1;
++	init.name = "tw";
++	init.unit = 0;
++	init.family = IFNET_FAMILY_ETHERNET;
++	init.type = IFT_ETHER;
++	init.output = tw_output;
++	init.demux = ether_demux;
++	init.add_proto = ether_add_proto;
++	init.del_proto = ether_del_proto;
++	init.check_multi = ether_check_multi;
++	init.framer_extended = ether_frameout_extended;
++	init.ioctl = tw_ioctl;
++	init.detach = tw_detach;
++	init.broadcast_addr = etherbroadcastaddr;
++	init.broadcast_len = ETHER_ADDR_LEN;
++
++	if (ifnet_allocate_extended(&init, &tw_ifp) != 0) {
++		printf("SWEET WLAN: tw0 ifnet_allocate failed\n");
++		tw_ifp = NULL;
++		return;
++	}
++	ifnet_set_addrlen(tw_ifp, ETHER_ADDR_LEN);
++	ifnet_set_hdrlen(tw_ifp, sizeof(struct ether_header));
++	ifnet_set_mtu(tw_ifp, ETHERMTU);
++	ifnet_set_baudrate(tw_ifp, 433000000); /* 802.11n-ish placeholder */
++	ifnet_set_flags(tw_ifp, IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST, 0xffff);
++	if (ifnet_attach(tw_ifp, NULL) != 0) {
++		printf("SWEET WLAN: tw0 ifnet_attach failed\n");
++		tw_ifp = NULL;
++		return;
++	}
++	ifnet_set_lladdr(tw_ifp, mac, ETHER_ADDR_LEN);
++	ifnet_set_flags(tw_ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
++	tw_attached = true;
++	printf("SWEET WLAN: tw0 up %02x:%02x:%02x:%02x:%02x:%02x (no assoc yet)\n",
++	    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
++}
++
++static void
++tw_on_ready(void)
++{
++	/*
++	 * Called from the modem/WLAN poll thread. Do not call topaz_wlan_scan()
++	 * here (it sleeps waiting for that same thread). Attach only.
++	 */
++	tw_attach_ifnet();
++}
++
++void
++topaz_wlan_if_init(void)
++{
++	(void)PE_parse_boot_argn("sweetwlanif", &tw_enabled, sizeof(tw_enabled));
++	if (!tw_enabled) {
++		printf("SWEET WLAN: ifnet disabled (sweetwlanif=0)\n");
++		return;
++	}
++	if (tw_hooked) {
++		return;
++	}
++	tw_hooked = true;
++	topaz_wlan_ready_hook = tw_on_ready;
++	/* Radio may already be up if init races past first scan_started. */
++	if (topaz_wlan_ready()) {
++		tw_attach_ifnet();
++	}
++	printf("SWEET WLAN: ifnet hook armed (need wifi=1)\n");
++}
++#else /* !ARM64_BOARD_CONFIG_SWEET */
++void
++topaz_wlan_if_init(void)
++{
++}
++#endif
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -39,6 +39,7 @@
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ extern "C" void sweet_console_retarget(vm_offset_t va);   /* osfmk/console/video_console.c */
+ extern "C" void (*sweet_console_show_hook)(void);
+ extern "C" void topaz_modem_init(void);             /* iokit/Kernel/arm/TopazModem.cpp (boot-arg modem=1) */
++extern "C" void topaz_wlan_if_init(void);           /* bsd/dev/topaz_wlan_if.c */
+ extern "C" int sweet_console_copy_dirty(void *dst);
+ 
+ /*
+@@ -253,6 +254,7 @@ AppleCLCD::start(IOService *provider)
+ 	if (!IOService::start(provider)) {
+ 		return false;
+ 	}
++	topaz_wlan_if_init();
+ 	topaz_modem_init();
+ 	PE_current_console(&video);
+ 	fPhys = video.v_baseAddr;
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -4510,34 +4510,14 @@ scan_mgmt_rx(const uint8_t *t, uint32_t len)
+ 	    b->bssid[2], b->chan, b->rssi, b->ssid);
+ }
+ 
+-/* ---------------- the radio for the rest of the kernel (sys-independent C API) */
+-
+-/*
+- * What another part of the kernel may ask of the radio once it is up: a scan, and what the
+- * scans heard (each access point with its beacon's information elements, from which a reader
+- * tells the network's protection). The modem thread does the work; a caller's scan waits.
+- */
+-extern "C" {
+-struct topaz_wlan_bss {
+-	uint8_t bssid[6];
+-	uint8_t ssid[32], ssid_length;
+-	uint16_t frequency;                         /* MHz */
+-	int16_t rssi;                               /* dBm */
+-	uint16_t beacon_interval, capability;
+-	uint32_t age_ms;
+-	uint16_t elements_length;
+-	uint8_t elements[768];
+-};
+-void (*topaz_wlan_ready_hook)(void);
+-bool topaz_wlan_ready(void);
+-int topaz_wlan_scan(void);
+-bool topaz_wlan_heard(unsigned index, struct topaz_wlan_bss *bss);
+-void topaz_wlan_address(uint8_t address[6]);
+-}
++/* ---------------- the radio for the rest of the kernel (<sys/topaz_wlan.h>) */
++#include <sys/topaz_wlan.h>
++
++void (*topaz_wlan_ready_hook)(void);
+ 
+ static volatile bool api_scan_asked;
+ static bool api_ready;
+ 
+ bool
+ topaz_wlan_ready(void)
+ {

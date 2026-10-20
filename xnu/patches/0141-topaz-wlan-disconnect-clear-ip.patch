@@ -1,0 +1,169 @@
+Subject: [PATCH] topaz-0141: restore assoc teardown; clear tw0 on disconnect
+
+0131 accidentally removed a_teardown/a_fail/a_arm/a_start_*/a_begin bodies
+(forward decls left). Restore them, reset a_ptk + WPA on teardown, and call
+topaz_wlan_if_on_disconnected() so tw0 drops SIOCDIFADDR and DHCP can restart.
+diff --git a/bsd/sys/topaz_wlan.h b/bsd/sys/topaz_wlan.h
+--- a/bsd/sys/topaz_wlan.h
++++ b/bsd/sys/topaz_wlan.h
+@@ -42,6 +42,7 @@ bool topaz_wlan_tx_ethernet(const uint8_t *eth, unsigned len);
+ void topaz_wlan_if_init(void);
+ void topaz_wlan_if_input(const uint8_t *eth, unsigned len);
+ void topaz_wlan_if_on_authorized(void); /* apply wifiip= after PTK/open */
++void topaz_wlan_if_on_disconnected(void); /* clear tw0 IP; allow re-DHCP */
+ void topaz_wlan_if_poll(uint32_t ms); /* DHCP retransmit */
+ 
+ #ifdef __cplusplus
+diff --git a/bsd/dev/topaz_wlan_if.c b/bsd/dev/topaz_wlan_if.c
+--- a/bsd/dev/topaz_wlan_if.c
++++ b/bsd/dev/topaz_wlan_if.c
+@@ -1,6 +1,6 @@
+ /*
+  * topaz: ifnet tw0 when TopazModem WLAN radio is ready.
+- * 0133-0136: HTT + wifiip=/dhcp + T1 renew. 0137: gratuitous ARP.
++ * 0133-0137: HTT + wifiip=/dhcp + renew + GARP. 0141: clear IP on disconnect.
+  * sweetwlanif=0 skips. wifigarpon=0 disables GARP.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+@@ -785,6 +785,36 @@ topaz_wlan_if_on_authorized(void)
+ 	tw_configure_ipv4();
+ }
+ 
++void
++topaz_wlan_if_on_disconnected(void)
++{
++	errno_t err;
++	socket_t so = NULL;
++	struct ifreq ifr;
++
++	tw_dhcp_state = TW_DHCP_IDLE;
++	tw_dhcp_t1_ms = 0;
++	tw_dhcp_last_ms = 0;
++	tw_dhcp_tries = 0;
++	if (!tw_attached || tw_ifp == NULL) {
++		tw_addr_done = false;
++		return;
++	}
++	if (tw_addr_done) {
++		err = sock_socket(PF_INET, SOCK_DGRAM, 0, NULL, NULL, &so);
++		if (err == 0) {
++			bzero(&ifr, sizeof(ifr));
++			snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "tw0");
++			(void)sock_ioctl(so, SIOCDIFADDR, &ifr);
++			sock_close(so);
++		}
++		tw_addr_done = false;
++		printf("SWEET WLAN: tw0 addr cleared (disconnect)\n");
++	} else {
++		printf("SWEET WLAN: tw0 link down\n");
++	}
++}
++
+ void
+ topaz_wlan_if_poll(uint32_t ms)
+ {
+@@ -858,5 +888,6 @@ void topaz_wlan_if_init(void) {}
+ void topaz_wlan_if_input(const uint8_t *eth, unsigned len)
+ { (void)eth; (void)len; }
+ void topaz_wlan_if_on_authorized(void) {}
++void topaz_wlan_if_on_disconnected(void) {}
+ void topaz_wlan_if_poll(uint32_t ms) { (void)ms; }
+ #endif
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -1,7 +1,94 @@
+ static void a_teardown(void);
+ static void a_fail(int status);
++static void a_arm(void);
+ static void a_start_auth(void);
+ static void a_start_assoc(void);
++static void a_begin(void);
++extern "C" void topaz_wlan_if_on_disconnected(void);
++
++static void
++a_teardown(void)
++{
++	bool was_up = (a_state == A_UP) || a_up;
++
++	if (a_state >= A_START) {
++		if (a_state == A_UP) {
++			a_vdev_simple(CMD_VDEV_DOWN, TAG_VDEV_DOWN);
++		}
++		if (a_state >= A_AUTH) {
++			a_peer_delete(a_req.bssid);
++		}
++		a_vdev_simple(CMD_VDEV_STOP, TAG_VDEV_STOP);
++	}
++	a_state = A_IDLE;
++	a_up = false;
++	a_ptk = false;
++	topaz_wlan_wpa_reset();
++	if (was_up) {
++		topaz_wlan_if_on_disconnected();
++	}
++}
++
++static void
++a_fail(int status)
++{
++	LOG("t=%u ms: assoc: failed (%d) state %u", g_ms, status, a_state);
++	a_teardown();
++}
++
++static void
++a_arm(void)
++{
++	a_deadline = g_ms + ASSOC_WAIT_MS;
++}
++
++static void
++a_start_auth(void)
++{
++	a_state = A_AUTH;
++	a_tries = 1;
++	a_peer_create(a_req.bssid);
++	a_send_auth();
++	a_arm();
++}
++
++static void
++a_start_assoc(void)
++{
++	a_state = A_ASSOC;
++	a_tries = 1;
++	a_areq_len = a_build_assoc_req(a_areq, sizeof(a_areq));
++	a_send_mgmt(a_areq, a_areq_len);
++	a_arm();
++}
++
++static void
++a_begin(void)
++{
++	uint32_t bcn = 100, dtim = 1;
++	const uint8_t *tim;
++
++	if (a_req.body_len >= 12) {
++		bcn = (uint32_t)a_req.body[8] | ((uint32_t)a_req.body[9] << 8);
++	}
++	tim = a_find_ie(a_req.body, a_req.body_len, 5);
++	if (tim != NULL && tim[1] >= 2 && tim[3] != 0) {
++		dtim = tim[3];
++	}
++	a_areq_len = a_aresp_len = 0;
++	a_start_resp = false;
++	LOG("t=%u ms: assoc: %02x:%02x:%02x:**:**:** %u MHz %s '%.*s'", g_ms,
++	    a_req.bssid[0], a_req.bssid[1], a_req.bssid[2], a_req.freq,
++	    a_rsn ? "WPA2" : "open", (int)a_req.ssid_len, a_req.ssid);
++	a_ps_off();
++	if (!a_vdev_start(a_req.freq, bcn, dtim)) {
++		a_fail(-2);
++		return;
++	}
++	a_state = A_START;
++	a_deadline = g_ms + 1500;
++}
++
+ static void
+ a_on_up(void)
+ {

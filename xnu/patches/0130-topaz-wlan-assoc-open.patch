@@ -1,0 +1,698 @@
+Subject: [PATCH] topaz-0130: open-network WLAN association (wifissid=)
+
+Port of topaz-woa assoc.c open-system AUTH+ASSOC into TopazModem: VDEV_START,
+PEER_CREATE, MGMT_TX auth/assoc, PEER_ASSOC, VDEV_UP, AUTHORIZE. WPA2 not yet.
+Boot-arg wifissid=Name auto-joins a matching open BSS after the first scan.
+API: topaz_wlan_connect_bss(index), topaz_wlan_associated().
+
+diff --git a/bsd/sys/topaz_wlan.h b/bsd/sys/topaz_wlan.h
+--- a/bsd/sys/topaz_wlan.h
++++ b/bsd/sys/topaz_wlan.h
+@@ -1,8 +1,9 @@
+ /*
+  * topaz: WCN3988 radio C API (implemented in iokit/Kernel/arm/TopazModem.cpp
+- * when boot-arg wifi=1). Scan + BSS list with beacon IEs; ready hook for
+- * ifnet / future IO80211. No association yet.
++ * when boot-arg wifi=1). Scan + BSS list with beacon IEs; open-network
++ * association (0130); ready hook for ifnet / future IO80211. WPA2 later.
+  */
+ #ifndef _BSD_SYS_TOPAZ_WLAN_H_
+ #define _BSD_SYS_TOPAZ_WLAN_H_
+@@ -28,6 +29,8 @@ bool topaz_wlan_ready(void);
+ int topaz_wlan_scan(void);                          /* 0 ok, ENXIO/ETIMEDOUT */
+ bool topaz_wlan_heard(unsigned index, struct topaz_wlan_bss *bss);
+ void topaz_wlan_address(uint8_t address[6]);
++int topaz_wlan_connect_bss(unsigned index);         /* open BSS only; 0 ok */
++bool topaz_wlan_associated(void);
+ 
+ /* bsd/dev/topaz_wlan_if.c — register hook early (before topaz_modem_init). */
+ void topaz_wlan_if_init(void);
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -4458,6 +4458,11 @@ scan_event(const uint8_t *t, uint32_t len)
+ 		api_scans_done++;
+ 	}
+ }
+ 
++static void assoc_mgmt_rx(const uint8_t *f, uint32_t len);
++static void assoc_event(uint32_t id, const uint8_t *tlvs, uint32_t len);
++static void assoc_poll(void);
++static void assoc_try_auto(void);
++
+ static void
+ scan_mgmt_rx(const uint8_t *t, uint32_t len)
+ {
+@@ -4488,7 +4493,13 @@ scan_mgmt_rx(const uint8_t *t, uint32_t len)
+ 	if (!have_hdr || f == NULL) {
+ 		return;
+ 	}
+ 	flen = MIN(hdr[4], flen);
++	if (flen >= 24 && (f[0] & 0x0C) == 0) {
++		uint8_t st = (uint8_t)(f[0] >> 4);
++		if (st == 0x0b || st == 0x01 || st == 0x0c || st == 0x0a) {
++			assoc_mgmt_rx(f, flen);
++		}
++	}
+ 	if (flen < 36 || (f[0] & 0x0C) != 0 || ((f[0] >> 4) != 8 && (f[0] >> 4) != 5)) {
+ 		return;                                 /* beacons and probe responses only */
+ 	}
+@@ -4575,6 +4586,616 @@
+ 	    b->bssid[2], b->chan, b->rssi, b->ssid);
+ }
+ 
++/* ---------------- open-network station association (topaz-woa assoc.c) */
++
++#define CMD_VDEV_START      0x5003
++#define CMD_VDEV_UP         0x5005
++#define CMD_VDEV_STOP       0x5006
++#define CMD_VDEV_DOWN       0x5007
++#define CMD_PEER_CREATE     0x6001
++#define CMD_PEER_DELETE     0x6002
++#define CMD_PEER_SET_PARAM  0x6004
++#define CMD_PEER_ASSOC      0x6005
++#define CMD_MGMT_TX_SEND    0x7008
++#define CMD_STA_PS_MODE     0x9001
++#define TAG_VDEV_START      0x58
++#define TAG_VDEV_UP         0x5c
++#define TAG_VDEV_STOP       0x5d
++#define TAG_VDEV_DOWN       0x5e
++#define TAG_PEER_CREATE     0x61
++#define TAG_PEER_DELETE     0x62
++#define TAG_PEER_SET_PARAM  0x64
++#define TAG_PEER_ASSOC      0x65
++#define TAG_VHT_RATE_SET    0x66
++#define TAG_STA_PS_MODE     0x6c
++#define TAG_MGMT_TX         0x1a6
++#define PEER_FLAG_AUTH      0x1
++#define PEER_PARAM_AUTHORIZE 3
++#define MODE_11A            0
++#define MODE_11G            1
++#define ASSOC_VDEV          0
++#define FC_ASSOC_REQ        0x00
++#define FC_ASSOC_RESP       0x10
++#define FC_DISASSOC         0xA0
++#define FC_AUTH             0xB0
++#define FC_DEAUTH           0xC0
++#define ASSOC_TRIES         4
++#define ASSOC_WAIT_MS       400
++#define ASSOC_ALIGN4(x)     (((x) + 3u) & ~3u)
++
++enum assoc_state { A_IDLE, A_START, A_AUTH, A_ASSOC, A_UP };
++
++struct topaz_wlan_connect {
++	uint8_t bssid[6];
++	uint32_t freq;
++	uint8_t ssid[32];
++	uint32_t ssid_len;
++	uint32_t body_len;
++	uint8_t body[12 + 768];
++};
++
++static struct topaz_wlan_connect a_req, a_pend;
++static volatile bool a_req_new, a_disc;
++static enum assoc_state a_state;
++static uint32_t a_tries, a_aid, a_desc, a_deadline;
++static uint8_t a_areq[512], a_aresp[512];
++static uint32_t a_areq_len, a_aresp_len;
++static uint8_t *a_txbuf;
++static uint64_t a_txpa;
++static bool a_start_resp;
++static int32_t a_start_status;
++static bool a_up;
++static char a_boot_ssid[33];
++static bool a_boot_ssid_set;
++static bool a_auto_tried;
++
++static uint8_t *
++a_pmac(uint8_t *p, const uint8_t *mac)
++{
++	bzero(p, 8);
++	memcpy(p, mac, 6);
++	return p + 8;
++}
++
++static uint8_t *
++a_put_chan(uint8_t *p, uint32_t freq)
++{
++	uint8_t *c = wmi_put_tlv(p, TAG_CHANNEL, 24);
++	c = put32(c, freq);
++	c = put32(c, freq);
++	c = put32(c, 0);
++	c = put32(c, freq < 4000 ? MODE_11G : MODE_11A);
++	c = put32(c, (40u << 8) | (40u << 16));
++	return put32(c, 40u << 8);
++}
++
++static bool
++a_vdev_start(uint32_t freq, uint32_t bcn, uint32_t dtim)
++{
++	uint8_t m[4 + 72 + 4 + 24 + 4], *p;
++	bzero(m, sizeof(m));
++	p = wmi_put_tlv(m, TAG_VDEV_START, 72);
++	p = put32(p, ASSOC_VDEV);
++	p = put32(p, 0);
++	p = put32(p, bcn);
++	p = put32(p, dtim);
++	p = put32(p, 0);
++	p += 36 + 16;
++	p = a_put_chan(p, freq);
++	wmi_put_tlv(p, TAG_ARRAY_STRUCT, 0);
++	return wmi_send(CMD_VDEV_START, m, sizeof(m));
++}
++
++static bool
++a_peer_create(const uint8_t *mac)
++{
++	uint8_t m[4 + 16], *p = wmi_put_tlv(m, TAG_PEER_CREATE, 16);
++	p = put32(p, ASSOC_VDEV);
++	p = a_pmac(p, mac);
++	put32(p, 0);
++	return wmi_send(CMD_PEER_CREATE, m, sizeof(m));
++}
++
++static bool
++a_peer_delete(const uint8_t *mac)
++{
++	uint8_t m[4 + 12], *p = wmi_put_tlv(m, TAG_PEER_DELETE, 12);
++	p = put32(p, ASSOC_VDEV);
++	a_pmac(p, mac);
++	return wmi_send(CMD_PEER_DELETE, m, sizeof(m));
++}
++
++static bool
++a_vdev_up(uint32_t aid, const uint8_t *bssid)
++{
++	uint8_t m[4 + 16], *p = wmi_put_tlv(m, TAG_VDEV_UP, 16);
++	p = put32(p, ASSOC_VDEV);
++	p = put32(p, aid);
++	a_pmac(p, bssid);
++	return wmi_send(CMD_VDEV_UP, m, sizeof(m));
++}
++
++static bool
++a_vdev_simple(uint32_t cmd, uint16_t tag)
++{
++	uint8_t m[4 + 4], *p = wmi_put_tlv(m, tag, 4);
++	put32(p, ASSOC_VDEV);
++	return wmi_send(cmd, m, sizeof(m));
++}
++
++static bool
++a_ps_off(void)
++{
++	uint8_t m[4 + 8], *p = wmi_put_tlv(m, TAG_STA_PS_MODE, 8);
++	p = put32(p, ASSOC_VDEV);
++	put32(p, 0);
++	return wmi_send(CMD_STA_PS_MODE, m, sizeof(m));
++}
++
++static bool
++a_peer_param(const uint8_t *mac, uint32_t param, uint32_t value)
++{
++	uint8_t m[4 + 20], *p = wmi_put_tlv(m, TAG_PEER_SET_PARAM, 20);
++	p = put32(p, ASSOC_VDEV);
++	p = a_pmac(p, mac);
++	p = put32(p, param);
++	put32(p, value);
++	return wmi_send(CMD_PEER_SET_PARAM, m, sizeof(m));
++}
++
++static bool
++a_send_mgmt(const uint8_t *frame, uint32_t len)
++{
++	uint8_t m[4 + 28 + 4 + 64], *p;
++	uint32_t buf = ASSOC_ALIGN4(MIN(len, 64u));
++
++	if (a_txbuf == NULL) {
++		a_txbuf = (uint8_t *)pool_alloc(0x1000, &a_txpa);
++	}
++	if (a_txbuf == NULL || len > 0x1000 - 8) {
++		return false;
++	}
++	bzero(a_txbuf, ASSOC_ALIGN4(len) + 4);
++	memcpy(a_txbuf, frame, len);
++	__asm__ volatile("dmb oshst" ::: "memory");
++	bzero(m, sizeof(m));
++	p = wmi_put_tlv(m, TAG_MGMT_TX, 28);
++	p = put32(p, ASSOC_VDEV);
++	p = put32(p, ++a_desc);
++	p = put32(p, 0);
++	*(uint64_t *)p = a_txpa;
++	p += 8;
++	p = put32(p, len);
++	p = put32(p, buf);
++	p = wmi_put_tlv(p, TAG_ARRAY_BYTE, buf);
++	memcpy(p, a_txbuf, buf);
++	return wmi_send(CMD_MGMT_TX_SEND, m, 4 + 28 + 4 + buf);
++}
++
++static bool
++a_peer_assoc(const uint8_t *mac, uint32_t aid, uint32_t caps,
++    const uint8_t *rates, uint32_t nrates, uint32_t phymode)
++{
++	uint8_t m[4 + 76 + 4 + 16 + 4 + 4 + 16], *p, *r;
++	uint32_t i, rl = ASSOC_ALIGN4(MIN(nrates, 16u));
++
++	bzero(m, sizeof(m));
++	p = wmi_put_tlv(m, TAG_PEER_ASSOC, 76);
++	p = a_pmac(p, mac);
++	p = put32(p, ASSOC_VDEV);
++	p = put32(p, 1);
++	p = put32(p, aid);
++	p = put32(p, PEER_FLAG_AUTH);
++	p = put32(p, caps);
++	p = put32(p, 1);
++	p = put32(p, 0);
++	p = put32(p, 0);
++	p = put32(p, 0);
++	p = put32(p, 0);
++	p = put32(p, 1);
++	p = put32(p, 0);
++	p = put32(p, phymode);
++	p += 8;
++	p = put32(p, MIN(nrates, 16u));
++	p = put32(p, 0);
++	r = wmi_put_tlv(p, TAG_ARRAY_BYTE, rl);
++	for (i = 0; i < nrates && i < 16; i++) {
++		uint8_t v = rates[i] & 0x7f;
++		r[i] = (v == 2 || v == 4 || v == 11 || v == 22) ? (uint8_t)(v | 0x80) : v;
++	}
++	p = r + rl;
++	p = wmi_put_tlv(p, TAG_ARRAY_BYTE, 0);
++	wmi_put_tlv(p, TAG_VHT_RATE_SET, 16);
++	return wmi_send(CMD_PEER_ASSOC, m, 4 + 76 + 4 + rl + 4 + 4 + 16);
++}
++
++static const uint8_t *
++a_find_ie(const uint8_t *body, uint32_t len, uint8_t id)
++{
++	uint32_t o;
++	for (o = 12; o + 2 <= len && o + 2 + body[o + 1] <= len; o += 2 + body[o + 1]) {
++		if (body[o] == id) {
++			return body + o;
++		}
++	}
++	return NULL;
++}
++
++static uint8_t *
++a_mgmt_hdr(uint8_t *f, uint8_t fc)
++{
++	bzero(f, 24);
++	f[0] = fc;
++	memcpy(f + 4, a_req.bssid, 6);
++	memcpy(f + 10, our_mac, 6);
++	memcpy(f + 16, a_req.bssid, 6);
++	return f + 24;
++}
++
++static bool
++a_send_auth(void)
++{
++	uint8_t f[24 + 6], *b = a_mgmt_hdr(f, FC_AUTH);
++	bzero(b, 6);
++	b[2] = 1;
++	return a_send_mgmt(f, sizeof(f));
++}
++
++static uint32_t
++a_ap_rates(uint8_t *out)
++{
++	const uint8_t *ie;
++	uint32_t n = 0, i, k;
++	static const uint8_t ids[2] = { 1, 50 };
++
++	for (k = 0; k < 2; k++) {
++		ie = a_find_ie(a_req.body, a_req.body_len, ids[k]);
++		for (i = 0; ie != NULL && i < ie[1] && n < 16; i++) {
++			out[n++] = ie[2 + i];
++		}
++	}
++	return n;
++}
++
++static uint32_t
++a_build_assoc_req(uint8_t *f, uint32_t max)
++{
++	uint8_t *b = a_mgmt_hdr(f, FC_ASSOC_REQ), *p, rates[16];
++	uint32_t n = a_ap_rates(rates), cap = 0, k;
++
++	(void)max;
++	if (a_req.body_len >= 12) {
++		cap = (uint32_t)a_req.body[10] | ((uint32_t)a_req.body[11] << 8);
++	}
++	cap &= 0x0001 | 0x0010 | 0x0020 | 0x0400;
++	p = b;
++	*p++ = (uint8_t)cap;
++	*p++ = (uint8_t)(cap >> 8);
++	*p++ = 10;
++	*p++ = 0;
++	*p++ = 0;
++	*p++ = (uint8_t)a_req.ssid_len;
++	memcpy(p, a_req.ssid, a_req.ssid_len);
++	p += a_req.ssid_len;
++	*p++ = 1;
++	*p++ = (uint8_t)MIN(n, 8u);
++	for (k = 0; k < n && k < 8; k++) {
++		*p++ = rates[k];
++	}
++	if (n > 8) {
++		*p++ = 50;
++		*p++ = (uint8_t)(n - 8);
++		for (k = 8; k < n; k++) {
++			*p++ = rates[k];
++		}
++	}
++	return (uint32_t)(p - f);
++}
++
++static void a_teardown(void);
++static void a_fail(int status);
++static void a_start_auth(void);
++static void a_start_assoc(void);
++static void a_on_up(void);
++
++static void
++a_teardown(void)
++{
++	if (a_state >= A_START) {
++		if (a_state == A_UP) {
++			a_vdev_simple(CMD_VDEV_DOWN, TAG_VDEV_DOWN);
++		}
++		if (a_state >= A_AUTH) {
++			a_peer_delete(a_req.bssid);
++		}
++		a_vdev_simple(CMD_VDEV_STOP, TAG_VDEV_STOP);
++	}
++	a_state = A_IDLE;
++	a_up = false;
++}
++
++static void
++a_fail(int status)
++{
++	LOG("t=%u ms: assoc: failed (%d) state %u", g_ms, status, a_state);
++	a_teardown();
++}
++
++static void
++a_arm(void)
++{
++	a_deadline = g_ms + ASSOC_WAIT_MS;
++}
++
++static void
++a_start_auth(void)
++{
++	a_state = A_AUTH;
++	a_tries = 1;
++	a_peer_create(a_req.bssid);
++	a_send_auth();
++	a_arm();
++}
++
++static void
++a_start_assoc(void)
++{
++	a_state = A_ASSOC;
++	a_tries = 1;
++	a_areq_len = a_build_assoc_req(a_areq, sizeof(a_areq));
++	a_send_mgmt(a_areq, a_areq_len);
++	a_arm();
++}
++
++static void
++a_begin(void)
++{
++	uint32_t bcn = 100, dtim = 1;
++	const uint8_t *tim;
++
++	if (a_req.body_len >= 12) {
++		bcn = (uint32_t)a_req.body[8] | ((uint32_t)a_req.body[9] << 8);
++	}
++	tim = a_find_ie(a_req.body, a_req.body_len, 5);
++	if (tim != NULL && tim[1] >= 2 && tim[3] != 0) {
++		dtim = tim[3];
++	}
++	a_areq_len = a_aresp_len = 0;
++	a_start_resp = false;
++	LOG("t=%u ms: assoc: %02x:%02x:%02x:**:**:** %u MHz open '%.*s'", g_ms,
++	    a_req.bssid[0], a_req.bssid[1], a_req.bssid[2], a_req.freq,
++	    (int)a_req.ssid_len, a_req.ssid);
++	a_ps_off();
++	if (!a_vdev_start(a_req.freq, bcn, dtim)) {
++		a_fail(-2);
++		return;
++	}
++	a_state = A_START;
++	a_deadline = g_ms + 1500;
++}
++
++static void
++a_on_up(void)
++{
++	uint8_t rates[16];
++	uint32_t n = a_ap_rates(rates), cap = 0;
++
++	if (a_aresp_len >= 26) {
++		cap = (uint32_t)a_aresp[24] | ((uint32_t)a_aresp[25] << 8);
++	}
++	a_peer_assoc(a_req.bssid, a_aid, cap, rates, n,
++	    a_req.freq < 4000 ? MODE_11G : MODE_11A);
++	a_vdev_up(a_aid, a_req.bssid);
++	a_peer_param(a_req.bssid, PEER_PARAM_AUTHORIZE, 1);
++	a_state = A_UP;
++	a_up = true;
++	LOG("t=%u ms: *** associated aid %u (open) ***", g_ms, a_aid);
++}
++
++static void
++assoc_mgmt_rx(const uint8_t *f, uint32_t len)
++{
++	uint8_t fc;
++	uint16_t v;
++
++	if (len < 26 || a_state == A_IDLE || memcmp(f + 10, a_req.bssid, 6) != 0) {
++		return;
++	}
++	fc = f[0];
++	v = (uint16_t)(f[24] | (f[25] << 8));
++	if (fc == FC_AUTH && a_state == A_AUTH && len >= 30 && f[26] == 2) {
++		v = (uint16_t)(f[28] | (f[29] << 8));
++		LOG("t=%u ms: assoc: auth status %u", g_ms, v);
++		if (v == 0) {
++			a_start_assoc();
++		} else {
++			a_fail(v);
++		}
++	} else if (fc == FC_ASSOC_RESP && a_state == A_ASSOC && len >= 30) {
++		a_aresp_len = MIN(len, (uint32_t)sizeof(a_aresp));
++		memcpy(a_aresp, f, a_aresp_len);
++		v = (uint16_t)(f[26] | (f[27] << 8));
++		a_aid = (uint32_t)(f[28] | (f[29] << 8)) & 0x3fff;
++		LOG("t=%u ms: assoc: assoc status %u aid %u", g_ms, v, a_aid);
++		if (v == 0) {
++			a_on_up();
++		} else {
++			a_fail(v);
++		}
++	} else if (fc == FC_DEAUTH || fc == FC_DISASSOC) {
++		LOG("t=%u ms: assoc: AP ended link reason %u state %u", g_ms, v, a_state);
++		a_teardown();
++	}
++}
++
++static void
++assoc_event(uint32_t id, const uint8_t *tlvs, uint32_t len)
++{
++	const uint32_t *v = (const uint32_t *)(tlvs + 4);
++	uint32_t l = len >= 4 ? *(const uint16_t *)tlvs : 0;
++
++	if (len < 4 + l) {
++		return;
++	}
++	switch (id) {
++	case 0x5001:
++		if (l >= 16) {
++			a_start_status = (int32_t)v[3];
++			a_start_resp = true;
++			LOG("t=%u ms: assoc: vdev start resp %d", g_ms, a_start_status);
++		}
++		break;
++	case 0x6001:
++		LOG("t=%u ms: assoc: peer kickout state %u", g_ms, a_state);
++		if (a_state == A_UP) {
++			a_teardown();
++		}
++		break;
++	default:
++		break;
++	}
++}
++
++static void
++assoc_fill_from_bss(const struct bss *b)
++{
++	bzero(&a_pend, sizeof(a_pend));
++	memcpy(a_pend.bssid, b->bssid, 6);
++	a_pend.freq = b->freq ? b->freq :
++	    (uint16_t)(b->chan == 14 ? 2484 : b->chan < 14 ? 2407 + 5 * b->chan :
++	    5000 + 5 * b->chan);
++	if (b->raw_ssid_len) {
++		memcpy(a_pend.ssid, b->raw_ssid, b->raw_ssid_len);
++		a_pend.ssid_len = b->raw_ssid_len;
++	} else {
++		size_t n = strnlen(b->ssid, 32);
++		memcpy(a_pend.ssid, b->ssid, n);
++		a_pend.ssid_len = (uint32_t)n;
++	}
++	a_pend.body[8] = (uint8_t)b->bintval;
++	a_pend.body[9] = (uint8_t)(b->bintval >> 8);
++	a_pend.body[10] = (uint8_t)b->capab;
++	a_pend.body[11] = (uint8_t)(b->capab >> 8);
++	memcpy(a_pend.body + 12, b->ie,
++	    MIN(b->ie_len, (uint16_t)sizeof(a_pend.body) - 12));
++	a_pend.body_len = 12 + MIN(b->ie_len, (uint16_t)sizeof(a_pend.body) - 12);
++	a_req_new = true;
++}
++
++static void
++assoc_try_auto(void)
++{
++	uint32_t i;
++
++	if (!a_boot_ssid_set || a_auto_tried || a_state != A_IDLE) {
++		return;
++	}
++	a_auto_tried = true;
++	for (i = 0; i < nbss; i++) {
++		const struct bss *b = &bss[i];
++		uint32_t slen = b->raw_ssid_len ? b->raw_ssid_len :
++		    (uint32_t)strnlen(b->ssid, 32);
++		const uint8_t *ssid = b->raw_ssid_len ? b->raw_ssid :
++		    (const uint8_t *)b->ssid;
++
++		if (slen != strlen(a_boot_ssid) ||
++		    memcmp(ssid, a_boot_ssid, slen) != 0) {
++			continue;
++		}
++		if (b->capab & 0x0010) {
++			LOG("t=%u ms: assoc: '%s' needs privacy (open-only)",
++			    g_ms, a_boot_ssid);
++			return;
++		}
++		assoc_fill_from_bss(b);
++		LOG("t=%u ms: assoc: wifissid match '%s' queued", g_ms, a_boot_ssid);
++		return;
++	}
++	LOG("t=%u ms: assoc: wifissid='%s' not heard (open)", g_ms, a_boot_ssid);
++}
++
++static uint32_t a_last_scans;
++
++static void
++assoc_poll(void)
++{
++	bool start = false;
++	static bool parsed;
++
++	if (!parsed) {
++		parsed = true;
++		a_boot_ssid_set = PE_parse_boot_argn("wifissid",
++		    a_boot_ssid, sizeof(a_boot_ssid));
++		if (a_boot_ssid_set && a_boot_ssid[0] != '\0') {
++			LOG("t=%u ms: assoc: will join open SSID '%s'",
++			    g_ms, a_boot_ssid);
++		} else {
++			a_boot_ssid_set = false;
++		}
++	}
++	if (scans != a_last_scans) {
++		a_last_scans = scans;
++		assoc_try_auto();
++	}
++	if (a_disc) {
++		a_disc = false;
++		a_req_new = false;
++		a_teardown();
++		LOG("t=%u ms: assoc: disconnect done", g_ms);
++	}
++	if (a_req_new && !scanning) {
++		a_req = a_pend;
++		a_req_new = false;
++		start = true;
++	}
++	if (start) {
++		a_teardown();
++		a_begin();
++		return;
++	}
++	if (a_state == A_START) {
++		if (a_start_resp) {
++			if (a_start_status == 0) {
++				a_start_auth();
++			} else {
++				a_fail(-3);
++			}
++		} else if (g_ms > a_deadline) {
++			a_fail(-4);
++		}
++	} else if ((a_state == A_AUTH || a_state == A_ASSOC) && g_ms > a_deadline) {
++		if (a_tries >= ASSOC_TRIES) {
++			a_fail(-1);
++		} else {
++			a_tries++;
++			if (a_state == A_AUTH) {
++				a_send_auth();
++			} else {
++				a_send_mgmt(a_areq, a_areq_len);
++			}
++			a_arm();
++		}
++	}
++}
++
++extern "C" bool
++topaz_wlan_associated(void)
++{
++	return a_up;
++}
++
++extern "C" int
++topaz_wlan_connect_bss(unsigned index)
++{
++	if (index >= nbss) {
++		return ENOENT;
++	}
++	if (bss[index].capab & 0x0010) {
++		return EPERM; /* open networks only in 0130 */
++	}
++	assoc_fill_from_bss(&bss[index]);
++	return 0;
++}
+ /* ---------------- the radio for the rest of the kernel (<sys/topaz_wlan.h>) */
+ #include <sys/topaz_wlan.h>
+ 
+ void (*topaz_wlan_ready_hook)(void);
+
+@@ -4675,6 +5286,10 @@ wmi_rx(const uint8_t *d, uint32_t len)
+ 	case WMI_EV_MGMT_RX:
+ 		scan_mgmt_rx(d + 4, len - 4);
+ 		break;
++	case 0x5001: /* VDEV_START_RESP */
++	case 0x6001: /* PEER_STA_KICKOUT */
++		assoc_event(id, d + 4, len - 4);
++		break;
+ 	default:
+ 		break;
+ 	}
+@@ -4687,6 +5302,7 @@ radio_poll(unsigned ms)
+ 	}
+ 	(void)ce_poll();
+ 	htt_poll();
++	assoc_poll();
+ 	if (scan_started && !api_ready) {
+ 		api_ready = true;
+ 		LOG("t=%u ms: wlan: radio ready for the rest of the kernel", g_ms);

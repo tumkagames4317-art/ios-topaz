@@ -1,0 +1,52 @@
+Subject: [PATCH] topaz-0146: compile IONetworkingFamily as C++
+
+xnu config includes a files entry only when every optional tag matches,
+and .cpp units are built as *.cpo. Mark the 0144 family sources
+sweet_ionet iokitcpp, and add -I plus kext warning waivers for those
+.cpo objects and TopazWlan.cpo.
+diff --git a/iokit/conf/Makefile.template b/iokit/conf/Makefile.template
+--- a/iokit/conf/Makefile.template
++++ b/iokit/conf/Makefile.template
+@@ -23,6 +23,12 @@
+ CFLAGS_RELEASE += -DIOASSERT=0
+ CFLAGS_DEVELOPMENT += -DIOASSERT=1
+ CFLAGS_DEBUG += -DIOASSERT=1
++
++# SWEET 0146: IONetworkingFamily units compile to *.cpo. Private headers
++# sit next to the sources.
++SWEET_IONET_ROOT = $(SRCROOT)/iokit/Families/IONetworkingFamily
++SWEET_IONET_CPPO = IONetworkController.cpo IONetworkInterface.cpo IOEthernetController.cpo IOEthernetInterface.cpo IONetworkData.cpo IONetworkMedium.cpo IOOutputQueue.cpo IOPacketQueue.cpo IOMbufMemoryCursor.cpo IONetworkStack.cpo IONetworkUserClient.cpo IOKernelDebugger.cpo TopazWlan.cpo
++$(foreach o,$(SWEET_IONET_CPPO),$(eval $(o)_CXXFLAGS_ADD += -I$(SWEET_IONET_ROOT) -Wno-cast-align -Wno-cast-qual -Wno-shadow -Wno-sign-conversion -Wno-unused-parameter -Wno-deprecated-declarations))
+ 
+ #
+ # Directories for generated files
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -2,14 +2,14 @@
+ iokit/Kernel/arm/TopazWlan.cpp                                   optional iokitcpp
+-iokit/Families/IONetworkingFamily/IONetworkController.cpp        optional sweet_ionet
++iokit/Families/IONetworkingFamily/IONetworkController.cpp        optional sweet_ionet iokitcpp
+-iokit/Families/IONetworkingFamily/IONetworkInterface.cpp         optional sweet_ionet
++iokit/Families/IONetworkingFamily/IONetworkInterface.cpp         optional sweet_ionet iokitcpp
+-iokit/Families/IONetworkingFamily/IOEthernetController.cpp       optional sweet_ionet
++iokit/Families/IONetworkingFamily/IOEthernetController.cpp       optional sweet_ionet iokitcpp
+-iokit/Families/IONetworkingFamily/IOEthernetInterface.cpp        optional sweet_ionet
++iokit/Families/IONetworkingFamily/IOEthernetInterface.cpp        optional sweet_ionet iokitcpp
+-iokit/Families/IONetworkingFamily/IONetworkData.cpp              optional sweet_ionet
++iokit/Families/IONetworkingFamily/IONetworkData.cpp              optional sweet_ionet iokitcpp
+-iokit/Families/IONetworkingFamily/IONetworkMedium.cpp            optional sweet_ionet
++iokit/Families/IONetworkingFamily/IONetworkMedium.cpp            optional sweet_ionet iokitcpp
+-iokit/Families/IONetworkingFamily/IOOutputQueue.cpp              optional sweet_ionet
++iokit/Families/IONetworkingFamily/IOOutputQueue.cpp              optional sweet_ionet iokitcpp
+-iokit/Families/IONetworkingFamily/IOPacketQueue.cpp              optional sweet_ionet
++iokit/Families/IONetworkingFamily/IOPacketQueue.cpp              optional sweet_ionet iokitcpp
+-iokit/Families/IONetworkingFamily/IOMbufMemoryCursor.cpp         optional sweet_ionet
++iokit/Families/IONetworkingFamily/IOMbufMemoryCursor.cpp         optional sweet_ionet iokitcpp
+-iokit/Families/IONetworkingFamily/IONetworkStack.cpp             optional sweet_ionet
++iokit/Families/IONetworkingFamily/IONetworkStack.cpp             optional sweet_ionet iokitcpp
+-iokit/Families/IONetworkingFamily/IONetworkUserClient.cpp        optional sweet_ionet
++iokit/Families/IONetworkingFamily/IONetworkUserClient.cpp        optional sweet_ionet iokitcpp
+-iokit/Families/IONetworkingFamily/IOKernelDebugger.cpp           optional sweet_ionet
++iokit/Families/IONetworkingFamily/IOKernelDebugger.cpp           optional sweet_ionet iokitcpp
+ iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitcpp

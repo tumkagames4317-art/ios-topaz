@@ -1,0 +1,78 @@
+Subject: [PATCH] topaz-0137: gratuitous ARP after tw0 IPv4
+
+After SIOCAIFADDR succeeds (static wifiip= or DHCP ACK), send a
+broadcast ARP request with SPA=TPA=our address so APs/switches learn
+the STA MAC. Disable with wifigarpon=0.
+diff --git a/bsd/dev/topaz_wlan_if.c b/bsd/dev/topaz_wlan_if.c
+--- a/bsd/dev/topaz_wlan_if.c
++++ b/bsd/dev/topaz_wlan_if.c
+@@ -1,7 +1,7 @@
+ /*
+  * topaz: ifnet tw0 when TopazModem WLAN radio is ready.
+- * 0133: HTT ethernet. 0134: wifiip= static. 0135: dhcp client.
+- * 0136: dhcp lease T1 renew. sweetwlanif=0 skips.
++ * 0133-0136: HTT + wifiip=/dhcp + T1 renew. 0137: gratuitous ARP.
++ * sweetwlanif=0 skips. wifigarpon=0 disables GARP.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -131,6 +131,51 @@ tw_ip_cksum(const void *data, unsigned len)
+ 	return htons((uint16_t)~sum);
+ }
+ 
++/* Announce SPA=TPA=ip so switches/APs refresh the STA MAC (RFC 5227-ish). */
++static void
++tw_garp(uint32_t ip)
++{
++	uint8_t frame[14 + 28];
++	uint8_t mac[6];
++	uint8_t *arp;
++	int on = 1;
++	uint32_t nip;
++
++	if (ip == 0 || !topaz_wlan_authorized()) {
++		return;
++	}
++	(void)PE_parse_boot_argn("wifigarpon", &on, sizeof(on));
++	if (!on) {
++		return;
++	}
++	topaz_wlan_address(mac);
++	bzero(frame, sizeof(frame));
++	memset(frame, 0xff, 6);
++	memcpy(frame + 6, mac, 6);
++	frame[12] = 0x08;
++	frame[13] = 0x06;
++	arp = frame + 14;
++	arp[0] = 0x00;
++	arp[1] = 0x01; /* Ethernet */
++	arp[2] = 0x08;
++	arp[3] = 0x00; /* IPv4 */
++	arp[4] = 6;
++	arp[5] = 4;
++	arp[6] = 0x00;
++	arp[7] = 0x01; /* request */
++	memcpy(arp + 8, mac, 6);
++	nip = htonl(ip);
++	memcpy(arp + 14, &nip, 4);
++	/* tha = zeros; tpa = same as spa */
++	memcpy(arp + 24, &nip, 4);
++	if (!topaz_wlan_tx_ethernet(frame, sizeof(frame))) {
++		printf("SWEET WLAN: GARP TX failed\n");
++		return;
++	}
++	printf("SWEET WLAN: GARP %u.%u.%u.%u\n",
++	    (ip >> 24) & 0xff, (ip >> 16) & 0xff, (ip >> 8) & 0xff, ip & 0xff);
++}
++
+ static void
+ tw_apply_ipv4(uint32_t ip, uint32_t mask, uint32_t gw)
+ {
+@@ -196,6 +241,7 @@ tw_apply_ipv4(uint32_t ip, uint32_t mask, uint32_t gw)
+ 		    (ip >> 24) & 0xff, (ip >> 16) & 0xff, (ip >> 8) & 0xff, ip & 0xff,
+ 		    (mask >> 24) & 0xff, (mask >> 16) & 0xff, (mask >> 8) & 0xff,
+ 		    mask & 0xff, gw != 0 ? " (+gw)" : "");
++		tw_garp(ip);
+ 	} else {
+ 		printf("SWEET WLAN: tw0 SIOCAIFADDR failed err %d\n", err);
+ 	}

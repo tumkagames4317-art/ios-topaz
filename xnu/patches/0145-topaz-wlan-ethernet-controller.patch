@@ -1,0 +1,386 @@
+Subject: [PATCH] topaz-0145: TopazWlan as IOEthernetController
+
+Subclass IOEthernetController, attachInterface() an IOEthernetInterface,
+and bridge HTT ethernet through outputPacket / a RX sink on
+topaz_wlan_if_input. Link follows topaz_wlan_authorized().
+tw0 remains unless sweetwlanif=0 (then only the IONetwork ifnet).
+Needs 0144 IONetworkingFamily. Not IO80211.
+diff --git a/bsd/sys/topaz_wlan.h b/bsd/sys/topaz_wlan.h
+--- a/bsd/sys/topaz_wlan.h
++++ b/bsd/sys/topaz_wlan.h
+@@ -47,6 +47,10 @@ void topaz_wlan_if_poll(uint32_t ms); /* DHCP retransmit */
+ /* Host-order; false if tw0 has no IPv4 yet. dns may be 0. */
+ bool topaz_wlan_if_ipv4(uint32_t *ip, uint32_t *mask, uint32_t *gw,
+     uint32_t *dns);
++/* 0145: extra RX sink for IOEthernetInterface (tw0 still receives too). */
++typedef void (*topaz_wlan_enet_rx_fn)(const uint8_t *eth, unsigned len,
++    void *arg);
++void topaz_wlan_enet_set_rx(topaz_wlan_enet_rx_fn fn, void *arg);
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/bsd/dev/topaz_wlan_if.c b/bsd/dev/topaz_wlan_if.c
+--- a/bsd/dev/topaz_wlan_if.c
++++ b/bsd/dev/topaz_wlan_if.c
+@@ -3,6 +3,7 @@
+  * 0133-0137: HTT + wifiip=/dhcp + renew + GARP. 0141: clear IP on disconnect.
+  * 0142: topaz_wlan_if_ipv4() for sysctl/ioreg (stores DHCP DNS).
+  * 0143: wifidns= stores resolver for static wifiip= (DHCP still uses opt 6).
++ * 0145: optional IOEthernet RX sink (sweetwlanif=0 leaves only that ifnet).
+  * sweetwlanif=0 skips. wifigarpon=0 disables GARP.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+@@ -70,6 +71,15 @@ static unsigned tw_dhcp_tries;
+ #define DHCP_DEFAULT_LEASE_SEC 3600
+ 
+ static void tw_dhcp_start(uint32_t ms);
++static topaz_wlan_enet_rx_fn tw_enet_rx;
++static void *tw_enet_rx_arg;
++
++void
++topaz_wlan_enet_set_rx(topaz_wlan_enet_rx_fn fn, void *arg)
++{
++	tw_enet_rx = fn;
++	tw_enet_rx_arg = arg;
++}
+ 
+ static int
+ tw_parse_ipv4(const char *s, uint32_t *host_order)
+@@ -771,6 +781,10 @@ topaz_wlan_if_input(const uint8_t *eth, unsigned len)
+ 	mbuf_t m = NULL;
+ 	struct ifnet_stat_increment_param stats;
+ 
++	if (eth != NULL && len >= ETHER_HDR_LEN && len <= ETHER_MAX_LEN &&
++	    tw_enet_rx != NULL) {
++		tw_enet_rx(eth, len, tw_enet_rx_arg);
++	}
+ 	if (!tw_attached || tw_ifp == NULL || eth == NULL ||
+ 	    len < ETHER_HDR_LEN || len > ETHER_MAX_LEN) {
+ 		return;
+@@ -953,4 +967,10 @@ topaz_wlan_if_ipv4(uint32_t *ip, uint32_t *mask, uint32_t *gw, uint32_t *dns)
+ 	}
+ 	return false;
+ }
++void
++topaz_wlan_enet_set_rx(topaz_wlan_enet_rx_fn fn, void *arg)
++{
++	(void)fn;
++	(void)arg;
++}
+ #endif
+diff --git a/iokit/Kernel/arm/TopazWlan.cpp b/iokit/Kernel/arm/TopazWlan.cpp
+--- a/iokit/Kernel/arm/TopazWlan.cpp
++++ b/iokit/Kernel/arm/TopazWlan.cpp
+@@ -1,37 +1,59 @@
+ /*
+- * topaz: IOService nub publishing WCN3988 / tw0 state into the IORegistry (0140).
+- * 0142: also TopazWlanIPv4/Netmask/Gateway/DNS from topaz_wlan_if_ipv4().
+- * Not an IONetworkInterface - configd/wifid still need IO80211 later.
+- * Match IOResources; poll topaz_wlan_* into properties. topazwlannub=0 skips.
++ * topaz: WCN3988 as IOEthernetController (0145).
++ * 0140/0142 properties stay. attachInterface() publishes IOEthernetInterface
++ * so IONetworkStack can attach a BSD ifnet (typically enN).
++ * Datapath: outputPacket -> topaz_wlan_tx_ethernet; RX via topaz_wlan_enet_set_rx.
++ * tw0 (0133) still attaches unless sweetwlanif=0. Use sweetwlanif=0 so only
++ * the IONetwork ifnet carries traffic (in-kernel wifiip=/DHCP then stays off).
++ * topazwlannub=0 skips. Not IO80211 (wifid still needs that later).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 
+ #include <IOKit/IOLib.h>
+-#include <IOKit/IOService.h>
+-#include <IOKit/IOWorkLoop.h>
+ #include <IOKit/IOTimerEventSource.h>
++#include <IOKit/network/IOEthernetController.h>
++#include <IOKit/network/IOEthernetInterface.h>
++#include <IOKit/network/IONetworkMedium.h>
++#include <IOKit/network/IOOutputQueue.h>
+ #include <libkern/c++/OSBoolean.h>
+-#include <libkern/c++/OSNumber.h>
+-#include <libkern/c++/OSString.h>
+-#include <libkern/c++/OSData.h>
+ #include <pexpert/pexpert.h>
++#include <sys/kpi_mbuf.h>
+ #include <sys/topaz_wlan.h>
+ 
+-class TopazWlan : public IOService {
++class TopazWlan : public IOEthernetController {
+ 	OSDeclareDefaultStructors(TopazWlan);
+ public:
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void stop(IOService *provider) APPLE_KEXT_OVERRIDE;
+-	void free(void) APPLE_KEXT_OVERRIDE;
++	IOReturn getHardwareAddress(IOEthernetAddress *addrP) APPLE_KEXT_OVERRIDE;
++	IOReturn setMulticastMode(bool active) APPLE_KEXT_OVERRIDE;
++	IOReturn setPromiscuousMode(bool active) APPLE_KEXT_OVERRIDE;
++	IOReturn enable(IONetworkInterface *interface) APPLE_KEXT_OVERRIDE;
++	IOReturn disable(IONetworkInterface *interface) APPLE_KEXT_OVERRIDE;
++	UInt32 outputPacket(mbuf_t m, void *param) APPLE_KEXT_OVERRIDE;
++	void submitRx(const uint8_t *eth, unsigned len);
+ private:
+-	IOWorkLoop *fLoop;
+ 	IOTimerEventSource *fTimer;
+ 	bool fTimerAdded;
++	IONetworkInterface *fIface;
++	IONetworkMedium *fMedium;
++	bool fEnabled;
+ 	void publish(void);
++	void updateLink(void);
+ 	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
+ };
+ 
+-OSDefineMetaClassAndStructors(TopazWlan, IOService);
++static void
++topaz_wlan_rx_thunk(const uint8_t *eth, unsigned len, void *arg)
++{
++	TopazWlan *self = (TopazWlan *)arg;
++
++	if (self != NULL) {
++		self->submitRx(eth, len);
++	}
++}
++
++OSDefineMetaClassAndStructors(TopazWlan, IOEthernetController);
+ 
+ void
+ TopazWlan::publish(void)
+@@ -48,7 +70,6 @@ TopazWlan::publish(void)
+ 	setProperty("TopazWlanReady", ready ? kOSBooleanTrue : kOSBooleanFalse);
+ 	setProperty("TopazWlanAssociated", assoc ? kOSBooleanTrue : kOSBooleanFalse);
+ 	setProperty("TopazWlanAuthorized", auth ? kOSBooleanTrue : kOSBooleanFalse);
+-	setProperty("BSD Name", "tw0");
+ 
+ 	if (ready) {
+ 		topaz_wlan_address(mac);
+@@ -56,7 +77,6 @@ TopazWlan::publish(void)
+ 		    "%02x:%02x:%02x:%02x:%02x:%02x",
+ 		    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+ 		setProperty("TopazWlanMAC", macstr);
+-		setProperty("IOMACAddress", (void *)mac, sizeof(mac));
+ 	}
+ 
+ 	if (have_ip) {
+@@ -92,6 +112,17 @@ TopazWlan::publish(void)
+ 	}
+ }
+ 
++void
++TopazWlan::updateLink(void)
++{
++	UInt32 status = 0;
++
++	if (topaz_wlan_authorized()) {
++		status = kIONetworkLinkValid | kIONetworkLinkActive;
++	}
++	setLinkStatus(status, (status != 0) ? fMedium : 0, 433000000ULL);
++}
++
+ void
+ TopazWlan::timerFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+@@ -101,70 +132,184 @@ TopazWlan::timerFired(OSObject *owner, IOTimerEventSource *sender)
+ 		return;
+ 	}
+ 	self->publish();
++	self->updateLink();
+ 	if (sender != NULL) {
+ 		sender->setTimeoutMS(2000);
+ 	}
+ }
+ 
++IOReturn
++TopazWlan::getHardwareAddress(IOEthernetAddress *addrP)
++{
++	if (addrP == NULL) {
++		return kIOReturnBadArgument;
++	}
++	if (!topaz_wlan_ready()) {
++		bzero(addrP->bytes, kIOEthernetAddressSize);
++		return kIOReturnNotReady;
++	}
++	topaz_wlan_address(addrP->bytes);
++	return kIOReturnSuccess;
++}
++
++IOReturn
++TopazWlan::setMulticastMode(bool active)
++{
++	(void)active;
++	return kIOReturnSuccess;
++}
++
++IOReturn
++TopazWlan::setPromiscuousMode(bool active)
++{
++	(void)active;
++	return kIOReturnSuccess;
++}
++
++IOReturn
++TopazWlan::enable(IONetworkInterface *interface)
++{
++	(void)interface;
++	fEnabled = true;
++	updateLink();
++	return kIOReturnSuccess;
++}
++
++IOReturn
++TopazWlan::disable(IONetworkInterface *interface)
++{
++	(void)interface;
++	fEnabled = false;
++	setLinkStatus(0, 0);
++	return kIOReturnSuccess;
++}
++
++UInt32
++TopazWlan::outputPacket(mbuf_t m, void *param)
++{
++	uint8_t buf[1518];
++	size_t len;
++
++	(void)param;
++	if (m == NULL) {
++		return kIOReturnOutputDropped;
++	}
++	len = mbuf_pkthdr_len(m);
++	if (!fEnabled || !topaz_wlan_authorized() ||
++	    len < kIOEthernetAddressSize * 2 + 2 || len > sizeof(buf) ||
++	    mbuf_copydata(m, 0, len, buf) != 0 ||
++	    !topaz_wlan_tx_ethernet(buf, (unsigned)len)) {
++		freePacket(m);
++		return kIOReturnOutputDropped;
++	}
++	freePacket(m);
++	return kIOReturnOutputSuccess;
++}
++
++void
++TopazWlan::submitRx(const uint8_t *eth, unsigned len)
++{
++	mbuf_t m;
++
++	if (!fEnabled || fIface == NULL || eth == NULL || len < 14 || len > 1518) {
++		return;
++	}
++	m = allocatePacket((UInt32)len);
++	if (m == NULL) {
++		return;
++	}
++	if (mbuf_copyback(m, 0, len, eth, MBUF_DONTWAIT) != 0) {
++		freePacket(m);
++		return;
++	}
++	fIface->inputPacket(m, (UInt32)len, 0, 0);
++}
++
+ bool
+ TopazWlan::start(IOService *provider)
+ {
+ 	int enabled = 1;
++	IOWorkLoop *loop;
++	OSDictionary *media;
+ 
+-	if (!IOService::start(provider)) {
+-		return false;
+-	}
+ 	(void)PE_parse_boot_argn("topazwlannub", &enabled, sizeof(enabled));
+ 	if (!enabled) {
+ 		IOLog("TopazWlan: disabled (topazwlannub=0)\n");
+ 		return false;
+ 	}
++	if (!IOEthernetController::start(provider)) {
++		return false;
++	}
+ 
+-	fLoop = NULL;
+ 	fTimer = NULL;
+ 	fTimerAdded = false;
++	fIface = NULL;
++	fMedium = NULL;
++	fEnabled = false;
+ 
+-	fLoop = IOWorkLoop::workLoop();
+-	if (fLoop == NULL) {
++	fMedium = IONetworkMedium::medium(kIOMediumEthernetAuto, 433000000);
++	media = OSDictionary::withCapacity(1);
++	if (fMedium == NULL || media == NULL ||
++	    !IONetworkMedium::addMedium(media, fMedium) ||
++	    !publishMediumDictionary(media)) {
++		if (media != NULL) {
++			media->release();
++		}
++		stop(provider);
+ 		return false;
+ 	}
++	media->release();
++	setSelectedMedium(fMedium);
++
++	loop = getWorkLoop();
+ 	fTimer = IOTimerEventSource::timerEventSource(this, &TopazWlan::timerFired);
+-	if (fTimer == NULL || fLoop->addEventSource(fTimer) != kIOReturnSuccess) {
++	if (loop == NULL || fTimer == NULL ||
++	    loop->addEventSource(fTimer) != kIOReturnSuccess) {
++		stop(provider);
+ 		return false;
+ 	}
+ 	fTimerAdded = true;
+ 
+ 	setName("TopazWlan");
++	if (!attachInterface(&fIface, true) || fIface == NULL) {
++		IOLog("TopazWlan: attachInterface failed\n");
++		stop(provider);
++		return false;
++	}
++	topaz_wlan_enet_set_rx(topaz_wlan_rx_thunk, this);
+ 	publish();
+-	registerService();
++	updateLink();
+ 	fTimer->setTimeoutMS(2000);
+-	IOLog("TopazWlan: nub registered (ioreg; not IONetwork yet)\n");
++	IOLog("TopazWlan: IOEthernetInterface registered (sweetwlanif=0 to drop tw0)\n");
+ 	return true;
+ }
+ 
+ void
+ TopazWlan::stop(IOService *provider)
+ {
++	topaz_wlan_enet_set_rx(NULL, NULL);
+ 	if (fTimer != NULL) {
+ 		fTimer->cancelTimeout();
+-		if (fTimerAdded && fLoop != NULL) {
+-			fLoop->removeEventSource(fTimer);
++		if (fTimerAdded) {
++			IOWorkLoop *loop = getWorkLoop();
++
++			if (loop != NULL) {
++				loop->removeEventSource(fTimer);
++			}
+ 			fTimerAdded = false;
+ 		}
+ 		fTimer->release();
+ 		fTimer = NULL;
+ 	}
+-	if (fLoop != NULL) {
+-		fLoop->release();
+-		fLoop = NULL;
++	if (fIface != NULL) {
++		detachInterface(fIface, true);
++		fIface = NULL;
+ 	}
+-	IOService::stop(provider);
+-}
+-
+-void
+-TopazWlan::free(void)
+-{
+-	IOService::free();
++	if (fMedium != NULL) {
++		fMedium->release();
++		fMedium = NULL;
++	}
++	IOEthernetController::stop(provider);
+ }
+ 
+ #else /* !ARM64_BOARD_CONFIG_SWEET */

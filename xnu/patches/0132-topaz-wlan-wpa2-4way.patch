@@ -1,0 +1,925 @@
+Subject: [PATCH] topaz-0132: in-kernel WPA2-PSK 4-way handshake
+
+PBKDF2-HMAC-SHA1 PMK, PRF PTK, EAPOL MIC, AES key-unwrap GTK.
+Boot-arg wifipsk= drives topaz_wlan_wpa.c; TopazModem sends msg2/msg4
+via HTT and installs keys through topaz_wlan_install_key (0131).
+
+diff --git a/bsd/sys/topaz_wlan_wpa.h b/bsd/sys/topaz_wlan_wpa.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/sys/topaz_wlan_wpa.h
+@@ -0,0 +1,43 @@
++/*
++ * topaz: WPA2-PSK 4-way handshake (0132). Used by TopazModem when wifipsk= is set.
++ */
++#ifndef _BSD_SYS_TOPAZ_WLAN_WPA_H_
++#define _BSD_SYS_TOPAZ_WLAN_WPA_H_
++
++#include <sys/types.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++struct topaz_wlan_wpa_keys {
++	uint8_t tk[16];
++	uint8_t gtk[32];
++	unsigned gtk_len;
++	unsigned gtk_id;
++	bool have_gtk;
++	bool done;
++};
++
++/* Arm after assoc to a privacy BSS. rsn_ie is the full IE (id+len+body), or NULL. */
++void topaz_wlan_wpa_start(const uint8_t *ssid, unsigned ssid_len,
++    const char *psk, const uint8_t spa[6], const uint8_t aa[6],
++    const uint8_t *rsn_ie, unsigned rsn_ie_len);
++
++void topaz_wlan_wpa_reset(void);
++
++/*
++ * Feed an EAPOL frame (starts at 802.1X header). Writes reply EAPOL into out[].
++ * Returns reply length (>0), 0 if none, or -1 on hard error (logged).
++ * When keys->done, install TK/GTK via topaz_wlan_install_key and authorize.
++ */
++int topaz_wlan_wpa_on_eapol(const uint8_t *eapol, unsigned len,
++    uint8_t *out, unsigned out_max, struct topaz_wlan_wpa_keys *keys);
++
++bool topaz_wlan_wpa_active(void);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* _BSD_SYS_TOPAZ_WLAN_WPA_H_ */
+
+
+diff --git a/bsd/dev/topaz_wlan_wpa.c b/bsd/dev/topaz_wlan_wpa.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/topaz_wlan_wpa.c
+@@ -0,0 +1,742 @@
++/*
++ * topaz: WPA2-PSK 4-way (PBKDF2 → PTK → MIC → AES key-unwrap GTK).
++ * Vectors pinned to IEEE 802.11i / independent hierarchy (see NOTES).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/types.h>
++#include <libkern/libkern.h>
++#include <libkern/crypto/sha1.h>
++#include <sys/topaz_wlan_wpa.h>
++
++#define LOG(fmt, ...) printf("SWEET WLAN WPA: " fmt "\n", ##__VA_ARGS__)
++
++#define EAPOL_VER           2
++#define EAPOL_TYPE_KEY      3
++#define KEY_DESC_RSN        2
++#define EAPOL_KEY_BODY      95
++#define EAPOL_MIC_OFF       (4 + 77)
++
++#define KI_VERSION_MASK     0x0007
++#define KI_PAIRWISE         0x0008
++#define KI_INSTALL          0x0040
++#define KI_ACK              0x0080
++#define KI_MIC              0x0100
++#define KI_SECURE           0x0200
++#define KI_ENCRYPTED        0x1000
++
++static bool w_active;
++static uint8_t w_pmk[32];
++static uint8_t w_spa[6], w_aa[6];
++static uint8_t w_snonce[32];
++static uint8_t w_rsn[64];
++static unsigned w_rsn_len;
++static uint8_t w_kck[16], w_kek[16], w_tk[16];
++static bool w_have_ptk;
++static uint64_t w_last_replay;
++static bool w_have_replay;
++
++/* ---- HMAC-SHA1 / PBKDF2 / PRF ---- */
++
++static void
++hmac_sha1(const uint8_t *key, unsigned key_len, const uint8_t *data,
++    unsigned data_len, uint8_t out[20])
++{
++	SHA1_CTX ctx;
++	uint8_t k[64], o_pad[64], i_pad[64], tk[20];
++	unsigned i;
++
++	bzero(k, sizeof(k));
++	if (key_len > 64) {
++		SHA1Init(&ctx);
++		SHA1Update(&ctx, key, key_len);
++		SHA1Final(tk, &ctx);
++		memcpy(k, tk, 20);
++	} else {
++		memcpy(k, key, key_len);
++	}
++	for (i = 0; i < 64; i++) {
++		o_pad[i] = k[i] ^ 0x5c;
++		i_pad[i] = k[i] ^ 0x36;
++	}
++	SHA1Init(&ctx);
++	SHA1Update(&ctx, i_pad, 64);
++	SHA1Update(&ctx, data, data_len);
++	SHA1Final(tk, &ctx);
++	SHA1Init(&ctx);
++	SHA1Update(&ctx, o_pad, 64);
++	SHA1Update(&ctx, tk, 20);
++	SHA1Final(out, &ctx);
++}
++
++static void
++pbkdf2_sha1(const uint8_t *pass, unsigned pass_len, const uint8_t *salt,
++    unsigned salt_len, unsigned iterations, uint8_t *out, unsigned out_len)
++{
++	uint8_t U[20], T[20], block[4];
++	unsigned produced = 0, i, j, k;
++
++	for (i = 1; produced < out_len; i++) {
++		block[0] = (uint8_t)(i >> 24);
++		block[1] = (uint8_t)(i >> 16);
++		block[2] = (uint8_t)(i >> 8);
++		block[3] = (uint8_t)i;
++		{
++			uint8_t msg[256];
++			unsigned ml;
++
++			if (salt_len + 4 > sizeof(msg)) {
++				return;
++			}
++			memcpy(msg, salt, salt_len);
++			memcpy(msg + salt_len, block, 4);
++			ml = salt_len + 4;
++			hmac_sha1(pass, pass_len, msg, ml, U);
++		}
++		memcpy(T, U, 20);
++		for (j = 1; j < iterations; j++) {
++			hmac_sha1(pass, pass_len, U, 20, U);
++			for (k = 0; k < 20; k++) {
++				T[k] ^= U[k];
++			}
++		}
++		for (k = 0; k < 20 && produced < out_len; k++) {
++			out[produced++] = T[k];
++		}
++	}
++}
++
++static void
++prf_sha1(const uint8_t *key, unsigned key_len, const char *label,
++    const uint8_t *data, unsigned data_len, uint8_t *out, unsigned out_len)
++{
++	uint8_t buf[128], hash[20];
++	unsigned label_len = (unsigned)strlen(label), n = 0, c = 0, i;
++
++	while (n < out_len) {
++		unsigned p = 0;
++
++		if (label_len + 1 + data_len + 1 > sizeof(buf)) {
++			return;
++		}
++		memcpy(buf, label, label_len);
++		p = label_len;
++		buf[p++] = 0;
++		memcpy(buf + p, data, data_len);
++		p += data_len;
++		buf[p++] = (uint8_t)c;
++		hmac_sha1(key, key_len, buf, p, hash);
++		for (i = 0; i < 20 && n < out_len; i++) {
++			out[n++] = hash[i];
++		}
++		c++;
++	}
++}
++
++static void
++derive_ptk(const uint8_t pmk[32], const uint8_t aa[6], const uint8_t spa[6],
++    const uint8_t anonce[32], const uint8_t snonce[32],
++    uint8_t kck[16], uint8_t kek[16], uint8_t tk[16])
++{
++	uint8_t data[12 + 64], stream[48];
++	const uint8_t *m0, *m1, *n0, *n1;
++
++	if (memcmp(aa, spa, 6) <= 0) {
++		m0 = aa;
++		m1 = spa;
++	} else {
++		m0 = spa;
++		m1 = aa;
++	}
++	if (memcmp(anonce, snonce, 32) <= 0) {
++		n0 = anonce;
++		n1 = snonce;
++	} else {
++		n0 = snonce;
++		n1 = anonce;
++	}
++	memcpy(data, m0, 6);
++	memcpy(data + 6, m1, 6);
++	memcpy(data + 12, n0, 32);
++	memcpy(data + 44, n1, 32);
++	prf_sha1(pmk, 32, "Pairwise key expansion", data, 76, stream, 48);
++	memcpy(kck, stream, 16);
++	memcpy(kek, stream + 16, 16);
++	memcpy(tk, stream + 32, 16);
++}
++
++static void
++eapol_mic(const uint8_t kck[16], const uint8_t *frame, unsigned len, uint8_t mic[16])
++{
++	uint8_t hash[20];
++
++	hmac_sha1(kck, 16, frame, len, hash);
++	memcpy(mic, hash, 16);
++}
++
++/* ---- AES-128 ECB + RFC 3394 key unwrap (portable) ---- */
++
++static const uint8_t aes_sbox[256] = {
++	0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
++	0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
++	0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
++	0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
++	0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
++	0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
++	0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,
++	0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
++	0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
++	0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
++	0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
++	0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
++	0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
++	0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
++	0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
++	0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16
++};
++
++static uint8_t
++xtime(uint8_t a)
++{
++	return (uint8_t)((a << 1) ^ ((a & 0x80) ? 0x1b : 0));
++}
++
++static void
++aes_expand(const uint8_t key[16], uint8_t rk[176])
++{
++	static const uint8_t rcon[11] = {
++		0x00,0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80,0x1b,0x36
++	};
++	unsigned i;
++
++	memcpy(rk, key, 16);
++	for (i = 4; i < 44; i++) {
++		uint8_t t[4];
++
++		memcpy(t, rk + 4 * (i - 1), 4);
++		if ((i % 4) == 0) {
++			uint8_t tmp = t[0];
++
++			t[0] = aes_sbox[t[1]] ^ rcon[i / 4];
++			t[1] = aes_sbox[t[2]];
++			t[2] = aes_sbox[t[3]];
++			t[3] = aes_sbox[tmp];
++		}
++		rk[4 * i + 0] = rk[4 * (i - 4) + 0] ^ t[0];
++		rk[4 * i + 1] = rk[4 * (i - 4) + 1] ^ t[1];
++		rk[4 * i + 2] = rk[4 * (i - 4) + 2] ^ t[2];
++		rk[4 * i + 3] = rk[4 * (i - 4) + 3] ^ t[3];
++	}
++}
++
++static void
++aes_encrypt_block(const uint8_t rk[176], const uint8_t in[16], uint8_t out[16])
++{
++	uint8_t s[16];
++	unsigned round, i;
++
++	for (i = 0; i < 16; i++) {
++		s[i] = in[i] ^ rk[i];
++	}
++	for (round = 1; round <= 10; round++) {
++		uint8_t t[16];
++
++		for (i = 0; i < 16; i++) {
++			t[i] = aes_sbox[s[i]];
++		}
++		{
++			uint8_t u;
++
++			u = t[1]; t[1] = t[5]; t[5] = t[9]; t[9] = t[13]; t[13] = u;
++			u = t[2]; t[2] = t[10]; t[10] = u;
++			u = t[6]; t[6] = t[14]; t[14] = u;
++			u = t[15]; t[15] = t[11]; t[11] = t[7]; t[7] = t[3]; t[3] = u;
++		}
++		if (round < 10) {
++			for (i = 0; i < 4; i++) {
++				uint8_t a = t[4 * i], b = t[4 * i + 1];
++				uint8_t c = t[4 * i + 2], d = t[4 * i + 3];
++
++				t[4 * i] = (uint8_t)(xtime(a) ^ xtime(b) ^ b ^ c ^ d);
++				t[4 * i + 1] = (uint8_t)(a ^ xtime(b) ^ xtime(c) ^ c ^ d);
++				t[4 * i + 2] = (uint8_t)(a ^ b ^ xtime(c) ^ xtime(d) ^ d);
++				t[4 * i + 3] = (uint8_t)(xtime(a) ^ a ^ b ^ c ^ xtime(d));
++			}
++		}
++		for (i = 0; i < 16; i++) {
++			s[i] = t[i] ^ rk[16 * round + i];
++		}
++	}
++	memcpy(out, s, 16);
++}
++
++/* Decrypt one block: expand + encrypt with inverse would be long; use decrypt via
++ * encrypt-only Feistel of RFC 3394 which only needs AES encrypt. Unwrap uses decrypt
++ * so we need AES decrypt. Compact inverse: */
++static const uint8_t aes_isbox[256] = {
++	0x52,0x09,0x6a,0xd5,0x30,0x36,0xa5,0x38,0xbf,0x40,0xa3,0x9e,0x81,0xf3,0xd7,0xfb,
++	0x7c,0xe3,0x39,0x82,0x9b,0x2f,0xff,0x87,0x34,0x8e,0x43,0x44,0xc4,0xde,0xe9,0xcb,
++	0x54,0x7b,0x94,0x32,0xa6,0xc2,0x23,0x3d,0xee,0x4c,0x95,0x0b,0x42,0xfa,0xc3,0x4e,
++	0x08,0x2e,0xa1,0x66,0x28,0xd9,0x24,0xb2,0x76,0x5b,0xa2,0x49,0x6d,0x8b,0xd1,0x25,
++	0x72,0xf8,0xf6,0x64,0x86,0x68,0x98,0x16,0xd4,0xa4,0x5c,0xcc,0x5d,0x65,0xb6,0x92,
++	0x6c,0x70,0x48,0x50,0xfd,0xed,0xb9,0xda,0x5e,0x15,0x46,0x57,0xa7,0x8d,0x9d,0x84,
++	0x90,0xd8,0xab,0x00,0x8c,0xbc,0xd3,0x0a,0xf7,0xe4,0x58,0x05,0xb8,0xb3,0x45,0x06,
++	0xd0,0x2c,0x1e,0x8f,0xca,0x3f,0x0f,0x02,0xc1,0xaf,0xbd,0x03,0x01,0x13,0x8a,0x6b,
++	0x3a,0x91,0x11,0x41,0x4f,0x67,0xdc,0xea,0x97,0xf2,0xcf,0xce,0xf0,0xb4,0xe6,0x73,
++	0x96,0xac,0x74,0x22,0xe7,0xad,0x35,0x85,0xe2,0xf9,0x37,0xe8,0x1c,0x75,0xdf,0x6e,
++	0x47,0xf1,0x1a,0x71,0x1d,0x29,0xc5,0x89,0x6f,0xb7,0x62,0x0e,0xaa,0x18,0xbe,0x1b,
++	0xfc,0x56,0x3e,0x4b,0xc6,0xd2,0x79,0x20,0x9a,0xdb,0xc0,0xfe,0x78,0xcd,0x5a,0xf4,
++	0x1f,0xdd,0xa8,0x33,0x88,0x07,0xc7,0x31,0xb1,0x12,0x10,0x59,0x27,0x80,0xec,0x5f,
++	0x60,0x51,0x7f,0xa9,0x19,0xb5,0x4a,0x0d,0x2d,0xe5,0x7a,0x9f,0x93,0xc9,0x9c,0xef,
++	0xa0,0xe0,0x3b,0x4d,0xae,0x2a,0xf5,0xb0,0xc8,0xeb,0xbb,0x3c,0x83,0x53,0x99,0x61,
++	0x17,0x2b,0x04,0x7e,0xba,0x77,0xd6,0x26,0xe1,0x69,0x14,0x63,0x55,0x21,0x0c,0x7d
++};
++
++static uint8_t
++mul(uint8_t a, uint8_t b)
++{
++	uint8_t p = 0;
++	unsigned i;
++
++	for (i = 0; i < 8; i++) {
++		if (b & 1) {
++			p ^= a;
++		}
++		{
++			uint8_t hi = a & 0x80;
++
++			a <<= 1;
++			if (hi) {
++				a ^= 0x1b;
++			}
++		}
++		b >>= 1;
++	}
++	return p;
++}
++
++static void
++aes_decrypt_block(const uint8_t rk[176], const uint8_t in[16], uint8_t out[16])
++{
++	uint8_t s[16];
++	int round;
++	unsigned i;
++
++	for (i = 0; i < 16; i++) {
++		s[i] = in[i] ^ rk[160 + i];
++	}
++	for (round = 9; round >= 0; round--) {
++		uint8_t t[16], u;
++
++		u = s[13]; s[13] = s[9]; s[9] = s[5]; s[5] = s[1]; s[1] = u;
++		u = s[2]; s[2] = s[10]; s[10] = u;
++		u = s[6]; s[6] = s[14]; s[14] = u;
++		u = s[3]; s[3] = s[7]; s[7] = s[11]; s[11] = s[15]; s[15] = u;
++		for (i = 0; i < 16; i++) {
++			t[i] = aes_isbox[s[i]];
++		}
++		for (i = 0; i < 16; i++) {
++			s[i] = t[i] ^ rk[16 * round + i];
++		}
++		if (round > 0) {
++			for (i = 0; i < 4; i++) {
++				uint8_t a = s[4 * i], b = s[4 * i + 1];
++				uint8_t c = s[4 * i + 2], d = s[4 * i + 3];
++
++				s[4 * i] = (uint8_t)(mul(a, 0x0e) ^ mul(b, 0x0b) ^ mul(c, 0x0d) ^ mul(d, 0x09));
++				s[4 * i + 1] = (uint8_t)(mul(a, 0x09) ^ mul(b, 0x0e) ^ mul(c, 0x0b) ^ mul(d, 0x0d));
++				s[4 * i + 2] = (uint8_t)(mul(a, 0x0d) ^ mul(b, 0x09) ^ mul(c, 0x0e) ^ mul(d, 0x0b));
++				s[4 * i + 3] = (uint8_t)(mul(a, 0x0b) ^ mul(b, 0x0d) ^ mul(c, 0x09) ^ mul(d, 0x0e));
++			}
++		}
++	}
++	memcpy(out, s, 16);
++}
++
++static int
++aes_key_unwrap(const uint8_t kek[16], const uint8_t *cipher, unsigned clen,
++    uint8_t *plain, unsigned *plen)
++{
++	uint8_t rk[176], A[8], B[16], R[8 * 16];
++	unsigned n, i, j, t;
++
++	if (clen < 24 || (clen % 8) != 0 || clen > 8 + 8 * 16) {
++		return -1;
++	}
++	n = (clen / 8) - 1;
++	aes_expand(kek, rk);
++	memcpy(A, cipher, 8);
++	memcpy(R, cipher + 8, n * 8);
++	for (j = 5; j != (unsigned)-1; j--) {
++		for (i = n; i >= 1; i--) {
++			t = n * j + i;
++			memcpy(B, A, 8);
++			B[4] ^= (uint8_t)(t >> 24);
++			B[5] ^= (uint8_t)(t >> 16);
++			B[6] ^= (uint8_t)(t >> 8);
++			B[7] ^= (uint8_t)t;
++			memcpy(B + 8, R + (i - 1) * 8, 8);
++			aes_decrypt_block(rk, B, B);
++			memcpy(A, B, 8);
++			memcpy(R + (i - 1) * 8, B + 8, 8);
++			if (i == 1) {
++				break;
++			}
++		}
++	}
++	if (A[0] != 0xa6 || A[1] != 0xa6 || A[2] != 0xa6 || A[3] != 0xa6 ||
++	    A[4] != 0xa6 || A[5] != 0xa6 || A[6] != 0xa6 || A[7] != 0xa6) {
++		return -1;
++	}
++	memcpy(plain, R, n * 8);
++	*plen = n * 8;
++	return 0;
++}
++
++static int
++find_gtk(const uint8_t *kd, unsigned kd_len, uint8_t *gtk, unsigned *gtk_len,
++    unsigned *gtk_id)
++{
++	unsigned at = 0;
++
++	while (at + 2 <= kd_len) {
++		uint8_t id = kd[at];
++		unsigned len = kd[at + 1];
++		const uint8_t *body;
++
++		if (len == 0 || at + 2 + len > kd_len) {
++			return -1;
++		}
++		body = kd + at + 2;
++		if (id == 0xdd && len >= 6 && body[0] == 0x00 && body[1] == 0x0f &&
++		    body[2] == 0xac && body[3] == 1) {
++			unsigned klen = len - 6;
++
++			if (klen == 0 || klen > 32) {
++				return -1;
++			}
++			*gtk_id = body[4] & 0x03;
++			memcpy(gtk, body + 6, klen);
++			*gtk_len = klen;
++			return 0;
++		}
++		at += 2 + len;
++	}
++	return -1;
++}
++
++/* ---- EAPOL encode/decode ---- */
++
++static uint16_t
++be16(const uint8_t *p)
++{
++	return (uint16_t)((p[0] << 8) | p[1]);
++}
++
++static void
++put_be16(uint8_t *p, uint16_t v)
++{
++	p[0] = (uint8_t)(v >> 8);
++	p[1] = (uint8_t)v;
++}
++
++static void
++put_be64(uint8_t *p, uint64_t v)
++{
++	int i;
++
++	for (i = 7; i >= 0; i--) {
++		p[i] = (uint8_t)v;
++		v >>= 8;
++	}
++}
++
++static uint64_t
++get_be64(const uint8_t *p)
++{
++	uint64_t v = 0;
++	unsigned i;
++
++	for (i = 0; i < 8; i++) {
++		v = (v << 8) | p[i];
++	}
++	return v;
++}
++
++static int
++build_eapol_key(uint8_t *out, unsigned out_max, uint16_t key_info,
++    uint64_t replay, const uint8_t nonce[32], const uint8_t *key_data,
++    unsigned key_data_len, const uint8_t mic[16])
++{
++	unsigned body = EAPOL_KEY_BODY + key_data_len;
++	uint8_t *b;
++
++	if (4 + body > out_max) {
++		return -1;
++	}
++	out[0] = EAPOL_VER;
++	out[1] = EAPOL_TYPE_KEY;
++	put_be16(out + 2, (uint16_t)body);
++	b = out + 4;
++	bzero(b, body);
++	b[0] = KEY_DESC_RSN;
++	put_be16(b + 1, key_info);
++	put_be16(b + 3, 0);
++	put_be64(b + 5, replay);
++	memcpy(b + 13, nonce, 32);
++	memcpy(b + 77, mic, 16);
++	put_be16(b + 93, (uint16_t)key_data_len);
++	if (key_data_len != 0) {
++		memcpy(b + 95, key_data, key_data_len);
++	}
++	return (int)(4 + body);
++}
++
++void
++topaz_wlan_wpa_reset(void)
++{
++	w_active = false;
++	w_have_ptk = false;
++	w_have_replay = false;
++	w_rsn_len = 0;
++	bzero(w_pmk, sizeof(w_pmk));
++}
++
++void
++topaz_wlan_wpa_start(const uint8_t *ssid, unsigned ssid_len,
++    const char *psk, const uint8_t spa[6], const uint8_t aa[6],
++    const uint8_t *rsn_ie, unsigned rsn_ie_len)
++{
++	unsigned psk_len;
++	SHA1_CTX ctx;
++	uint8_t seed[40];
++
++	topaz_wlan_wpa_reset();
++	if (ssid == NULL || psk == NULL || spa == NULL || aa == NULL) {
++		return;
++	}
++	psk_len = (unsigned)strlen(psk);
++	if (psk_len < 8 || psk_len > 63 || ssid_len == 0 || ssid_len > 32) {
++		LOG("bad psk/ssid len (%u/%u)", psk_len, ssid_len);
++		return;
++	}
++	pbkdf2_sha1((const uint8_t *)psk, psk_len, ssid, ssid_len, 4096, w_pmk, 32);
++	memcpy(w_spa, spa, 6);
++	memcpy(w_aa, aa, 6);
++	/* SNonce: not a CSPRNG call site everywhere; hash time+MACs+psk prefix. */
++	SHA1Init(&ctx);
++	SHA1Update(&ctx, spa, 6);
++	SHA1Update(&ctx, aa, 6);
++	SHA1Update(&ctx, (const uint8_t *)psk, MIN(psk_len, 16u));
++	{
++		uint32_t t = (uint32_t)(uintptr_t)&ctx;
++
++		SHA1Update(&ctx, &t, sizeof(t));
++	}
++	SHA1Final(seed, &ctx);
++	memcpy(w_snonce, seed, 20);
++	SHA1Init(&ctx);
++	SHA1Update(&ctx, seed, 20);
++	SHA1Update(&ctx, ssid, ssid_len);
++	SHA1Final(seed, &ctx);
++	memcpy(w_snonce + 20, seed, 12);
++	if (rsn_ie != NULL && rsn_ie_len >= 2 && rsn_ie_len <= sizeof(w_rsn)) {
++		memcpy(w_rsn, rsn_ie, rsn_ie_len);
++		w_rsn_len = rsn_ie_len;
++	} else {
++		/* Minimal RSN matching our assoc req (CCMP / PSK). */
++		static const uint8_t def[] = {
++			48, 20, 1, 0,
++			0x00, 0x0f, 0xac, 4,
++			1, 0, 0x00, 0x0f, 0xac, 4,
++			1, 0, 0x00, 0x0f, 0xac, 2,
++			0, 0
++		};
++		memcpy(w_rsn, def, sizeof(def));
++		w_rsn_len = sizeof(def);
++	}
++	w_active = true;
++	LOG("armed (ssid_len %u psk_len %u); waiting for EAPOL msg1",
++	    ssid_len, psk_len);
++}
++
++bool
++topaz_wlan_wpa_active(void)
++{
++	return w_active;
++}
++
++int
++topaz_wlan_wpa_on_eapol(const uint8_t *eapol, unsigned len,
++    uint8_t *out, unsigned out_max, struct topaz_wlan_wpa_keys *keys)
++{
++	const uint8_t *body;
++	unsigned declared, data_len;
++	uint16_t key_info, ver;
++	uint64_t replay;
++	uint8_t anonce[32], mic_rx[16], mic_chk[16];
++	uint8_t scratch[512];
++	int scratch_len;
++	bool pairwise, has_mic, ack, secure, enc;
++
++	if (keys != NULL) {
++		bzero(keys, sizeof(*keys));
++	}
++	if (!w_active || eapol == NULL || out == NULL || len < 4 + EAPOL_KEY_BODY) {
++		return 0;
++	}
++	if (eapol[1] != EAPOL_TYPE_KEY) {
++		return 0;
++	}
++	declared = be16(eapol + 2);
++	if (declared < EAPOL_KEY_BODY || 4 + declared > len) {
++		LOG("malformed EAPOL len %u declared %u", len, declared);
++		return -1;
++	}
++	body = eapol + 4;
++	if (body[0] != KEY_DESC_RSN) {
++		LOG("unsupported key descriptor %u", body[0]);
++		return -1;
++	}
++	key_info = be16(body + 1);
++	data_len = be16(body + 93);
++	if (EAPOL_KEY_BODY + data_len > declared) {
++		return -1;
++	}
++	replay = get_be64(body + 5);
++	memcpy(anonce, body + 13, 32);
++	memcpy(mic_rx, body + 77, 16);
++	ver = key_info & KI_VERSION_MASK;
++	pairwise = (key_info & KI_PAIRWISE) != 0;
++	has_mic = (key_info & KI_MIC) != 0;
++	ack = (key_info & KI_ACK) != 0;
++	secure = (key_info & KI_SECURE) != 0;
++	enc = (key_info & KI_ENCRYPTED) != 0;
++	if (!pairwise) {
++		return 0; /* group rekey: ignore for now */
++	}
++
++	/* Message 1: no MIC, ACK set */
++	if (!has_mic && ack) {
++		if (w_have_replay && replay <= w_last_replay) {
++			LOG("replayed msg1");
++			return -1;
++		}
++		w_last_replay = replay;
++		w_have_replay = true;
++		derive_ptk(w_pmk, w_aa, w_spa, anonce, w_snonce, w_kck, w_kek, w_tk);
++		w_have_ptk = true;
++		{
++			uint8_t zmic[16];
++
++			bzero(zmic, sizeof(zmic));
++			scratch_len = build_eapol_key(scratch, sizeof(scratch),
++			    (uint16_t)(ver | KI_PAIRWISE | KI_MIC), replay, w_snonce,
++			    w_rsn, w_rsn_len, zmic);
++		}
++		if (scratch_len < 0) {
++			return -1;
++		}
++		eapol_mic(w_kck, scratch, (unsigned)scratch_len, mic_chk);
++		memcpy(scratch + EAPOL_MIC_OFF, mic_chk, 16);
++		if ((unsigned)scratch_len > out_max) {
++			return -1;
++		}
++		memcpy(out, scratch, (unsigned)scratch_len);
++		LOG("msg1 ok → msg2 (%u B)", scratch_len);
++		return scratch_len;
++	}
++
++	/* Message 3: MIC + ACK */
++	if (has_mic && ack) {
++		uint8_t plain[256];
++		unsigned plain_len = 0;
++
++		if (!w_have_ptk) {
++			LOG("msg3 before msg1");
++			return -1;
++		}
++		{
++			uint8_t kck2[16], kek2[16], tk2[16];
++
++			derive_ptk(w_pmk, w_aa, w_spa, anonce, w_snonce, kck2, kek2, tk2);
++			if (memcmp(kck2, w_kck, 16) != 0) {
++				LOG("msg3 ANonce mismatch");
++				return -1;
++			}
++		}
++		if (len > sizeof(scratch)) {
++			return -1;
++		}
++		memcpy(scratch, eapol, len);
++		bzero(scratch + EAPOL_MIC_OFF, 16);
++		eapol_mic(w_kck, scratch, 4 + declared, mic_chk);
++		if (memcmp(mic_chk, mic_rx, 16) != 0) {
++			LOG("msg3 MIC fail (wrong passphrase?)");
++			return -1;
++		}
++		if (w_have_replay && replay < w_last_replay) {
++			LOG("replayed msg3");
++			return -1;
++		}
++		w_last_replay = replay;
++		if (enc && data_len >= 24) {
++			if (aes_key_unwrap(w_kek, body + 95, data_len, plain, &plain_len) != 0) {
++				LOG("GTK unwrap failed");
++				return -1;
++			}
++		}
++		{
++			uint8_t zmic[16], znonce[32];
++
++			bzero(zmic, sizeof(zmic));
++			bzero(znonce, sizeof(znonce));
++			scratch_len = build_eapol_key(scratch, sizeof(scratch),
++			    (uint16_t)(ver | KI_PAIRWISE | KI_MIC | KI_SECURE), replay,
++			    znonce, NULL, 0, zmic);
++		}
++		if (scratch_len < 0) {
++			return -1;
++		}
++		eapol_mic(w_kck, scratch, (unsigned)scratch_len, mic_chk);
++		memcpy(scratch + EAPOL_MIC_OFF, mic_chk, 16);
++		if ((unsigned)scratch_len > out_max) {
++			return -1;
++		}
++		memcpy(out, scratch, (unsigned)scratch_len);
++		if (keys != NULL) {
++			memcpy(keys->tk, w_tk, 16);
++			keys->done = true;
++			if (plain_len != 0 &&
++			    find_gtk(plain, plain_len, keys->gtk, &keys->gtk_len,
++			    &keys->gtk_id) == 0) {
++				keys->have_gtk = true;
++			}
++		}
++		LOG("msg3 ok → msg4; PTK ready%s",
++		    (keys != NULL && keys->have_gtk) ? " + GTK" : "");
++		return scratch_len;
++	}
++
++	(void)secure;
++	(void)KI_INSTALL;
++	return 0;
++}
++
++#else /* !SWEET */
++
++#include <sys/types.h>
++#include <sys/topaz_wlan_wpa.h>
++
++void topaz_wlan_wpa_start(const uint8_t *ssid, unsigned ssid_len, const char *psk,
++    const uint8_t spa[6], const uint8_t aa[6], const uint8_t *rsn_ie,
++    unsigned rsn_ie_len) { (void)ssid; (void)ssid_len; (void)psk; (void)spa;
++	(void)aa; (void)rsn_ie; (void)rsn_ie_len; }
++void topaz_wlan_wpa_reset(void) {}
++int topaz_wlan_wpa_on_eapol(const uint8_t *eapol, unsigned len, uint8_t *out,
++    unsigned out_max, struct topaz_wlan_wpa_keys *keys)
++{ (void)eapol; (void)len; (void)out; (void)out_max; (void)keys; return 0; }
++bool topaz_wlan_wpa_active(void) { return false; }
++
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -109,6 +109,7 @@ bsd/dev/sweet_rtc.c			standard
+ bsd/dev/topaz_wlan_if.c			standard
++bsd/dev/topaz_wlan_wpa.c			standard
+ bsd/dev/sweet_cpufreq.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+
+diff --git a/bsd/sys/topaz_wlan.h b/bsd/sys/topaz_wlan.h
+--- a/bsd/sys/topaz_wlan.h
++++ b/bsd/sys/topaz_wlan.h
+@@ -1,9 +1,9 @@
+ /*
+  * topaz: WCN3988 radio C API (implemented in iokit/Kernel/arm/TopazModem.cpp
+  * when boot-arg wifi=1). Scan + BSS list with beacon IEs; open-network
+  * association (0130); WPA2-PSK assoc + key install (0131); ready hook for
+- * ifnet / future IO80211. In-kernel 4-way still TODO (wifipsk= armed).
++ * ifnet / future IO80211. 4-way in topaz_wlan_wpa.c when wifipsk= (0132).
+  */
+ #ifndef _BSD_SYS_TOPAZ_WLAN_H_
+ #define _BSD_SYS_TOPAZ_WLAN_H_
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -4586,6 +4586,7 @@
+ 	    b->bssid[2], b->chan, b->rssi, b->ssid);
+ }
+ 
+ /* ---------------- open-network station association (topaz-woa assoc.c) */
++#include <sys/topaz_wlan_wpa.h>
+ 
+ #define CMD_VDEV_START      0x5003
+ #define CMD_VDEV_UP         0x5005
+@@ -4888,6 +4889,7 @@ a_teardown(void)
+ 	}
+ 	a_state = A_IDLE;
+ 	a_up = false;
+ 	a_ptk = false;
++	topaz_wlan_wpa_reset();
+ }
+@@ -4965,6 +4967,16 @@ a_on_up(void)
+ 	a_state = A_UP;
+ 	a_up = true;
+ 	LOG("t=%u ms: *** associated aid %u (%s) ***", g_ms, a_aid,
+ 	    a_rsn ? "WPA2, waiting for PTK" : "open");
++	if (a_rsn && a_boot_psk_set) {
++		const uint8_t *rsn = a_find_ie(a_req.body, a_req.body_len, 48);
++		unsigned rlen = (rsn != NULL) ? (unsigned)(rsn[1] + 2) : 0;
++
++		topaz_wlan_wpa_start(a_req.ssid, a_req.ssid_len, a_boot_psk,
++		    our_mac, a_req.bssid, rsn, rlen);
++	} else {
++		topaz_wlan_wpa_reset();
++	}
+ }
+@@ -5115,7 +5127,7 @@ assoc_poll(void)
+ 		a_boot_psk_set = PE_parse_boot_argn("wifipsk",
+ 		    a_boot_psk, sizeof(a_boot_psk));
+ 		if (a_boot_psk_set && a_boot_psk[0] != '\0') {
+-			LOG("t=%u ms: assoc: wifipsk set (len %u); 4-way TODO",
++			LOG("t=%u ms: assoc: wifipsk set (len %u); 4-way armed",
+ 			    g_ms, (unsigned)strlen(a_boot_psk));
+ 		} else {
+ 			a_boot_psk_set = false;
+@@ -5165,12 +5177,54 @@ topaz_wlan_install_key(bool group, unsigned key_idx, unsigned cipher,
+ static void
+ assoc_on_rx_msdu(const uint8_t *frame, uint32_t len)
+ {
+-	if (len >= 32 && frame[24] == 0xAA && frame[25] == 0xAA &&
+-	    frame[30] == 0x88 && frame[31] == 0x8E) {
+-		LOG("t=%u ms: assoc: EAPOL rx %u B (4-way TODO, wifipsk %s)",
+-		    g_ms, len, a_boot_psk_set ? "set" : "unset");
+-	}
++	if (len < 32 || frame[24] != 0xAA || frame[25] != 0xAA ||
++	    frame[30] != 0x88 || frame[31] != 0x8E) {
++		return;
++	}
++	LOG("t=%u ms: assoc: EAPOL rx %u B", g_ms, len);
++	if (!topaz_wlan_wpa_active()) {
++		return;
++	}
++	{
++		uint8_t reply[512], tx[24 + 8 + 512];
++		struct topaz_wlan_wpa_keys keys;
++		int rl;
++
++		bzero(&keys, sizeof(keys));
++		rl = topaz_wlan_wpa_on_eapol(frame + 32, len - 32, reply,
++		    sizeof(reply), &keys);
++		if (rl > 0) {
++			bzero(tx, 24);
++			tx[0] = 0x08;
++			tx[1] = 0x01; /* ToDS data */
++			memcpy(tx + 4, a_req.bssid, 6);
++			memcpy(tx + 10, our_mac, 6);
++			memcpy(tx + 16, a_req.bssid, 6);
++			tx[24] = 0xAA; tx[25] = 0xAA; tx[26] = 0x03;
++			tx[27] = 0; tx[28] = 0; tx[29] = 0;
++			tx[30] = 0x88; tx[31] = 0x8E;
++			memcpy(tx + 32, reply, (unsigned)rl);
++			if (!topaz_wlan_tx(tx, 32 + (unsigned)rl)) {
++				LOG("t=%u ms: assoc: EAPOL tx failed", g_ms);
++			}
++		}
++		if (keys.done) {
++			if (topaz_wlan_install_key(false, 0, 4, keys.tk, 16) != 0) {
++				LOG("t=%u ms: assoc: PTK install failed", g_ms);
++			}
++			if (keys.have_gtk &&
++			    topaz_wlan_install_key(true, keys.gtk_id, 4,
++			    keys.gtk, keys.gtk_len) != 0) {
++				LOG("t=%u ms: assoc: GTK install failed", g_ms);
++			}
++		}
++	}
+ }
+

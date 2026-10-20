@@ -1,0 +1,429 @@
+Subject: [PATCH] topaz-0131: WPA2-PSK assoc + key install + HTT TX/RX EAPOL hook
+
+Extend 0130 for privacy BSS: RSN IE in assoc request, NEED_PTK_4WAY,
+defer AUTHORIZE until topaz_wlan_install_key(). HTT RX delivers MSDUs
+to an EAPOL logger. Boot-arg wifipsk= is recorded for a future 4-way.
+HTT TX (topaz_wlan_tx) sends native-wifi frames once associated.
+
+diff --git a/bsd/sys/topaz_wlan.h b/bsd/sys/topaz_wlan.h
+--- a/bsd/sys/topaz_wlan.h
++++ b/bsd/sys/topaz_wlan.h
+@@ -1,7 +1,8 @@
+ /*
+  * topaz: WCN3988 radio C API (implemented in iokit/Kernel/arm/TopazModem.cpp
+  * when boot-arg wifi=1). Scan + BSS list with beacon IEs; open-network
+- * association (0130); ready hook for ifnet / future IO80211. WPA2 later.
++ * association (0130); WPA2-PSK assoc + key install (0131); ready hook for
++ * ifnet / future IO80211. In-kernel 4-way still TODO (wifipsk= armed).
+  */
+ #ifndef _BSD_SYS_TOPAZ_WLAN_H_
+ #define _BSD_SYS_TOPAZ_WLAN_H_
+@@ -29,8 +30,12 @@ bool topaz_wlan_ready(void);
+ int topaz_wlan_scan(void);                          /* 0 ok, ENXIO/ETIMEDOUT */
+ bool topaz_wlan_heard(unsigned index, struct topaz_wlan_bss *bss);
+ void topaz_wlan_address(uint8_t address[6]);
+-int topaz_wlan_connect_bss(unsigned index);         /* open BSS only; 0 ok */
++int topaz_wlan_connect_bss(unsigned index);         /* open or WPA2-PSK; 0 ok */
+ bool topaz_wlan_associated(void);
++bool topaz_wlan_authorized(void);                   /* PTK installed (or open) */
++int topaz_wlan_install_key(bool group, unsigned key_idx, unsigned cipher,
++    const uint8_t *key, unsigned key_len);          /* cipher 4 = CCMP */
++bool topaz_wlan_tx(const uint8_t *frame, unsigned len); /* native 802.11 via HTT */
+ 
+ /* bsd/dev/topaz_wlan_if.c — register hook early (before topaz_modem_init). */
+ void topaz_wlan_if_init(void);
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -17,6 +17,7 @@ scan_start(void)
+ #define H2T_RX_RING_CFG     2
+ #define H2T_AGGR_CFG        5
+ #define H2T_FRAG_DESC_BANK_CFG 6
++#define H2T_TX_FRM          1
+ #define T2H_VERSION_CONF    0x00
+ #define T2H_RX_IN_ORD_PADDR_IND 0x12
+ #define HTT_RING_SIZE       256
+@@ -42,6 +43,9 @@ static volatile uint32_t *htt_idx;
+ static uint32_t htt_alloc, htt_state, htt_msgs, htt_msdus, htt_req_ms;
+ 
+ static bool htt_send(const void *d, uint32_t len) { return htt_eid != 0xFF && htc_send(htt_eid, d, len); }
++static void assoc_on_rx_msdu(const uint8_t *frame, uint32_t len);
++static bool assoc_is_up(void);
++#define HTT_TX_ALIGN4(x) (((x) + 3u) & ~3u)
+ 
+ static void
+ htt_post(uint64_t pa)
+@@ -170,7 +174,17 @@ htt_rx(const uint8_t *p, uint32_t len)
+ 				continue;
+ 			}
+ 			htt_msdus++;
+-			htt_post(pa);                       /* recycle: data frames are for later */
++			{
++				uint16_t mlen;
++				memcpy(&mlen, d + 8, 2);
++				if (assoc_is_up() && mlen > 0 &&
++				    mlen <= HTT_BUF_SIZE - 4 * OFF_MSDU_PAYLOAD) {
++					assoc_on_rx_msdu(
++					    htt_buf + (pa - htt_buf_pa) +
++					    4 * OFF_MSDU_PAYLOAD, mlen);
++				}
++			}
++			htt_post(pa);
+ 		}
+ 		htt_publish();
+ 	}
+@@ -200,6 +214,7 @@ htt_rx(const uint8_t *p, uint32_t len)
+ #define TAG_STA_PS_MODE     0x6c
+ #define TAG_MGMT_TX         0x1a6
+ #define PEER_FLAG_AUTH      0x1
++#define PEER_FLAG_NEED_PTK_4WAY 0x4
+ #define PEER_PARAM_AUTHORIZE 3
+ #define MODE_11A            0
+ #define MODE_11G            1
+@@ -235,9 +250,13 @@ static uint64_t a_txpa;
+ static bool a_start_resp;
+ static int32_t a_start_status;
+ static bool a_up;
++static bool a_rsn;
++static bool a_ptk;
+ static char a_boot_ssid[33];
+ static bool a_boot_ssid_set;
+ static bool a_auto_tried;
++static char a_boot_psk[64];
++static bool a_boot_psk_set;
+ 
+ static uint8_t *
+ a_pmac(uint8_t *p, const uint8_t *mac)
+@@ -364,7 +383,7 @@ a_send_mgmt(const uint8_t *frame, uint32_t len)
+ 
+ static bool
+ a_peer_assoc(const uint8_t *mac, uint32_t aid, uint32_t caps,
+-    const uint8_t *rates, uint32_t nrates, uint32_t phymode)
++    const uint8_t *rates, uint32_t nrates, uint32_t flags, uint32_t phymode)
+ {
+ 	uint8_t m[4 + 76 + 4 + 16 + 4 + 4 + 16], *p, *r;
+ 	uint32_t i, rl = ASSOC_ALIGN4(MIN(nrates, 16u));
+@@ -375,7 +394,7 @@ a_peer_assoc(const uint8_t *mac, uint32_t aid, uint32_t caps,
+ 	p = put32(p, ASSOC_VDEV);
+ 	p = put32(p, 1);
+ 	p = put32(p, aid);
+-	p = put32(p, PEER_FLAG_AUTH);
++	p = put32(p, flags);
+ 	p = put32(p, caps);
+ 	p = put32(p, 1);
+ 	p = put32(p, 0);
+@@ -479,6 +498,21 @@ a_build_assoc_req(uint8_t *f, uint32_t max)
+ 			*p++ = rates[k];
+ 		}
+ 	}
++	if (a_rsn) {
++		static const uint8_t hdr[] = { 48, 20, 1, 0 };
++		const uint8_t *rsn = a_find_ie(a_req.body, a_req.body_len, 48);
++		uint8_t group = 4;
++
++		if (rsn != NULL && rsn[1] >= 8) {
++			group = rsn[2 + 2 + 3];
++		}
++		memcpy(p, hdr, sizeof(hdr));
++		p += sizeof(hdr);
++		*p++ = 0x00; *p++ = 0x0F; *p++ = 0xAC; *p++ = group;
++		*p++ = 1; *p++ = 0; *p++ = 0x00; *p++ = 0x0F; *p++ = 0xAC; *p++ = 4;
++		*p++ = 1; *p++ = 0; *p++ = 0x00; *p++ = 0x0F; *p++ = 0xAC; *p++ = 2;
++		*p++ = 0; *p++ = 0;
++	}
+ 	return (uint32_t)(p - f);
+ }
+ 
+@@ -486,100 +520,29 @@ static void a_teardown(void);
+ static void a_fail(int status);
+ static void a_start_auth(void);
+ static void a_start_assoc(void);
+-static void a_on_up(void);
+-
+-static void
+-a_teardown(void)
+-{
+-	if (a_state >= A_START) {
+-		if (a_state == A_UP) {
+-			a_vdev_simple(CMD_VDEV_DOWN, TAG_VDEV_DOWN);
+-		}
+-		if (a_state >= A_AUTH) {
+-			a_peer_delete(a_req.bssid);
+-		}
+-		a_vdev_simple(CMD_VDEV_STOP, TAG_VDEV_STOP);
+-	}
+-	a_state = A_IDLE;
+-	a_up = false;
+-}
+-
+-static void
+-a_fail(int status)
+-{
+-	LOG("t=%u ms: assoc: failed (%d) state %u", g_ms, status, a_state);
+-	a_teardown();
+-}
+-
+-static void
+-a_arm(void)
+-{
+-	a_deadline = g_ms + ASSOC_WAIT_MS;
+-}
+-
+-static void
+-a_start_auth(void)
+-{
+-	a_state = A_AUTH;
+-	a_tries = 1;
+-	a_peer_create(a_req.bssid);
+-	a_send_auth();
+-	a_arm();
+-}
+-
+-static void
+-a_start_assoc(void)
+-{
+-	a_state = A_ASSOC;
+-	a_tries = 1;
+-	a_areq_len = a_build_assoc_req(a_areq, sizeof(a_areq));
+-	a_send_mgmt(a_areq, a_areq_len);
+-	a_arm();
+-}
+-
+-static void
+-a_begin(void)
+-{
+-	uint32_t bcn = 100, dtim = 1;
+-	const uint8_t *tim;
+-
+-	if (a_req.body_len >= 12) {
+-		bcn = (uint32_t)a_req.body[8] | ((uint32_t)a_req.body[9] << 8);
+-	}
+-	tim = a_find_ie(a_req.body, a_req.body_len, 5);
+-	if (tim != NULL && tim[1] >= 2 && tim[3] != 0) {
+-		dtim = tim[3];
+-	}
+-	a_areq_len = a_aresp_len = 0;
+-	a_start_resp = false;
+-	LOG("t=%u ms: assoc: %02x:%02x:%02x:**:**:** %u MHz open '%.*s'", g_ms,
+-	    a_req.bssid[0], a_req.bssid[1], a_req.bssid[2], a_req.freq,
+-	    (int)a_req.ssid_len, a_req.ssid);
+-	a_ps_off();
+-	if (!a_vdev_start(a_req.freq, bcn, dtim)) {
+-		a_fail(-2);
+-		return;
+-	}
+-	a_state = A_START;
+-	a_deadline = g_ms + 1500;
+-}
+-
+-static void
+-a_on_up(void)
++static void a_on_up(void)
+ {
+ 	uint8_t rates[16];
+ 	uint32_t n = a_ap_rates(rates), cap = 0;
++	uint32_t flags = PEER_FLAG_AUTH;
+ 
+ 	if (a_aresp_len >= 26) {
+ 		cap = (uint32_t)a_aresp[24] | ((uint32_t)a_aresp[25] << 8);
+ 	}
++	if (a_rsn) {
++		flags |= PEER_FLAG_NEED_PTK_4WAY;
++	}
+ 	a_peer_assoc(a_req.bssid, a_aid, cap, rates, n,
+-	    a_req.freq < 4000 ? MODE_11G : MODE_11A);
++	    flags, a_req.freq < 4000 ? MODE_11G : MODE_11A);
+ 	a_vdev_up(a_aid, a_req.bssid);
+-	a_peer_param(a_req.bssid, PEER_PARAM_AUTHORIZE, 1);
++	if (!a_rsn) {
++		a_peer_param(a_req.bssid, PEER_PARAM_AUTHORIZE, 1);
++		a_ptk = true;
++	}
+ 	a_state = A_UP;
+ 	a_up = true;
+-	LOG("t=%u ms: *** associated aid %u (open) ***", g_ms, a_aid);
++	LOG("t=%u ms: *** associated aid %u (%s) ***", g_ms, a_aid,
++	    a_rsn ? "WPA2, waiting for PTK" : "open");
+ }
+ 
+ static void
+@@ -692,10 +655,9 @@ assoc_try_auto(void)
+ 		    memcmp(ssid, a_boot_ssid, slen) != 0) {
+ 			continue;
+ 		}
+-		if (b->capab & 0x0010) {
+-			LOG("t=%u ms: assoc: '%s' needs privacy (open-only)",
++		if ((b->capab & 0x0010) && !a_boot_psk_set) {
++			LOG("t=%u ms: assoc: '%s' WPA2 without wifipsk= (assoc ok, no 4-way)",
+ 			    g_ms, a_boot_ssid);
+-			return;
+ 		}
+ 		assoc_fill_from_bss(b);
+ 		LOG("t=%u ms: assoc: wifissid match '%s' queued", g_ms, a_boot_ssid);
+@@ -717,11 +679,19 @@ assoc_poll(void)
+ 		a_boot_ssid_set = PE_parse_boot_argn("wifissid",
+ 		    a_boot_ssid, sizeof(a_boot_ssid));
+ 		if (a_boot_ssid_set && a_boot_ssid[0] != '\0') {
+-			LOG("t=%u ms: assoc: will join open SSID '%s'",
++			LOG("t=%u ms: assoc: will join SSID '%s'",
+ 			    g_ms, a_boot_ssid);
+ 		} else {
+ 			a_boot_ssid_set = false;
+ 		}
++		a_boot_psk_set = PE_parse_boot_argn("wifipsk",
++		    a_boot_psk, sizeof(a_boot_psk));
++		if (a_boot_psk_set && a_boot_psk[0] != '\0') {
++			LOG("t=%u ms: assoc: wifipsk set (len %u); 4-way TODO",
++			    g_ms, (unsigned)strlen(a_boot_psk));
++		} else {
++			a_boot_psk_set = false;
++		}
+ 	}
+ 	if (scans != a_last_scans) {
+ 		a_last_scans = scans;
+@@ -774,15 +744,140 @@ topaz_wlan_associated(void)
+ 	return a_up;
+ }
+ 
++extern "C" bool
++topaz_wlan_authorized(void)
++{
++	return a_up && a_ptk;
++}
++
++static bool
++assoc_is_up(void)
++{
++	return a_up;
++}
++
++#define CMD_VDEV_INSTALL_KEY 0x5009
++#define TAG_VDEV_INSTALL_KEY 0x60
++#define KEY_FLAG_GROUP       0x1
++
++extern "C" int
++topaz_wlan_install_key(bool group, unsigned key_idx, unsigned cipher,
++    const uint8_t *key, unsigned key_len)
++{
++	uint8_t m[4 + 92 + 4 + 32], *p;
++	uint32_t kl;
++
++	if (!a_up || key == NULL || key_len == 0 || key_len > 32) {
++		return EINVAL;
++	}
++	kl = ASSOC_ALIGN4(key_len);
++	bzero(m, sizeof(m));
++	p = wmi_put_tlv(m, TAG_VDEV_INSTALL_KEY, 92);
++	p = put32(p, ASSOC_VDEV);
++	p = a_pmac(p, a_req.bssid);
++	p = put32(p, key_idx);
++	p = put32(p, group ? KEY_FLAG_GROUP : 0);
++	p = put32(p, cipher);
++	p += 3 * 8 + 16 + 16;
++	p = put32(p, key_len);
++	p = put32(p, cipher == 2 ? 8 : 0);
++	p = put32(p, cipher == 2 ? 8 : 0);
++	p = wmi_put_tlv(p, TAG_ARRAY_BYTE, kl);
++	memcpy(p, key, key_len);
++	if (!wmi_send(CMD_VDEV_INSTALL_KEY, m, 4 + 92 + 4 + kl)) {
++		return EIO;
++	}
++	LOG("t=%u ms: assoc: install %s key idx %u cipher %u len %u", g_ms,
++	    group ? "group" : "pairwise", key_idx, cipher, key_len);
++	if (!group) {
++		a_ptk = true;
++		a_peer_param(a_req.bssid, PEER_PARAM_AUTHORIZE, 1);
++		LOG("t=%u ms: assoc: PTK installed, peer authorized", g_ms);
++	}
++	return 0;
++}
++
++static void
++assoc_on_rx_msdu(const uint8_t *frame, uint32_t len)
++{
++	if (len >= 32 && frame[24] == 0xAA && frame[25] == 0xAA &&
++	    frame[30] == 0x88 && frame[31] == 0x8E) {
++		LOG("t=%u ms: assoc: EAPOL rx %u B (4-way TODO, wifipsk %s)",
++		    g_ms, len, a_boot_psk_set ? "set" : "unset");
++	}
++}
++
++/* HTT native-wifi TX (topaz-woa htt.c TxOne); EAPOL / data once associated. */
++#define HTT_TX_SLOTS     32
++#define HTT_TX_SLOT_SIZE 2048
++#define HTT_PREFETCH     50
++static uint8_t *htt_tx_pool;
++static uint64_t htt_tx_pool_pa;
++static uint32_t htt_tx_next, htt_tx_sent;
++
++extern "C" bool
++topaz_wlan_tx(const uint8_t *frame, unsigned len)
++{
++	uint8_t m[20 + 52], *p, *ext, f0;
++	uint32_t id, pf;
++	uint64_t pa;
++	bool eapol;
++
++	if (!a_up || frame == NULL || len < 24 || len > HTT_TX_SLOT_SIZE ||
++	    htt_state != 2 || htt_bank == NULL) {
++		return false;
++	}
++	if (htt_tx_pool == NULL) {
++		htt_tx_pool = (uint8_t *)pool_alloc(
++		    HTT_TX_SLOTS * HTT_TX_SLOT_SIZE, &htt_tx_pool_pa);
++		if (htt_tx_pool == NULL) {
++			return false;
++		}
++	}
++	id = htt_tx_next++ % HTT_TX_SLOTS;
++	pa = htt_tx_pool_pa + (uint64_t)id * HTT_TX_SLOT_SIZE;
++	memcpy(htt_tx_pool + (size_t)id * HTT_TX_SLOT_SIZE, frame, len);
++	ext = htt_bank + (size_t)id * HTT_EXT_DESC_SIZE;
++	bzero(ext, HTT_EXT_DESC_SIZE);
++	*(uint32_t *)(ext + 24) = (uint32_t)pa;
++	*(uint16_t *)(ext + 28) = (uint16_t)(pa >> 32);
++	*(uint16_t *)(ext + 30) = (uint16_t)len;
++	__asm__ volatile("dmb oshst" ::: "memory");
++	eapol = len >= 32 && frame[24] == 0xAA && frame[25] == 0xAA &&
++	    frame[30] == 0x88 && frame[31] == 0x8E;
++	f0 = 0x01 | (1u << 5); /* MAC_HDR | NATIVE */
++	if (eapol && !a_ptk) {
++		f0 |= 0x04; /* NO_ENCRYPT */
++	}
++	pf = HTT_TX_ALIGN4(MIN(len, (unsigned)HTT_PREFETCH));
++	bzero(m, sizeof(m));
++	p = m;
++	*p++ = H2T_TX_FRM;
++	*p++ = f0;
++	p = put16(p, (uint16_t)((16u << 6) | (1u << 11))); /* NON_QOS | POSTPONED */
++	p = put16(p, (uint16_t)len);
++	p = put16(p, (uint16_t)id);
++	p = put64(p, htt_bank_pa + (uint64_t)id * HTT_EXT_DESC_SIZE);
++	*(uint32_t *)p = 0xFFFF;
++	p += 4;
++	memcpy(p, frame, MIN(len, pf));
++	if (!htt_send(m, 20 + pf)) {
++		return false;
++	}
++	htt_tx_sent++;
++	if (htt_tx_sent <= 8) {
++		LOG("t=%u ms: htt tx id %u len %u%s", g_ms, id, len,
++		    eapol ? " EAPOL" : "");
++	}
++	return true;
++}
++
+ extern "C" int
+ topaz_wlan_connect_bss(unsigned index)
+ {
+ 	if (index >= nbss) {
+ 		return ENOENT;
+ 	}
+-	if (bss[index].capab & 0x0010) {
+-		return EPERM; /* open networks only in 0130 */
+-	}
+ 	assoc_fill_from_bss(&bss[index]);
+ 	return 0;
+ }
+\ No newline at end of file
+

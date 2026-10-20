@@ -1,0 +1,64 @@
+Subject: [PATCH] topaz-0144: wire built-in IONetworkingFamily-170.140.2
+
+Stage script 0144-stage-ionetworkingfamily.sh fetches the OSS family
+(macOS 13.5 tag) into iokit/Families/IONetworkingFamily + IOKit/network
+headers. This patch enables config option sweet_ionet, lists the TUs in
+files.arm64, and registers IONetworkStack on IOResources/IOBSD.
+TopazWlan remains an IOService nub; 0145 will subclass IOEthernetController.
+diff --git a/config/MASTER b/config/MASTER
+--- a/config/MASTER
++++ b/config/MASTER
+@@ -114,5 +114,6 @@
+ options		MOCKFS		# Boot from an executable	# <mockfs>
+ options		SWEET_HFS	# Built-in Apple OSS HFS (SWEET)	# <sweet_hfs>
++options		SWEET_IONET	# Built-in IONetworkingFamily (SWEET)	# <sweet_ionet>
+ options		FIFO		# fifo support			# <fifo>
+ options		FDESC		# fdesc_fs support		# <fdesc>
+ options		DEVFS		# devfs support			# <devfs>
+diff --git a/config/MASTER.arm64.sweet b/config/MASTER.arm64.sweet
+--- a/config/MASTER.arm64.sweet
++++ b/config/MASTER.arm64.sweet
+@@ -57,7 +57,7 @@
+ #else /*!(SOC_CONFIG_t8020 || SOC_IS_VIRTUALIZED)*/
+ #  HIBERNATION =    [ ]
+ #endif /*SOC_CONFIG_t8020 || SOC_IS_VIRTUALIZED*/
+-#  IOKIT_BASE =     [ iokit iokitcpp no_kernel_hid config_sleep iokitstats HIBERNATION ]
++#  IOKIT_BASE =     [ iokit iokitcpp no_kernel_hid config_sleep iokitstats HIBERNATION sweet_ionet ]
+ #  IOKIT_RELEASE =  [ IOKIT_BASE ]
+ #  IOKIT_DEV =      [ IOKIT_BASE iotracking ]
+ #  IOKIT_DEBUG =    [ IOKIT_BASE iotracking ]
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -1,3 +1,15 @@
+ iokit/Kernel/arm/TopazModem.cpp                                  optional iokitcpp
+ iokit/Kernel/arm/TopazWlan.cpp                                   optional iokitcpp
++iokit/Families/IONetworkingFamily/IONetworkController.cpp        optional sweet_ionet
++iokit/Families/IONetworkingFamily/IONetworkInterface.cpp         optional sweet_ionet
++iokit/Families/IONetworkingFamily/IOEthernetController.cpp       optional sweet_ionet
++iokit/Families/IONetworkingFamily/IOEthernetInterface.cpp        optional sweet_ionet
++iokit/Families/IONetworkingFamily/IONetworkData.cpp              optional sweet_ionet
++iokit/Families/IONetworkingFamily/IONetworkMedium.cpp            optional sweet_ionet
++iokit/Families/IONetworkingFamily/IOOutputQueue.cpp              optional sweet_ionet
++iokit/Families/IONetworkingFamily/IOPacketQueue.cpp              optional sweet_ionet
++iokit/Families/IONetworkingFamily/IOMbufMemoryCursor.cpp         optional sweet_ionet
++iokit/Families/IONetworkingFamily/IONetworkStack.cpp             optional sweet_ionet
++iokit/Families/IONetworkingFamily/IONetworkUserClient.cpp        optional sweet_ionet
++iokit/Families/IONetworkingFamily/IOKernelDebugger.cpp           optional sweet_ionet
+ iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitcpp
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -11,6 +11,12 @@
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = TopazWlan;"
+     "   },"
++    "   {"
++    "     'IOClass'         = IONetworkStack;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = IONetworkStack;"
++    "     'IOResourceMatch' = IOBSD;"
++    "   },"
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"

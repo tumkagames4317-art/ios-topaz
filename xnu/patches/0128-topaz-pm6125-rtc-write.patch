@@ -1,0 +1,366 @@
+Subject: [PATCH] topaz-0128: PM6125 RTC settimeofday via SPMI write
+
+Persist calendar time through SweetPlatformExpert::setGMTTimeOfDay by
+writing the PM8941-compatible RTC on PM6125. Observer channels are
+read-only; writes use the arbiter v5 RW channel bank (chnls @0x01e00000,
+offset 0x10000*APID) with EXT_WRITEL + WDATA0, matching Linux
+spmi-pmic-arb.c / rtc-pm8xxx.c.
+
+Sequence: optionally clear alarm enable (PPID 0x61), disable RTC, write
+0 then bytes 1..3 then byte 0 at 0x6040, re-enable. Unix→raw uses the
+same GPS-epoch heuristic as the 0127 read path. Requires write_ee==0
+(HLOS ownership); otherwise setGMT stays a no-op with a console note.
+
+diff --git a/bsd/dev/sweet_rtc.c b/bsd/dev/sweet_rtc.c
+--- a/bsd/dev/sweet_rtc.c
++++ b/bsd/dev/sweet_rtc.c
+@@ -1,8 +1,9 @@
+ /*
+- * topaz: PM6125 RTC (qcom,pm8941-rtc at SPMI 0x6000). Read-only wall clock
+- * for XNU PEGetUTCTimeOfDay / calendar init. SPMI MMIO matches patch 0087
+- * keys (arb 0x01c40000). Register map from Linux drivers/rtc/rtc-pm8xxx.c
+- * pm8941_regs: ctrl 0x6046, read 0x6048 (4 LE bytes), enable BIT(7).
++ * topaz: PM6125 RTC (qcom,pm8941-rtc at SPMI 0x6000). Wall clock for XNU
++ * PEGetUTCTimeOfDay / settimeofday. SPMI MMIO matches patch 0087 keys
++ * (arb 0x01c40000, obs 0x03e00000, chnls 0x01e00000). Register map from
++ * Linux rtc-pm8xxx.c pm8941_regs: ctrl 0x6046, write 0x6040, read 0x6048,
++ * alarm_ctrl 0x6146, enable BIT(7).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -16,23 +17,31 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ 
+ int sweet_rtc_init(void);
+ int sweet_rtc_read_unix(clock_sec_t *secs);
++int sweet_rtc_write_unix(clock_sec_t secs);
+ 
+ #define RTC_CORE_PA     0x01c40000u
+ #define RTC_OBS_PA      0x03e00000u
++#define RTC_CHNLS_PA    0x01e00000u
+ #define RTC_CFG_PA      0x01c0a000u
+ #define RTC_NO_APID     0xffffu
+ #define RTC_PPID        0x060u          /* SID0 peripheral 0x60 */
++#define RTC_ALARM_PPID  0x061u          /* SID0 peripheral 0x61 */
+ #define RTC_CTRL        0x6046u
++#define RTC_WRITE       0x6040u
+ #define RTC_READ        0x6048u
++#define RTC_ALARM_CTRL  0x6146u
+ #define RTC_ENABLE      0x80u
+ #define RTC_GPS_EPOCH   315964800u      /* 1980-01-06 */
+ #define RTC_UNIX_2021   1609459200u
+ 
+-static vm_offset_t rtc_core, rtc_obs, rtc_cfg;
++static vm_offset_t rtc_core, rtc_obs, rtc_chnls, rtc_cfg;
+ static IOLock *rtc_lock;
+ static unsigned rtc_count;
+ static uint16_t rtc_apid = RTC_NO_APID;
++static uint16_t rtc_alarm_apid = RTC_NO_APID;
++static vm_offset_t rtc_alarm_chnls;
+ static bool rtc_ready;
++static bool rtc_can_write;
+ static int rtc_enabled = 1;
+ 
+ static uint32_t
+@@ -62,11 +71,25 @@ rtc_find_apid(unsigned ppid)
+ 	return found;
+ }
+ 
++static int
++rtc_spmi_wait(vm_offset_t base, unsigned off)
++{
++	unsigned i;
++
++	for (i = 0; i < 1000; ++i) {
++		uint32_t status = rtc_rd(base, off + 0x08u);
++		if (status & 1u) {
++			return (status & 0x0eu) ? -1 : 0;
++		}
++		delay(1);
++	}
++	return -1;
++}
++
+ static int
+ rtc_spmi_read(uint16_t addr, uint8_t *out)
+ {
+ 	unsigned off;
+-	unsigned i;
+ 
+ 	if (!rtc_ready || rtc_apid == RTC_NO_APID || !out) {
+ 		return -1;
+@@ -77,21 +100,106 @@ rtc_spmi_read(uint16_t addr, uint8_t *out)
+ 	*(volatile uint32_t *)(rtc_obs + off) =
+ 	    (1u << 27) | ((uint32_t)(addr & 0xffu) << 4);
+ 	__asm__ volatile("dsb osh" ::: "memory");
+-	for (i = 0; i < 1000; ++i) {
+-		uint32_t status = rtc_rd(rtc_obs, off + 0x08u);
+-		if (status & 1u) {
+-			if (status & 0x0eu) {
+-				IOLockUnlock(rtc_lock);
+-				return -1;
+-			}
+-			*out = (uint8_t)rtc_rd(rtc_obs, off + 0x18u);
+-			IOLockUnlock(rtc_lock);
+-			return 0;
+-		}
+-		delay(1);
++	if (rtc_spmi_wait(rtc_obs, off)) {
++		IOLockUnlock(rtc_lock);
++		return -1;
+ 	}
++	*out = (uint8_t)rtc_rd(rtc_obs, off + 0x18u);
+ 	IOLockUnlock(rtc_lock);
+-	return -1;
++	return 0;
++}
++
++/* OBS read with an explicit APID (alarm peripheral 0x61 ≠ RTC 0x60). */
++static int
++rtc_spmi_read_apid(uint16_t apid, uint16_t addr, uint8_t *out)
++{
++	unsigned off;
++
++	if (!rtc_ready || apid == RTC_NO_APID || !out) {
++		return -1;
++	}
++	IOLockLock(rtc_lock);
++	off = 0x80u * apid;
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(rtc_obs + off) =
++	    (1u << 27) | ((uint32_t)(addr & 0xffu) << 4);
++	__asm__ volatile("dsb osh" ::: "memory");
++	if (rtc_spmi_wait(rtc_obs, off)) {
++		IOLockUnlock(rtc_lock);
++		return -1;
++	}
++	*out = (uint8_t)rtc_rd(rtc_obs, off + 0x18u);
++	IOLockUnlock(rtc_lock);
++	return 0;
++}
++
++static int
++rtc_spmi_write_at(vm_offset_t ch, uint16_t addr, uint8_t val)
++{
++	if (!ch) {
++		return -1;
++	}
++	/* WDATA0 then CMD: EXT_WRITEL (opc 0), 1 byte (bc 0). */
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(ch + 0x10u) = val;
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(ch + 0x00u) =
++	    ((uint32_t)(addr & 0xffu) << 4);
++	__asm__ volatile("dsb osh" ::: "memory");
++	return rtc_spmi_wait(ch, 0);
++}
++
++static int
++rtc_spmi_write(uint16_t addr, uint8_t val)
++{
++	int rc;
++
++	if (!rtc_ready || !rtc_can_write || rtc_apid == RTC_NO_APID) {
++		return -1;
++	}
++	IOLockLock(rtc_lock);
++	rc = rtc_spmi_write_at(rtc_chnls, addr, val);
++	IOLockUnlock(rtc_lock);
++	return rc;
++}
++
++static int
++rtc_ctrl_set_enable(bool on)
++{
++	uint8_t ctrl = 0;
++
++	if (rtc_spmi_read(RTC_CTRL, &ctrl)) {
++		return -1;
++	}
++	if (on) {
++		ctrl |= RTC_ENABLE;
++	} else {
++		ctrl &= (uint8_t)~RTC_ENABLE;
++	}
++	return rtc_spmi_write(RTC_CTRL, ctrl);
++}
++
++static int
++rtc_alarm_set_enable(bool on)
++{
++	uint8_t ctrl = 0;
++	int rc;
++
++	if (rtc_alarm_apid == RTC_NO_APID || !rtc_alarm_chnls) {
++		return 0;
++	}
++	if (rtc_spmi_read_apid(rtc_alarm_apid, RTC_ALARM_CTRL, &ctrl)) {
++		return -1;
++	}
++	if (on) {
++		ctrl |= RTC_ENABLE;
++	} else {
++		ctrl &= (uint8_t)~RTC_ENABLE;
++	}
++	IOLockLock(rtc_lock);
++	rc = rtc_spmi_write_at(rtc_alarm_chnls, RTC_ALARM_CTRL, ctrl);
++	IOLockUnlock(rtc_lock);
++	return rc;
+ }
+ 
+ static int
+@@ -119,6 +227,15 @@ rtc_read_raw(uint32_t *secs)
+ 	return 0;
+ }
+ 
++static int32_t
++rtc_boot_offset(void)
++{
++	int32_t offset = (int32_t)RTC_GPS_EPOCH;
++
++	(void)PE_parse_boot_argn("sweetrtoffset", &offset, sizeof(offset));
++	return offset;
++}
++
+ int
+ sweet_rtc_read_unix(clock_sec_t *secs)
+ {
+@@ -129,7 +246,7 @@ sweet_rtc_read_unix(clock_sec_t *secs)
+ 	if (!secs || !rtc_ready) {
+ 		return -1;
+ 	}
+-	(void)PE_parse_boot_argn("sweetrtoffset", &offset, sizeof(offset));
++	offset = rtc_boot_offset();
+ 	if (rtc_spmi_read(RTC_CTRL, &ctrl)) {
+ 		return -1;
+ 	}
+@@ -150,6 +267,75 @@ sweet_rtc_read_unix(clock_sec_t *secs)
+ 	return 0;
+ }
+ 
++int
++sweet_rtc_write_unix(clock_sec_t secs)
++{
++	int32_t offset;
++	uint32_t raw;
++	uint32_t cur = 0;
++	uint8_t alarm = 0;
++	bool alarm_was_on = false;
++
++	if (!rtc_ready || !rtc_can_write) {
++		return -1;
++	}
++	if (secs < 0 || (uint64_t)secs > 0xffffffffull) {
++		return -1;
++	}
++	offset = rtc_boot_offset();
++	if (offset == -1) {
++		raw = (uint32_t)secs;
++	} else if (rtc_read_raw(&cur) == 0 && cur >= RTC_UNIX_2021) {
++		raw = (uint32_t)secs;
++	} else {
++		if ((uint64_t)secs < (uint32_t)offset) {
++			return -1;
++		}
++		raw = (uint32_t)secs - (uint32_t)offset;
++	}
++
++	if (rtc_alarm_apid != RTC_NO_APID &&
++	    rtc_spmi_read_apid(rtc_alarm_apid, RTC_ALARM_CTRL, &alarm) == 0 &&
++	    (alarm & RTC_ENABLE)) {
++		alarm_was_on = true;
++		if (rtc_alarm_set_enable(false)) {
++			printf("SWEET RTC: alarm disable failed\n");
++			return -1;
++		}
++	}
++	if (rtc_ctrl_set_enable(false)) {
++		printf("SWEET RTC: disable failed\n");
++		goto fail_alarm;
++	}
++	/* Linux: write 0 to LSB, then bytes 1..3, then byte 0. */
++	if (rtc_spmi_write(RTC_WRITE + 0, 0) ||
++	    rtc_spmi_write(RTC_WRITE + 1, (uint8_t)(raw >> 8)) ||
++	    rtc_spmi_write(RTC_WRITE + 2, (uint8_t)(raw >> 16)) ||
++	    rtc_spmi_write(RTC_WRITE + 3, (uint8_t)(raw >> 24)) ||
++	    rtc_spmi_write(RTC_WRITE + 0, (uint8_t)raw)) {
++		printf("SWEET RTC: write failed\n");
++		(void)rtc_ctrl_set_enable(true);
++		goto fail_alarm;
++	}
++	if (rtc_ctrl_set_enable(true)) {
++		printf("SWEET RTC: re-enable failed\n");
++		goto fail_alarm;
++	}
++	if (alarm_was_on && rtc_alarm_set_enable(true)) {
++		printf("SWEET RTC: alarm restore failed\n");
++		return -1;
++	}
++	printf("SWEET RTC: wrote unix %lu raw %#x\n",
++	    (unsigned long)secs, raw);
++	return 0;
++
++fail_alarm:
++	if (alarm_was_on) {
++		(void)rtc_alarm_set_enable(true);
++	}
++	return -1;
++}
++
+ int
+ sweet_rtc_init(void)
+ {
+@@ -189,6 +375,28 @@ sweet_rtc_init(void)
+ 		printf("SWEET RTC: no APID for PPID %#x\n", RTC_PPID);
+ 		return -1;
+ 	}
++	rtc_chnls = ml_io_map(RTC_CHNLS_PA + 0x10000u * rtc_apid, 0x1000);
++	if (!rtc_chnls) {
++		printf("SWEET RTC: chnls map failed APID=%u\n", rtc_apid);
++		return -1;
++	}
++	{
++		unsigned owner = rtc_rd(rtc_cfg, 0x700u + 4u * rtc_apid) & 7u;
++		rtc_can_write = (owner == 0);
++		if (!rtc_can_write) {
++			printf("SWEET RTC: APID=%u write_ee=%u (no settime)\n",
++			    rtc_apid, owner);
++		}
++	}
++	rtc_alarm_apid = rtc_find_apid(RTC_ALARM_PPID);
++	if (rtc_alarm_apid != RTC_NO_APID) {
++		rtc_alarm_chnls = ml_io_map(
++		    RTC_CHNLS_PA + 0x10000u * rtc_alarm_apid, 0x1000);
++		if (!rtc_alarm_chnls) {
++			printf("SWEET RTC: alarm chnls map failed\n");
++			rtc_alarm_apid = RTC_NO_APID;
++		}
++	}
+ 	rtc_ready = true;
+ 	printf("SWEET RTC: SPMI arb=%#x APID=%u PPID=%#x\n",
+ 	    arb, rtc_apid, RTC_PPID);
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -23,5 +23,6 @@ OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
+ 
+ extern "C" int sweet_rtc_read_unix(clock_sec_t *secs);
++extern "C" int sweet_rtc_write_unix(clock_sec_t secs);
+ 
+ long
+ SweetPlatformExpert::getGMTTimeOfDay(void)
+@@ -36,12 +37,10 @@ SweetPlatformExpert::getGMTTimeOfDay(void)
+ void
+ SweetPlatformExpert::setGMTTimeOfDay(long secs)
+ {
+-	/*
+-	 * PMIC write-back (SPMI EXT_WRITEL) not implemented yet. settimeofday
+-	 * still updates the in-kernel calendar until reboot.
+-	 */
+-	(void)secs;
++	if (secs > 0) {
++		(void)sweet_rtc_write_unix((clock_sec_t)secs);
++	}
+ }
+ 
+ bool
+ SweetPlatformExpert::start(IOService *provider)

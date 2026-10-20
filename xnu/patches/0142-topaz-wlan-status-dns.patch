@@ -1,0 +1,279 @@
+Subject: [PATCH] topaz-0142: expose tw0 IP/DNS via sysctl and TopazWlan
+
+Add topaz_wlan_if_ipv4() (stores applied IPv4 + DHCP opt-6 DNS).
+kern.topaz_wlan.status summarizes ready/assoc/auth + ip/mask/gw/dns;
+kern.topaz_wlan.dns is the DHCP resolver alone. TopazWlan ioreg nub
+publishes TopazWlanIPv4/Netmask/Gateway/DNS (cleared when no address).
+Still does not program resolv.conf / configd (needs IONetwork later).
+diff --git a/bsd/sys/topaz_wlan.h b/bsd/sys/topaz_wlan.h
+--- a/bsd/sys/topaz_wlan.h
++++ b/bsd/sys/topaz_wlan.h
+@@ -44,6 +44,9 @@ void topaz_wlan_if_input(const uint8_t *eth, unsigned len);
+ void topaz_wlan_if_on_authorized(void); /* apply wifiip= after PTK/open */
+ void topaz_wlan_if_on_disconnected(void); /* clear tw0 IP; allow re-DHCP */
+ void topaz_wlan_if_poll(uint32_t ms); /* DHCP retransmit */
++/* Host-order; false if tw0 has no IPv4 yet. dns may be 0. */
++bool topaz_wlan_if_ipv4(uint32_t *ip, uint32_t *mask, uint32_t *gw,
++    uint32_t *dns);
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/bsd/dev/topaz_wlan_if.c b/bsd/dev/topaz_wlan_if.c
+--- a/bsd/dev/topaz_wlan_if.c
++++ b/bsd/dev/topaz_wlan_if.c
+@@ -1,6 +1,7 @@
+ /*
+  * topaz: ifnet tw0 when TopazModem WLAN radio is ready.
+  * 0133-0137: HTT + wifiip=/dhcp + renew + GARP. 0141: clear IP on disconnect.
++ * 0142: topaz_wlan_if_ipv4() for sysctl/ioreg (stores DHCP DNS).
+  * sweetwlanif=0 skips. wifigarpon=0 disables GARP.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+@@ -29,6 +30,8 @@ static int tw_enabled = 1;
+ static bool tw_hooked;
+ static bool tw_attached;
+ static bool tw_addr_done;
++/* Last applied IPv4 (host order); dns from DHCP opt 6 when present. */
++static uint32_t tw_cfg_ip, tw_cfg_mask, tw_cfg_gw, tw_cfg_dns;
+ 
+ enum {
+ 	TW_DHCP_IDLE,
+@@ -237,6 +240,9 @@ tw_apply_ipv4(uint32_t ip, uint32_t mask, uint32_t gw)
+ 	ifnet_set_flags(tw_ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
+ 	if (err == 0) {
+ 		tw_addr_done = true;
++		tw_cfg_ip = ip;
++		tw_cfg_mask = mask;
++		tw_cfg_gw = gw;
+ 		printf("SWEET WLAN: tw0 %u.%u.%u.%u mask %u.%u.%u.%u%s\n",
+ 		    (ip >> 24) & 0xff, (ip >> 16) & 0xff, (ip >> 8) & 0xff, ip & 0xff,
+ 		    (mask >> 24) & 0xff, (mask >> 16) & 0xff, (mask >> 8) & 0xff,
+@@ -523,12 +529,15 @@ tw_dhcp_rx(const uint8_t *eth, unsigned len)
+ 		    (yiaddr >> 8) & 0xff, yiaddr & 0xff,
+ 		    tw_dhcp_state == TW_DHCP_RENEW ? " (renew)" : "");
+ 		if (dns != 0) {
+-			printf("SWEET WLAN: DHCP DNS %u.%u.%u.%u (not applied)\n",
++			tw_cfg_dns = dns;
++			printf("SWEET WLAN: DHCP DNS %u.%u.%u.%u (stored; not resolv)\n",
+ 			    (dns >> 24) & 0xff, (dns >> 16) & 0xff,
+ 			    (dns >> 8) & 0xff, dns & 0xff);
+ 		}
+ 		if (!tw_addr_done) {
+ 			tw_apply_ipv4(yiaddr, mask != 0 ? mask : tw_dhcp_mask, gw);
++		} else if (gw != 0) {
++			tw_cfg_gw = gw;
+ 		}
+ 		tw_dhcp_yiaddr = yiaddr;
+ 		tw_dhcp_arm_lease(now, lease);
+@@ -540,6 +549,7 @@ tw_dhcp_rx(const uint8_t *eth, unsigned len)
+ 		tw_dhcp_t1_ms = 0;
+ 		tw_dhcp_state = TW_DHCP_IDLE;
+ 		tw_addr_done = false;
++		tw_cfg_ip = tw_cfg_mask = tw_cfg_gw = tw_cfg_dns = 0;
+ 		tw_dhcp_start(tw_dhcp_last_ms);
+ 		return true;
+ 	}
+@@ -796,6 +806,7 @@ topaz_wlan_if_on_disconnected(void)
+ 	tw_dhcp_t1_ms = 0;
+ 	tw_dhcp_last_ms = 0;
+ 	tw_dhcp_tries = 0;
++	tw_cfg_ip = tw_cfg_mask = tw_cfg_gw = tw_cfg_dns = 0;
+ 	if (!tw_attached || tw_ifp == NULL) {
+ 		tw_addr_done = false;
+ 		return;
+@@ -815,6 +826,27 @@ topaz_wlan_if_on_disconnected(void)
+ 	}
+ }
+ 
++bool
++topaz_wlan_if_ipv4(uint32_t *ip, uint32_t *mask, uint32_t *gw, uint32_t *dns)
++{
++	if (!tw_addr_done || tw_cfg_ip == 0) {
++		return false;
++	}
++	if (ip != NULL) {
++		*ip = tw_cfg_ip;
++	}
++	if (mask != NULL) {
++		*mask = tw_cfg_mask;
++	}
++	if (gw != NULL) {
++		*gw = tw_cfg_gw;
++	}
++	if (dns != NULL) {
++		*dns = tw_cfg_dns;
++	}
++	return true;
++}
++
+ void
+ topaz_wlan_if_poll(uint32_t ms)
+ {
+@@ -890,4 +922,21 @@ void topaz_wlan_if_input(const uint8_t *eth, unsigned len)
+ void topaz_wlan_if_on_authorized(void) {}
+ void topaz_wlan_if_on_disconnected(void) {}
+ void topaz_wlan_if_poll(uint32_t ms) { (void)ms; }
++bool
++topaz_wlan_if_ipv4(uint32_t *ip, uint32_t *mask, uint32_t *gw, uint32_t *dns)
++{
++	if (ip != NULL) {
++		*ip = 0;
++	}
++	if (mask != NULL) {
++		*mask = 0;
++	}
++	if (gw != NULL) {
++		*gw = 0;
++	}
++	if (dns != NULL) {
++		*dns = 0;
++	}
++	return false;
++}
+ #endif
+diff --git a/bsd/dev/topaz_wlan_sysctl.c b/bsd/dev/topaz_wlan_sysctl.c
+--- a/bsd/dev/topaz_wlan_sysctl.c
++++ b/bsd/dev/topaz_wlan_sysctl.c
+@@ -1,7 +1,8 @@
+ /*
+  * topaz: sysctl bridge for WLAN scan / BSS list / join (0138).
+  * 0139: kern.topaz_wlan.psk for runtime WPA2-PSK (or boot-arg wifipsk=).
+- * kern.topaz_wlan.{ready,associated,authorized,scan,bss,connect,psk}
++ * 0142: kern.topaz_wlan.status / dns (IPv4 + DHCP DNS via topaz_wlan_if_ipv4).
++ * kern.topaz_wlan.{ready,associated,authorized,scan,bss,connect,psk,status,dns}
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -189,6 +190,57 @@ sysctl_tw_psk SYSCTL_HANDLER_ARGS
+ 	return error;
+ }
+ 
++static void
++tw_fmt_ip(char *dst, size_t dstlen, uint32_t ip)
++{
++	if (dstlen == 0) {
++		return;
++	}
++	if (ip == 0) {
++		strlcpy(dst, "-", dstlen);
++		return;
++	}
++	snprintf(dst, dstlen, "%u.%u.%u.%u",
++	    (ip >> 24) & 0xff, (ip >> 16) & 0xff,
++	    (ip >> 8) & 0xff, ip & 0xff);
++}
++
++static int
++sysctl_tw_status SYSCTL_HANDLER_ARGS
++{
++	char buf[192];
++	uint32_t ip = 0, mask = 0, gw = 0, dns = 0;
++	char sip[16], smask[16], sgw[16], sdns[16];
++	bool have;
++
++	have = topaz_wlan_if_ipv4(&ip, &mask, &gw, &dns);
++	tw_fmt_ip(sip, sizeof(sip), have ? ip : 0);
++	tw_fmt_ip(smask, sizeof(smask), have ? mask : 0);
++	tw_fmt_ip(sgw, sizeof(sgw), have ? gw : 0);
++	tw_fmt_ip(sdns, sizeof(sdns), have ? dns : 0);
++	snprintf(buf, sizeof(buf),
++	    "ready=%d assoc=%d auth=%d ip=%s mask=%s gw=%s dns=%s\n",
++	    topaz_wlan_ready() ? 1 : 0,
++	    topaz_wlan_associated() ? 1 : 0,
++	    topaz_wlan_authorized() ? 1 : 0,
++	    sip, smask, sgw, sdns);
++	return sysctl_handle_string(oidp, buf, sizeof(buf), req);
++}
++
++static int
++sysctl_tw_dns SYSCTL_HANDLER_ARGS
++{
++	char buf[32];
++	uint32_t dns = 0;
++
++	if (!topaz_wlan_if_ipv4(NULL, NULL, NULL, &dns) || dns == 0) {
++		strlcpy(buf, "", sizeof(buf));
++	} else {
++		tw_fmt_ip(buf, sizeof(buf), dns);
++	}
++	return sysctl_handle_string(oidp, buf, sizeof(buf), req);
++}
++
+ SYSCTL_NODE(_kern, OID_AUTO, topaz_wlan, CTLFLAG_RW | CTLFLAG_LOCKED, 0,
+     "topaz WCN3988 WLAN control");
+ 
+@@ -220,4 +272,12 @@ SYSCTL_PROC(_kern_topaz_wlan, OID_AUTO, psk,
+     CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED,
+     NULL, 0, sysctl_tw_psk, "A", "write WPA2-PSK (8-63); read set|empty");
+ 
++SYSCTL_PROC(_kern_topaz_wlan, OID_AUTO, status,
++    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    NULL, 0, sysctl_tw_status, "A", "ready/assoc/auth + IPv4/DNS summary");
++
++SYSCTL_PROC(_kern_topaz_wlan, OID_AUTO, dns,
++    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    NULL, 0, sysctl_tw_dns, "A", "DHCP DNS (dotted quad) or empty");
++
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/TopazWlan.cpp b/iokit/Kernel/arm/TopazWlan.cpp
+--- a/iokit/Kernel/arm/TopazWlan.cpp
++++ b/iokit/Kernel/arm/TopazWlan.cpp
+@@ -1,5 +1,6 @@
+ /*
+  * topaz: IOService nub publishing WCN3988 / tw0 state into the IORegistry (0140).
++ * 0142: also TopazWlanIPv4/Netmask/Gateway/DNS from topaz_wlan_if_ipv4().
+  * Not an IONetworkInterface - configd/wifid still need IO80211 later.
+  * Match IOResources; poll topaz_wlan_* into properties. topazwlannub=0 skips.
+  */
+@@ -37,9 +38,12 @@ TopazWlan::publish(void)
+ {
+ 	uint8_t mac[6];
+ 	char macstr[32];
++	char ipstr[16];
++	uint32_t ip = 0, mask = 0, gw = 0, dns = 0;
+ 	bool ready = topaz_wlan_ready();
+ 	bool assoc = topaz_wlan_associated();
+ 	bool auth = topaz_wlan_authorized();
++	bool have_ip = topaz_wlan_if_ipv4(&ip, &mask, &gw, &dns);
+ 
+ 	setProperty("TopazWlanReady", ready ? kOSBooleanTrue : kOSBooleanFalse);
+ 	setProperty("TopazWlanAssociated", assoc ? kOSBooleanTrue : kOSBooleanFalse);
+@@ -54,6 +58,38 @@ TopazWlan::publish(void)
+ 		setProperty("TopazWlanMAC", macstr);
+ 		setProperty("IOMACAddress", (void *)mac, sizeof(mac));
+ 	}
++
++	if (have_ip) {
++		snprintf(ipstr, sizeof(ipstr), "%u.%u.%u.%u",
++		    (ip >> 24) & 0xff, (ip >> 16) & 0xff,
++		    (ip >> 8) & 0xff, ip & 0xff);
++		setProperty("TopazWlanIPv4", ipstr);
++		snprintf(ipstr, sizeof(ipstr), "%u.%u.%u.%u",
++		    (mask >> 24) & 0xff, (mask >> 16) & 0xff,
++		    (mask >> 8) & 0xff, mask & 0xff);
++		setProperty("TopazWlanNetmask", ipstr);
++		if (gw != 0) {
++			snprintf(ipstr, sizeof(ipstr), "%u.%u.%u.%u",
++			    (gw >> 24) & 0xff, (gw >> 16) & 0xff,
++			    (gw >> 8) & 0xff, gw & 0xff);
++			setProperty("TopazWlanGateway", ipstr);
++		} else {
++			removeProperty("TopazWlanGateway");
++		}
++		if (dns != 0) {
++			snprintf(ipstr, sizeof(ipstr), "%u.%u.%u.%u",
++			    (dns >> 24) & 0xff, (dns >> 16) & 0xff,
++			    (dns >> 8) & 0xff, dns & 0xff);
++			setProperty("TopazWlanDNS", ipstr);
++		} else {
++			removeProperty("TopazWlanDNS");
++		}
++	} else {
++		removeProperty("TopazWlanIPv4");
++		removeProperty("TopazWlanNetmask");
++		removeProperty("TopazWlanGateway");
++		removeProperty("TopazWlanDNS");
++	}
+ }
+ 
+ void

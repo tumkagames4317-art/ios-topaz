@@ -1,0 +1,116 @@
+Subject: [PATCH] topaz-0139: runtime WPA2-PSK via kern.topaz_wlan.psk
+
+topaz_wlan_set_psk() updates a_boot_psk used by the 0132 4-way.
+sysctl write sets/clears; read returns "set" or empty (never the secret).
+Boot-arg wifipsk= still works.
+diff --git a/bsd/sys/topaz_wlan.h b/bsd/sys/topaz_wlan.h
+--- a/bsd/sys/topaz_wlan.h
++++ b/bsd/sys/topaz_wlan.h
+@@ -2,7 +2,7 @@
+  * topaz: WCN3988 radio C API (implemented in iokit/Kernel/arm/TopazModem.cpp
+  * when boot-arg wifi=1). Scan + BSS list with beacon IEs; open-network
+  * association (0130); WPA2-PSK assoc + key install (0131); ready hook for
+- * ifnet tw0 + wifiip=/dhcp (0133-0135); 4-way when wifipsk= (0132).
++ * ifnet tw0 + wifiip=/dhcp (0133-0135); 4-way wifipsk=/sysctl psk (0132/0139).
+  */
+ #ifndef _BSD_SYS_TOPAZ_WLAN_H_
+ #define _BSD_SYS_TOPAZ_WLAN_H_
+@@ -31,6 +31,7 @@ int topaz_wlan_scan(void);
+ bool topaz_wlan_heard(unsigned index, struct topaz_wlan_bss *bss);
+ void topaz_wlan_address(uint8_t address[6]);
+ int topaz_wlan_connect_bss(unsigned index);
++int topaz_wlan_set_psk(const char *psk); /* runtime PSK; empty clears */
+ bool topaz_wlan_associated(void);
+ bool topaz_wlan_authorized(void);
+ int topaz_wlan_install_key(bool group, unsigned key_idx, unsigned cipher,
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -1,3 +1,24 @@
++extern "C" int
++topaz_wlan_set_psk(const char *psk)
++{
++	size_t n;
++
++	if (psk == NULL || psk[0] == '\0') {
++		a_boot_psk_set = false;
++		bzero(a_boot_psk, sizeof(a_boot_psk));
++		LOG("t=%u ms: assoc: psk cleared (sysctl)", g_ms);
++		return 0;
++	}
++	n = strlen(psk);
++	if (n < 8 || n > 63) {
++		return EINVAL;
++	}
++	strlcpy(a_boot_psk, psk, sizeof(a_boot_psk));
++	a_boot_psk_set = true;
++	LOG("t=%u ms: assoc: psk set via sysctl (len %u)", g_ms, (unsigned)n);
++	return 0;
++}
++
+ extern "C" int
+ topaz_wlan_connect_bss(unsigned index)
+ {
+diff --git a/bsd/dev/topaz_wlan_sysctl.c b/bsd/dev/topaz_wlan_sysctl.c
+--- a/bsd/dev/topaz_wlan_sysctl.c
++++ b/bsd/dev/topaz_wlan_sysctl.c
+@@ -1,8 +1,7 @@
+ /*
+  * topaz: sysctl bridge for WLAN scan / BSS list / join (0138).
+- * kern.topaz_wlan.{ready,associated,authorized,scan,bss,connect}
+- * Userspace can drive the radio before IO80211 exists.
+- * WPA2 still needs boot-arg wifipsk= for the in-kernel 4-way.
++ * 0139: kern.topaz_wlan.psk for runtime WPA2-PSK (or boot-arg wifipsk=).
++ * kern.topaz_wlan.{ready,associated,authorized,scan,bss,connect,psk}
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -147,6 +146,7 @@ tw_connect_ssid(const char *ssid)
+ }
+ 
+ static char tw_sys_connect_ssid[33];
++static int tw_sys_psk_set;
+ 
+ static int
+ sysctl_tw_connect SYSCTL_HANDLER_ARGS
+@@ -164,6 +164,31 @@ sysctl_tw_connect SYSCTL_HANDLER_ARGS
+ 	return error;
+ }
+ 
++static int
++sysctl_tw_psk SYSCTL_HANDLER_ARGS
++{
++	char buf[64];
++	int error;
++
++	/* Never echo the secret; only "set" / empty on read. */
++	if (req->newptr == USER_ADDR_NULL) {
++		strlcpy(buf, tw_sys_psk_set ? "set" : "", sizeof(buf));
++		return sysctl_handle_string(oidp, buf, sizeof(buf), req);
++	}
++	bzero(buf, sizeof(buf));
++	error = sysctl_handle_string(oidp, buf, sizeof(buf), req);
++	if (error != 0) {
++		return error;
++	}
++	error = topaz_wlan_set_psk(buf);
++	if (error == 0) {
++		tw_sys_psk_set = (buf[0] != '\0');
++		printf("SWEET WLAN: sysctl psk %s\n",
++		    tw_sys_psk_set ? "set" : "cleared");
++	}
++	return error;
++}
++
+ SYSCTL_NODE(_kern, OID_AUTO, topaz_wlan, CTLFLAG_RW | CTLFLAG_LOCKED, 0,
+     "topaz WCN3988 WLAN control");
+ 
+@@ -191,4 +216,8 @@ SYSCTL_PROC(_kern_topaz_wlan, OID_AUTO, connect,
+     CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED,
+     NULL, 0, sysctl_tw_connect, "A", "write SSID to join (needs prior scan)");
+ 
++SYSCTL_PROC(_kern_topaz_wlan, OID_AUTO, psk,
++    CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED,
++    NULL, 0, sysctl_tw_psk, "A", "write WPA2-PSK (8-63); read set|empty");
++
+ #endif /* ARM64_BOARD_CONFIG_SWEET */

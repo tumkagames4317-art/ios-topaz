@@ -1,0 +1,292 @@
+Subject: [PATCH] topaz-0127: PM6125 RTC wall clock via SPMI
+
+Read the PM8941-compatible RTC on PM6125 (SID0 @0x6000) over the same
+SPMI arbiter as the keys driver. Override SweetPlatformExpert
+get/setGMTTimeOfDay and push clock_set_calendar_microtime once UFS
+bring-up has mapped SPMI, so the UI is not stuck on 31 December.
+
+Raw Qualcomm counts are often GPS-epoch relative; if the value already
+looks like Unix (>= 2021-01-01) it is used as-is, else GPS epoch
+315964800 is added. Boot-arg sweetrtoffset=N overrides the addend
+(sweetrtoffset=-1 disables the GPS adjustment). sweetrton=0 disables.
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -109,6 +109,7 @@ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_i2c1.c			standard
++bsd/dev/sweet_rtc.c			standard
+ bsd/dev/sweet_cpufreq.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+diff --git a/bsd/dev/sweet_rtc.c b/bsd/dev/sweet_rtc.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_rtc.c
+@@ -0,0 +1,252 @@
++/*
++ * topaz: PM6125 RTC (qcom,pm8941-rtc at SPMI 0x6000). Read-only wall clock
++ * for XNU PEGetUTCTimeOfDay / calendar init. SPMI MMIO matches patch 0087
++ * keys (arb 0x01c40000). Register map from Linux drivers/rtc/rtc-pm8xxx.c
++ * pm8941_regs: ctrl 0x6046, read 0x6048 (4 LE bytes), enable BIT(7).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <IOKit/IOLocks.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++int sweet_rtc_init(void);
++int sweet_rtc_read_unix(clock_sec_t *secs);
++
++#define RTC_CORE_PA     0x01c40000u
++#define RTC_OBS_PA      0x03e00000u
++#define RTC_CFG_PA      0x01c0a000u
++#define RTC_NO_APID     0xffffu
++#define RTC_PPID        0x060u          /* SID0 peripheral 0x60 */
++#define RTC_CTRL        0x6046u
++#define RTC_READ        0x6048u
++#define RTC_ENABLE      0x80u
++#define RTC_GPS_EPOCH   315964800u      /* 1980-01-06 */
++#define RTC_UNIX_2021   1609459200u
++
++static vm_offset_t rtc_core, rtc_obs, rtc_cfg;
++static IOLock *rtc_lock;
++static unsigned rtc_count;
++static uint16_t rtc_apid = RTC_NO_APID;
++static bool rtc_ready;
++static int rtc_enabled = 1;
++
++static uint32_t
++rtc_rd(vm_offset_t base, unsigned off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static uint16_t
++rtc_find_apid(unsigned ppid)
++{
++	uint16_t found = RTC_NO_APID;
++	unsigned i;
++
++	for (i = 0; i < rtc_count; ++i) {
++		uint32_t map = rtc_rd(rtc_core, 0x900u + 4u * i);
++		if (!map || ((map >> 8) & 0xfffu) != ppid) {
++			continue;
++		}
++		unsigned owner = rtc_rd(rtc_cfg, 0x700u + 4u * i) & 7u;
++		if (found == RTC_NO_APID || owner == 0) {
++			found = (uint16_t)i;
++		}
++	}
++	return found;
++}
++
++static int
++rtc_spmi_read(uint16_t addr, uint8_t *out)
++{
++	unsigned off;
++	unsigned i;
++
++	if (!rtc_ready || rtc_apid == RTC_NO_APID || !out) {
++		return -1;
++	}
++	IOLockLock(rtc_lock);
++	off = 0x80u * rtc_apid;
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(rtc_obs + off) =
++	    (1u << 27) | ((uint32_t)(addr & 0xffu) << 4);
++	__asm__ volatile("dsb osh" ::: "memory");
++	for (i = 0; i < 1000; ++i) {
++		uint32_t status = rtc_rd(rtc_obs, off + 0x08u);
++		if (status & 1u) {
++			if (status & 0x0eu) {
++				IOLockUnlock(rtc_lock);
++				return -1;
++			}
++			*out = (uint8_t)rtc_rd(rtc_obs, off + 0x18u);
++			IOLockUnlock(rtc_lock);
++			return 0;
++		}
++		delay(1);
++	}
++	IOLockUnlock(rtc_lock);
++	return -1;
++}
++
++static int
++rtc_read_raw(uint32_t *secs)
++{
++	uint8_t b0, b1, b2, b3, b0b;
++
++	if (rtc_spmi_read(RTC_READ + 0, &b0) ||
++	    rtc_spmi_read(RTC_READ + 1, &b1) ||
++	    rtc_spmi_read(RTC_READ + 2, &b2) ||
++	    rtc_spmi_read(RTC_READ + 3, &b3) ||
++	    rtc_spmi_read(RTC_READ + 0, &b0b)) {
++		return -1;
++	}
++	if (b0b < b0) {
++		if (rtc_spmi_read(RTC_READ + 0, &b0) ||
++		    rtc_spmi_read(RTC_READ + 1, &b1) ||
++		    rtc_spmi_read(RTC_READ + 2, &b2) ||
++		    rtc_spmi_read(RTC_READ + 3, &b3)) {
++			return -1;
++		}
++	}
++	*secs = (uint32_t)b0 | ((uint32_t)b1 << 8) |
++	    ((uint32_t)b2 << 16) | ((uint32_t)b3 << 24);
++	return 0;
++}
++
++int
++sweet_rtc_read_unix(clock_sec_t *secs)
++{
++	uint32_t raw;
++	int32_t offset = (int32_t)RTC_GPS_EPOCH;
++	uint8_t ctrl = 0;
++
++	if (!secs || !rtc_ready) {
++		return -1;
++	}
++	(void)PE_parse_boot_argn("sweetrtoffset", &offset, sizeof(offset));
++	if (rtc_spmi_read(RTC_CTRL, &ctrl)) {
++		return -1;
++	}
++	if (!(ctrl & RTC_ENABLE)) {
++		printf("SWEET RTC: ctrl=%#x not enabled\n", ctrl);
++		return -1;
++	}
++	if (rtc_read_raw(&raw)) {
++		return -1;
++	}
++	if (raw >= RTC_UNIX_2021) {
++		*secs = raw;
++	} else if (offset == -1) {
++		*secs = raw;
++	} else {
++		*secs = (clock_sec_t)((uint64_t)raw + (uint32_t)offset);
++	}
++	return 0;
++}
++
++int
++sweet_rtc_init(void)
++{
++	uint32_t arb;
++	clock_sec_t secs = 0;
++	static bool attempted;
++
++	if (attempted) {
++		return rtc_ready ? 0 : -1;
++	}
++	attempted = true;
++	(void)PE_parse_boot_argn("sweetrton", &rtc_enabled, sizeof(rtc_enabled));
++	if (!rtc_enabled) {
++		printf("SWEET RTC: disabled (sweetrton=0)\n");
++		return -1;
++	}
++	rtc_lock = IOLockAlloc();
++	if (!rtc_lock) {
++		return -1;
++	}
++	rtc_core = ml_io_map(RTC_CORE_PA, 0x2000);
++	rtc_cfg = ml_io_map(RTC_CFG_PA, 0x1000);
++	rtc_obs = ml_io_map(RTC_OBS_PA, 0x10000);
++	if (!rtc_core || !rtc_cfg || !rtc_obs) {
++		printf("SWEET RTC: SPMI mapping failed\n");
++		return -1;
++	}
++	arb = rtc_rd(rtc_core, 0);
++	rtc_count = rtc_rd(rtc_core, 4) & 0x7ffu;
++	if (arb < 0x50000000u || arb >= 0x70000000u ||
++	    !rtc_count || rtc_count > 512) {
++		printf("SWEET RTC: bad SPMI arb=%#x APIDs=%u\n", arb, rtc_count);
++		return -1;
++	}
++	rtc_apid = rtc_find_apid(RTC_PPID);
++	if (rtc_apid == RTC_NO_APID) {
++		printf("SWEET RTC: no APID for PPID %#x\n", RTC_PPID);
++		return -1;
++	}
++	rtc_ready = true;
++	printf("SWEET RTC: SPMI arb=%#x APID=%u PPID=%#x\n",
++	    arb, rtc_apid, RTC_PPID);
++	if (sweet_rtc_read_unix(&secs) == 0) {
++		printf("SWEET RTC: unix %lu\n", (unsigned long)secs);
++		clock_set_calendar_microtime(secs, 0);
++	} else {
++		printf("SWEET RTC: read failed\n");
++	}
++	return 0;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -52,6 +52,7 @@
+ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
++extern int sweet_rtc_init(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -710,6 +711,7 @@
+ 	(void)PE_parse_boot_argn("sweethw", &hw, sizeof(hw));
+ 	sweet_touch_init();
+ 	sweet_keys_init();
++	(void)sweet_rtc_init();
+ 	if (hw == 1) {
+ 		sweet_usb_probe();
+ 	} else {
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -16,12 +16,36 @@
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void processTopLevel(IORegistryEntry *root) APPLE_KEXT_OVERRIDE;
+ 	const char *deleteList(void) APPLE_KEXT_OVERRIDE;
+ 	const char *excludeList(void) APPLE_KEXT_OVERRIDE;
++	long getGMTTimeOfDay(void) APPLE_KEXT_OVERRIDE;
++	void setGMTTimeOfDay(long secs) APPLE_KEXT_OVERRIDE;
+ };
+ 
+ OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
+ 
++extern "C" int sweet_rtc_read_unix(clock_sec_t *secs);
++
++long
++SweetPlatformExpert::getGMTTimeOfDay(void)
++{
++	clock_sec_t secs = 0;
++
++	if (sweet_rtc_read_unix(&secs) == 0) {
++		return (long)secs;
++	}
++	return 0;
++}
++
++void
++SweetPlatformExpert::setGMTTimeOfDay(long secs)
++{
++	/*
++	 * PMIC write-back (SPMI EXT_WRITEL) not implemented yet. settimeofday
++	 * still updates the in-kernel calendar until reboot.
++	 */
++	(void)secs;
++}
++
+ bool
+ SweetPlatformExpert::start(IOService *provider)
+ {
+ 	IOLog("SWEET: starting device-tree platform expert\n");

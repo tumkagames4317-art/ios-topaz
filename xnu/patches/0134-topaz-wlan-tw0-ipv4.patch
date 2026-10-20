@@ -1,0 +1,278 @@
+Subject: [PATCH] topaz-0134: tw0 IPv4 from wifiip=/wifimask=/wifigw=
+
+When the station is authorized (open or PTK), apply a static IPv4 on tw0
+from boot-args (same sock_ioctl path as ue0). Optional default gateway.
+
+diff --git a/bsd/sys/topaz_wlan.h b/bsd/sys/topaz_wlan.h
+--- a/bsd/sys/topaz_wlan.h
++++ b/bsd/sys/topaz_wlan.h
+@@ -2,7 +2,7 @@
+  * topaz: WCN3988 radio C API (implemented in iokit/Kernel/arm/TopazModem.cpp
+  * when boot-arg wifi=1). Scan + BSS list with beacon IEs; open-network
+  * association (0130); WPA2-PSK assoc + key install (0131); ready hook for
+- * ifnet tw0 datapath (0133); 4-way in topaz_wlan_wpa.c when wifipsk= (0132).
++ * ifnet tw0 datapath (0133) + wifiip= (0134); 4-way when wifipsk= (0132).
+  */
+ #ifndef _BSD_SYS_TOPAZ_WLAN_H_
+ #define _BSD_SYS_TOPAZ_WLAN_H_
+@@ -40,6 +40,7 @@ bool topaz_wlan_tx_ethernet(const uint8_t *eth, unsigned len);
+ 
+ void topaz_wlan_if_init(void);
+ void topaz_wlan_if_input(const uint8_t *eth, unsigned len);
++void topaz_wlan_if_on_authorized(void); /* apply wifiip= after PTK/open */
+ 
+ #ifdef __cplusplus
+ }
+
+diff --git a/bsd/dev/topaz_wlan_if.c b/bsd/dev/topaz_wlan_if.c
+--- a/bsd/dev/topaz_wlan_if.c
++++ b/bsd/dev/topaz_wlan_if.c
+@@ -1,7 +1,7 @@
+ /*
+  * topaz: ifnet tw0 when TopazModem WLAN radio is ready.
+- * 0133: ethernet TX via topaz_wlan_tx_ethernet; RX via topaz_wlan_if_input.
+- * sweetwlanif=0 skips. Needs assoc (+ PTK for WPA2) for datapath.
++ * 0133: HTT ethernet datapath. 0134: optional wifiip=/wifimask=/wifigw=.
++ * sweetwlanif=0 skips. Datapath needs assoc (+ PTK for WPA2).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -9,6 +9,7 @@
+ #include <sys/socket.h>
+ #include <sys/sockio.h>
+ #include <sys/kpi_mbuf.h>
++#include <sys/kpi_socket.h>
+ #include <sys/topaz_wlan.h>
+ #include <net/ethernet.h>
+ #include <net/if.h>
+@@ -16,6 +17,9 @@
+ #include <net/if_ether.h>
+ #include <net/ether_if_module.h>
+ #include <net/kpi_interface.h>
++#include <net/kpi_protocol.h>
++#include <net/route.h>
++#include <netinet/in.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/locks.h>
+ 
+@@ -24,6 +28,144 @@ static lck_mtx_t *tw_lock;
+ static int tw_enabled = 1;
+ static bool tw_hooked;
+ static bool tw_attached;
++static bool tw_addr_done;
++
++static int
++tw_parse_ipv4(const char *s, uint32_t *host_order)
++{
++	unsigned a = 0, b = 0, c = 0, d = 0, n = 0, v = 0;
++	const char *p;
++
++	if (s == NULL || s[0] == '\0') {
++		return -1;
++	}
++	for (p = s; ; p++) {
++		if (*p >= '0' && *p <= '9') {
++			v = v * 10 + (unsigned)(*p - '0');
++			if (v > 255) {
++				return -1;
++			}
++			continue;
++		}
++		if (*p == '.' || *p == '\0') {
++			if (n == 0) {
++				a = v;
++			} else if (n == 1) {
++				b = v;
++			} else if (n == 2) {
++				c = v;
++			} else if (n == 3) {
++				d = v;
++			} else {
++				return -1;
++			}
++			n++;
++			v = 0;
++			if (*p == '\0') {
++				break;
++			}
++			continue;
++		}
++		return -1;
++	}
++	if (n != 4) {
++		return -1;
++	}
++	*host_order = (a << 24) | (b << 16) | (c << 8) | d;
++	return 0;
++}
++
++static void
++tw_configure_ipv4(void)
++{
++	char ipstr[32], maskstr[32], gwstr[32];
++	uint32_t ip = 0, mask = 0xffffff00, gw = 0;
++	errno_t err;
++	socket_t so = NULL;
++	struct ifaliasreq ifra;
++	struct sockaddr_in *sin;
++
++	if (!tw_attached || tw_ifp == NULL || tw_addr_done) {
++		return;
++	}
++	if (!PE_parse_boot_argn("wifiip", ipstr, sizeof(ipstr)) ||
++	    ipstr[0] == '\0') {
++		printf("SWEET WLAN: no wifiip= (tw0 link only)\n");
++		return;
++	}
++	if (tw_parse_ipv4(ipstr, &ip) != 0) {
++		printf("SWEET WLAN: bad wifiip='%s'\n", ipstr);
++		return;
++	}
++	if (PE_parse_boot_argn("wifimask", maskstr, sizeof(maskstr)) &&
++	    maskstr[0] != '\0') {
++		if (tw_parse_ipv4(maskstr, &mask) != 0) {
++			printf("SWEET WLAN: bad wifimask='%s'\n", maskstr);
++			return;
++		}
++	}
++	if (PE_parse_boot_argn("wifigw", gwstr, sizeof(gwstr)) &&
++	    gwstr[0] != '\0') {
++		if (tw_parse_ipv4(gwstr, &gw) != 0) {
++			printf("SWEET WLAN: bad wifigw='%s'\n", gwstr);
++			gw = 0;
++		}
++	}
++
++	err = proto_plumb(PF_INET, tw_ifp);
++	if (err == 0) {
++		err = sock_socket(PF_INET, SOCK_DGRAM, 0, NULL, NULL, &so);
++	}
++	if (err == 0) {
++		bzero(&ifra, sizeof(ifra));
++		snprintf(ifra.ifra_name, sizeof(ifra.ifra_name), "tw0");
++		sin = (struct sockaddr_in *)&ifra.ifra_addr;
++		sin->sin_len = sizeof(*sin);
++		sin->sin_family = AF_INET;
++		sin->sin_addr.s_addr = htonl(ip);
++		sin = (struct sockaddr_in *)&ifra.ifra_mask;
++		sin->sin_len = sizeof(*sin);
++		sin->sin_family = AF_INET;
++		sin->sin_addr.s_addr = htonl(mask);
++		sin = (struct sockaddr_in *)&ifra.ifra_broadaddr;
++		sin->sin_len = sizeof(*sin);
++		sin->sin_family = AF_INET;
++		sin->sin_addr.s_addr = htonl(ip | ~mask);
++		err = sock_ioctl(so, SIOCAIFADDR, &ifra);
++	}
++	if (err == 0 && gw != 0 && so != NULL) {
++		struct ortentry rt;
++
++		bzero(&rt, sizeof(rt));
++		rt.rt_flags = RTF_UP | RTF_GATEWAY;
++		sin = (struct sockaddr_in *)&rt.rt_dst;
++		sin->sin_len = sizeof(*sin);
++		sin->sin_family = AF_INET;
++		sin->sin_addr.s_addr = htonl(0);
++		sin = (struct sockaddr_in *)&rt.rt_gateway;
++		sin->sin_len = sizeof(*sin);
++		sin->sin_family = AF_INET;
++		sin->sin_addr.s_addr = htonl(gw);
++		sin = (struct sockaddr_in *)&rt.rt_genmask;
++		sin->sin_len = sizeof(*sin);
++		sin->sin_family = AF_INET;
++		sin->sin_addr.s_addr = htonl(0);
++		(void)sock_ioctl(so, SIOCADDRT, &rt);
++	}
++	if (so != NULL) {
++		sock_close(so);
++	}
++	ifnet_set_flags(tw_ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
++	if (err == 0) {
++		tw_addr_done = true;
++		printf("SWEET WLAN: tw0 %u.%u.%u.%u mask %u.%u.%u.%u%s\n",
++		    (ip >> 24) & 0xff, (ip >> 16) & 0xff, (ip >> 8) & 0xff, ip & 0xff,
++		    (mask >> 24) & 0xff, (mask >> 16) & 0xff, (mask >> 8) & 0xff,
++		    mask & 0xff, gw != 0 ? " (+gw)" : "");
++	} else {
++		printf("SWEET WLAN: tw0 SIOCAIFADDR failed err %d\n", err);
++	}
++}
+ 
+ static errno_t
+ tw_output(ifnet_t ifp, mbuf_t m)
+@@ -59,9 +201,13 @@ tw_ioctl(ifnet_t ifp, unsigned long cmd, void *data __unused)
+ {
+ 	switch (cmd) {
+ 	case SIOCSIFADDR:
++	case SIOCAIFADDR:
+ 	case SIOCSIFFLAGS:
+ 		ifnet_set_flags(ifp, IFF_UP, IFF_UP);
+ 		return 0;
++	case SIOCADDMULTI:
++	case SIOCDELMULTI:
++		return 0;
+ 	default:
+ 		return EOPNOTSUPP;
+ 	}
+@@ -135,6 +281,9 @@ tw_attach_ifnet(void)
+ 	tw_attached = true;
+ 	printf("SWEET WLAN: tw0 up %02x:%02x:%02x:%02x:%02x:%02x (HTT datapath)\n",
+ 	    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
++	if (topaz_wlan_authorized()) {
++		tw_configure_ipv4();
++	}
+ }
+ 
+ static void
+@@ -178,6 +327,16 @@ topaz_wlan_if_input(const uint8_t *eth, unsigned len)
+ 	stats.bytes_in = len;
+ 	ifnet_input(tw_ifp, m, &stats);
+ }
++
++void
++topaz_wlan_if_on_authorized(void)
++{
++	if (!tw_attached) {
++		tw_attach_ifnet();
++	}
++	tw_configure_ipv4();
++}
++
+ void
+ topaz_wlan_if_init(void)
+ {
+@@ -208,4 +367,8 @@ topaz_wlan_if_input(const uint8_t *eth, unsigned len)
+ 	(void)eth;
+ 	(void)len;
+ }
++void
++topaz_wlan_if_on_authorized(void)
++{
++}
+ #endif
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -1,9 +1,11 @@
+ #include <sys/topaz_wlan_wpa.h>
+ extern "C" void topaz_wlan_if_input(const uint8_t *eth, unsigned len);
++extern "C" void topaz_wlan_if_on_authorized(void);
+ 
+ 	if (!a_rsn) {
+ 		a_peer_param(a_req.bssid, PEER_PARAM_AUTHORIZE, 1);
+ 		a_ptk = true;
++		topaz_wlan_if_on_authorized();
+ 	}
+ 	a_state = A_UP;
+ 	a_up = true;
+@@ -23,6 +25,8 @@ extern "C" void topaz_wlan_if_input(const uint8_t *eth, unsigned len);
+ 		if (keys.done) {
+ 			if (topaz_wlan_install_key(false, 0, 4, keys.tk, 16) != 0) {
+ 				LOG("t=%u ms: assoc: PTK install failed", g_ms);
++			} else {
++				topaz_wlan_if_on_authorized();
+ 			}
+ 			if (keys.have_gtk &&
+ 			    topaz_wlan_install_key(true, keys.gtk_id, 4,
+

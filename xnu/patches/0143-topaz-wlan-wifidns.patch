@@ -1,0 +1,48 @@
+Subject: [PATCH] topaz-0143: wifidns= for static tw0 DNS store
+
+Parse boot-arg wifidns=A.B.C.D after static wifiip= apply and store it in
+tw_cfg_dns so kern.topaz_wlan.dns / status and TopazWlanDNS (0142) work
+without DHCP. Still does not program resolv.conf / configd.
+diff --git a/bsd/dev/topaz_wlan_if.c b/bsd/dev/topaz_wlan_if.c
+--- a/bsd/dev/topaz_wlan_if.c
++++ b/bsd/dev/topaz_wlan_if.c
+@@ -2,6 +2,7 @@
+  * topaz: ifnet tw0 when TopazModem WLAN radio is ready.
+  * 0133-0137: HTT + wifiip=/dhcp + renew + GARP. 0141: clear IP on disconnect.
+  * 0142: topaz_wlan_if_ipv4() for sysctl/ioreg (stores DHCP DNS).
++ * 0143: wifidns= stores resolver for static wifiip= (DHCP still uses opt 6).
+  * sweetwlanif=0 skips. wifigarpon=0 disables GARP.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+@@ -583,8 +584,8 @@ tw_dhcp_start(uint32_t ms)
+ static void
+ tw_configure_ipv4(void)
+ {
+-	char ipstr[32], maskstr[32], gwstr[32];
+-	uint32_t ip = 0, mask = 0xffffff00, gw = 0;
++	char ipstr[32], maskstr[32], gwstr[32], dnsstr[32];
++	uint32_t ip = 0, mask = 0xffffff00, gw = 0, dns = 0;
+ 	int want_dhcp = 0;
+ 
+ 	if (!tw_attached || tw_ifp == NULL || tw_addr_done) {
+@@ -623,7 +624,20 @@ tw_configure_ipv4(void)
+ 			gw = 0;
+ 		}
+ 	}
++	if (PE_parse_boot_argn("wifidns", dnsstr, sizeof(dnsstr)) &&
++	    dnsstr[0] != '\0') {
++		if (tw_parse_ipv4(dnsstr, &dns) != 0) {
++			printf("SWEET WLAN: bad wifidns='%s'\n", dnsstr);
++			dns = 0;
++		}
++	}
+ 	tw_apply_ipv4(ip, mask, gw);
++	if (tw_addr_done && dns != 0) {
++		tw_cfg_dns = dns;
++		printf("SWEET WLAN: DNS %u.%u.%u.%u (wifidns=; not resolv)\n",
++		    (dns >> 24) & 0xff, (dns >> 16) & 0xff,
++		    (dns >> 8) & 0xff, dns & 0xff);
++	}
+ }
+ 
+ static errno_t

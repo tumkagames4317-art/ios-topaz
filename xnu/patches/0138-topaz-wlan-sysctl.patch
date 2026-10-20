@@ -1,0 +1,212 @@
+Subject: [PATCH] topaz-0138: kern.topaz_wlan sysctl scan/BSS/join
+
+Userspace bridge before IO80211: ready/associated/authorized, write
+scan=1 to scan, read bss for the table, write connect=SSID to join.
+WPA2 still needs boot-arg wifipsk= for the 4-way.
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -1,3 +1,4 @@
+ bsd/dev/topaz_wlan_if.c			standard
+ bsd/dev/topaz_wlan_wpa.c			standard
++bsd/dev/topaz_wlan_sysctl.c		standard
+ bsd/dev/sweet_cpufreq.c			standard
+diff --git a/bsd/dev/topaz_wlan_sysctl.c b/bsd/dev/topaz_wlan_sysctl.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/topaz_wlan_sysctl.c
+@@ -0,0 +1,194 @@
++/*
++ * topaz: sysctl bridge for WLAN scan / BSS list / join (0138).
++ * kern.topaz_wlan.{ready,associated,authorized,scan,bss,connect}
++ * Userspace can drive the radio before IO80211 exists.
++ * WPA2 still needs boot-arg wifipsk= for the in-kernel 4-way.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/sysctl.h>
++#include <sys/topaz_wlan.h>
++#include <libkern/libkern.h>
++
++static int tw_sys_scan_err;
++
++static int
++sysctl_tw_ready SYSCTL_HANDLER_ARGS
++{
++	int v = topaz_wlan_ready() ? 1 : 0;
++
++	return sysctl_handle_int(oidp, &v, 0, req);
++}
++
++static int
++sysctl_tw_associated SYSCTL_HANDLER_ARGS
++{
++	int v = topaz_wlan_associated() ? 1 : 0;
++
++	return sysctl_handle_int(oidp, &v, 0, req);
++}
++
++static int
++sysctl_tw_authorized SYSCTL_HANDLER_ARGS
++{
++	int v = topaz_wlan_authorized() ? 1 : 0;
++
++	return sysctl_handle_int(oidp, &v, 0, req);
++}
++
++static int
++sysctl_tw_scan SYSCTL_HANDLER_ARGS
++{
++	int v = tw_sys_scan_err;
++	int error;
++
++	error = sysctl_handle_int(oidp, &v, 0, req);
++	if (error != 0 || req->newptr == USER_ADDR_NULL) {
++		return error;
++	}
++	/* Any non-zero write triggers a blocking scan (sleeps off modem thread). */
++	if (v != 0) {
++		tw_sys_scan_err = topaz_wlan_scan();
++		printf("SWEET WLAN: sysctl scan -> %d\n", tw_sys_scan_err);
++	}
++	return 0;
++}
++
++static void
++tw_fmt_ssid(char *dst, size_t dstlen, const uint8_t *ssid, unsigned len)
++{
++	unsigned i, o = 0;
++
++	if (dstlen == 0) {
++		return;
++	}
++	for (i = 0; i < len && o + 1 < dstlen; i++) {
++		uint8_t c = ssid[i];
++
++		if (c >= 0x20 && c < 0x7f && c != '\\' && c != '\t') {
++			dst[o++] = (char)c;
++		} else if (o + 4 < dstlen) {
++			dst[o++] = '\\';
++			dst[o++] = 'x';
++			dst[o++] = "0123456789abcdef"[(c >> 4) & 0xf];
++			dst[o++] = "0123456789abcdef"[c & 0xf];
++		} else {
++			break;
++		}
++	}
++	dst[o] = '\0';
++}
++
++static int
++sysctl_tw_bss SYSCTL_HANDLER_ARGS
++{
++	char buf[4096];
++	unsigned off = 0;
++	unsigned i;
++	struct topaz_wlan_bss b;
++
++	bzero(buf, sizeof(buf));
++	for (i = 0; topaz_wlan_heard(i, &b); i++) {
++		char ssid[96];
++		char line[160];
++		int n;
++
++		tw_fmt_ssid(ssid, sizeof(ssid), b.ssid, b.ssid_length);
++		n = snprintf(line, sizeof(line),
++		    "%u\t%s\t%02x:%02x:%02x:%02x:%02x:%02x\t%d\t%u\t0x%04x\n",
++		    i, ssid[0] != '\0' ? ssid : "(hidden)",
++		    b.bssid[0], b.bssid[1], b.bssid[2],
++		    b.bssid[3], b.bssid[4], b.bssid[5],
++		    (int)b.rssi, (unsigned)b.frequency, (unsigned)b.capability);
++		if (n <= 0) {
++			break;
++		}
++		if (off + (unsigned)n + 1 >= sizeof(buf)) {
++			break;
++		}
++		memcpy(buf + off, line, (unsigned)n);
++		off += (unsigned)n;
++	}
++	if (off == 0) {
++		strlcpy(buf, "# empty (scan first: sysctl -w kern.topaz_wlan.scan=1)\n",
++		    sizeof(buf));
++	}
++	return sysctl_handle_string(oidp, buf, sizeof(buf), req);
++}
++
++static int
++tw_connect_ssid(const char *ssid)
++{
++	struct topaz_wlan_bss b;
++	unsigned i, slen;
++
++	if (ssid == NULL) {
++		return EINVAL;
++	}
++	slen = (unsigned)strlen(ssid);
++	if (slen == 0 || slen > 32) {
++		return EINVAL;
++	}
++	if (!topaz_wlan_ready()) {
++		return ENXIO;
++	}
++	for (i = 0; topaz_wlan_heard(i, &b); i++) {
++		if (b.ssid_length == slen && memcmp(b.ssid, ssid, slen) == 0) {
++			int err = topaz_wlan_connect_bss(i);
++
++			printf("SWEET WLAN: sysctl connect '%s' idx %u -> %d\n",
++			    ssid, i, err);
++			return err;
++		}
++	}
++	printf("SWEET WLAN: sysctl connect '%s' not in BSS list\n", ssid);
++	return ENOENT;
++}
++
++static char tw_sys_connect_ssid[33];
++
++static int
++sysctl_tw_connect SYSCTL_HANDLER_ARGS
++{
++	char ssid[33];
++	int error;
++
++	strlcpy(ssid, tw_sys_connect_ssid, sizeof(ssid));
++	error = sysctl_handle_string(oidp, ssid, sizeof(ssid), req);
++	if (error != 0 || req->newptr == USER_ADDR_NULL) {
++		return error;
++	}
++	strlcpy(tw_sys_connect_ssid, ssid, sizeof(tw_sys_connect_ssid));
++	error = tw_connect_ssid(ssid);
++	return error;
++}
++
++SYSCTL_NODE(_kern, OID_AUTO, topaz_wlan, CTLFLAG_RW | CTLFLAG_LOCKED, 0,
++    "topaz WCN3988 WLAN control");
++
++SYSCTL_PROC(_kern_topaz_wlan, OID_AUTO, ready,
++    CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED,
++    NULL, 0, sysctl_tw_ready, "I", "1 if WLAN radio API ready");
++
++SYSCTL_PROC(_kern_topaz_wlan, OID_AUTO, associated,
++    CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED,
++    NULL, 0, sysctl_tw_associated, "I", "1 if associated");
++
++SYSCTL_PROC(_kern_topaz_wlan, OID_AUTO, authorized,
++    CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED,
++    NULL, 0, sysctl_tw_authorized, "I", "1 if authorized (open or PTK)");
++
++SYSCTL_PROC(_kern_topaz_wlan, OID_AUTO, scan,
++    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    NULL, 0, sysctl_tw_scan, "I", "write nonzero to scan; read last error");
++
++SYSCTL_PROC(_kern_topaz_wlan, OID_AUTO, bss,
++    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    NULL, 0, sysctl_tw_bss, "A", "BSS table: idx ssid bssid rssi freq cap");
++
++SYSCTL_PROC(_kern_topaz_wlan, OID_AUTO, connect,
++    CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED,
++    NULL, 0, sysctl_tw_connect, "A", "write SSID to join (needs prior scan)");
++
++#endif /* ARM64_BOARD_CONFIG_SWEET */
