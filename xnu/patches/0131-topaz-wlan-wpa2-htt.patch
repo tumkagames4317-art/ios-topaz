@@ -134,87 +134,88 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
  	return (uint32_t)(p - f);
  }
  
-@@ -486,100 +520,29 @@ static void a_teardown(void);
+@@ -486,100 +520,105 @@ static void a_teardown(void);
  static void a_fail(int status);
  static void a_start_auth(void);
  static void a_start_assoc(void);
 -static void a_on_up(void);
 -
--static void
--a_teardown(void)
--{
--	if (a_state >= A_START) {
--		if (a_state == A_UP) {
--			a_vdev_simple(CMD_VDEV_DOWN, TAG_VDEV_DOWN);
--		}
--		if (a_state >= A_AUTH) {
--			a_peer_delete(a_req.bssid);
--		}
--		a_vdev_simple(CMD_VDEV_STOP, TAG_VDEV_STOP);
--	}
--	a_state = A_IDLE;
--	a_up = false;
--}
--
--static void
--a_fail(int status)
--{
--	LOG("t=%u ms: assoc: failed (%d) state %u", g_ms, status, a_state);
--	a_teardown();
--}
--
--static void
--a_arm(void)
--{
--	a_deadline = g_ms + ASSOC_WAIT_MS;
--}
--
--static void
--a_start_auth(void)
--{
--	a_state = A_AUTH;
--	a_tries = 1;
--	a_peer_create(a_req.bssid);
--	a_send_auth();
--	a_arm();
--}
--
--static void
--a_start_assoc(void)
--{
--	a_state = A_ASSOC;
--	a_tries = 1;
--	a_areq_len = a_build_assoc_req(a_areq, sizeof(a_areq));
--	a_send_mgmt(a_areq, a_areq_len);
--	a_arm();
--}
--
--static void
--a_begin(void)
--{
--	uint32_t bcn = 100, dtim = 1;
--	const uint8_t *tim;
--
--	if (a_req.body_len >= 12) {
--		bcn = (uint32_t)a_req.body[8] | ((uint32_t)a_req.body[9] << 8);
--	}
--	tim = a_find_ie(a_req.body, a_req.body_len, 5);
--	if (tim != NULL && tim[1] >= 2 && tim[3] != 0) {
--		dtim = tim[3];
--	}
--	a_areq_len = a_aresp_len = 0;
--	a_start_resp = false;
--	LOG("t=%u ms: assoc: %02x:%02x:%02x:**:**:** %u MHz open '%.*s'", g_ms,
--	    a_req.bssid[0], a_req.bssid[1], a_req.bssid[2], a_req.freq,
--	    (int)a_req.ssid_len, a_req.ssid);
--	a_ps_off();
--	if (!a_vdev_start(a_req.freq, bcn, dtim)) {
--		a_fail(-2);
--		return;
--	}
--	a_state = A_START;
--	a_deadline = g_ms + 1500;
--}
+ static void
+ a_teardown(void)
+ {
+ 	if (a_state >= A_START) {
+ 		if (a_state == A_UP) {
+ 			a_vdev_simple(CMD_VDEV_DOWN, TAG_VDEV_DOWN);
+ 		}
+ 		if (a_state >= A_AUTH) {
+ 			a_peer_delete(a_req.bssid);
+ 		}
+ 		a_vdev_simple(CMD_VDEV_STOP, TAG_VDEV_STOP);
+ 	}
+ 	a_state = A_IDLE;
+ 	a_up = false;
++	a_ptk = false;
+ }
+ 
+ static void
+ a_fail(int status)
+ {
+ 	LOG("t=%u ms: assoc: failed (%d) state %u", g_ms, status, a_state);
+ 	a_teardown();
+ }
+ 
+ static void
+ a_arm(void)
+ {
+ 	a_deadline = g_ms + ASSOC_WAIT_MS;
+ }
+ 
+ static void
+ a_start_auth(void)
+ {
+ 	a_state = A_AUTH;
+ 	a_tries = 1;
+ 	a_peer_create(a_req.bssid);
+ 	a_send_auth();
+ 	a_arm();
+ }
+ 
+ static void
+ a_start_assoc(void)
+ {
+ 	a_state = A_ASSOC;
+ 	a_tries = 1;
+ 	a_areq_len = a_build_assoc_req(a_areq, sizeof(a_areq));
+ 	a_send_mgmt(a_areq, a_areq_len);
+ 	a_arm();
+ }
+ 
+ static void
+ a_begin(void)
+ {
+ 	uint32_t bcn = 100, dtim = 1;
+ 	const uint8_t *tim;
+ 
+ 	if (a_req.body_len >= 12) {
+ 		bcn = (uint32_t)a_req.body[8] | ((uint32_t)a_req.body[9] << 8);
+ 	}
+ 	tim = a_find_ie(a_req.body, a_req.body_len, 5);
+ 	if (tim != NULL && tim[1] >= 2 && tim[3] != 0) {
+ 		dtim = tim[3];
+ 	}
+ 	a_areq_len = a_aresp_len = 0;
+ 	a_start_resp = false;
+ 	LOG("t=%u ms: assoc: %02x:%02x:%02x:**:**:** %u MHz open '%.*s'", g_ms,
+ 	    a_req.bssid[0], a_req.bssid[1], a_req.bssid[2], a_req.freq,
+ 	    (int)a_req.ssid_len, a_req.ssid);
+ 	a_ps_off();
+ 	if (!a_vdev_start(a_req.freq, bcn, dtim)) {
+ 		a_fail(-2);
+ 		return;
+ 	}
+ 	a_state = A_START;
+ 	a_deadline = g_ms + 1500;
+ }
 -
 -static void
 -a_on_up(void)
