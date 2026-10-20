@@ -31,7 +31,7 @@ diff --git a/bsd/sys/topaz_wlan.h b/bsd/sys/topaz_wlan.h
 diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
 --- a/iokit/Kernel/arm/TopazModem.cpp
 +++ b/iokit/Kernel/arm/TopazModem.cpp
-@@ -4458,6 +4458,11 @@ scan_event(const uint8_t *t, uint32_t len)
+@@ -4458,7 +4458,12 @@ scan_event(const uint8_t *t, uint32_t len)
  		api_scans_done++;
  	}
  }
@@ -58,7 +58,7 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
  	if (flen < 36 || (f[0] & 0x0C) != 0 || ((f[0] >> 4) != 8 && (f[0] >> 4) != 5)) {
  		return;                                 /* beacons and probe responses only */
  	}
-@@ -4575,6 +4586,616 @@
+@@ -4575,7 +4586,617 @@
  	    b->bssid[2], b->chan, b->rssi, b->ssid);
  }
  
