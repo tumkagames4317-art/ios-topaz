@@ -51,6 +51,16 @@ Tooling in `/home/comaru/ios16-port/ginkgo-work/`:
 - Consequence: the shim must either bring up MDP/DSI itself, or run with a
   kernel cmdline/DTB that creates the framebuffer. Do not assume 0x5c000000.
 
+### tg16 test prepared (2026-10-24)
+
+`ginkgo-work/ginkgo-tg16.img` answers the 16K-granule question three ways so it
+works even with a dark panel: it prints TGran16 on the splash framebuffer, on
+the GENI UART (0x4a90000, ttyMSM0), and encodes the answer in a power-off delay
+(10 s = granule present, 60 s = absent). Rationale for expecting it present:
+Kryo 260 Gold on SM6125 is Cortex-A73, and A73 implements TGran16; the silver
+A55/A53 cluster does not, which matches the topaz design where only gold runs
+xnu.
+
 ### Next concrete action (ginkgo)
 
 1. Phone was **off**, awaiting manual fastboot entry. When it appears, boot
