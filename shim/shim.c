@@ -267,14 +267,13 @@ static void gold_cpufreq_max(void)
 
 static void __attribute__((noreturn)) gold_main(uint64_t dtb)
 {
-	uint64_t mmfr0 = rsr("id_aa64mmfr0_el1");
+	/* We are on gold by construction (see shim_main): gold has the 16K
+	 * granule that xnu needs, the silver cluster does not. */
 
 	con_hex2("GOLD", "midr=", (uint32_t)rsr("midr_el1"), "mpidr=", (uint32_t)rsr("mpidr_el1"));
-	con_hex2("MMFR0", "lo=", (uint32_t)mmfr0, "tg16=", (mmfr0 >> 20) & 0xf);
+	con_str("GOLD", "running on the 16K-capable cluster");
 	con_skip();
-	if (((mmfr0 >> 20) & 0xf) == 0)
-		con_str("GOLD", "no 16K granule here either");
-	else {
+	{
 		/*
 		 * Required: without it xnu hangs after initCPU on gold (no SGI or
 		 * vtimer). It sets GICD EnableGrp1/ARE_NS, wakes gold's redistributor
@@ -509,12 +508,18 @@ void shim_main(uint64_t dtb)
 	stage = "loader";
 	con_clear(RED);
 	con_str("SHIM", "sweet milestone 4: xnu loader");
-	/* topaz: xnu needs the 16K granule (TGran16 != 0); Cortex-A53 may lack it */
-	uint64_t mmfr0 = rsr("id_aa64mmfr0_el1");
-	con_hex2("MMFR0", "lo=", (uint32_t)mmfr0, "tg16=", (mmfr0 >> 20) & 0xf);
-	con_hex2("MIDR", "el1=", (uint32_t)rsr("midr_el1"), "mpidr=", (uint32_t)rsr("mpidr_el1"));
-	if (((mmfr0 >> 20) & 0xf) == 0) {
-		con_str("SILVER", "no 16K granule: handing off to gold CPU 0x100");
+	/*
+	 * ginkgo/topaz: xnu needs the 16K granule. The silver cluster (MPIDR
+	 * Aff0 0x0-0x3, Cortex-A55/A53) lacks it, the gold cluster (0x100,
+	 * A73/A76) has it, so always hand off to gold. Select by MPIDR rather
+	 * than by probing ID_AA64MMFR0_EL1: on ginkgo reading that register
+	 * during early bring-up powered the phone off (the flat-binary payload
+	 * was the real cause, but MPIDR is enough to decide and costs nothing).
+	 */
+	uint64_t mpidr = rsr("mpidr_el1");
+	con_hex2("MIDR", "el1=", (uint32_t)rsr("midr_el1"), "mpidr=", (uint32_t)mpidr);
+	if ((mpidr & 0xff) != 0x00) {
+		con_str("SILVER", "no 16K granule here: handing off to gold CPU 0x100");
 		con_skip();
 		silver_ticks = speed_ticks();
 		gold_dtb = dtb;
@@ -563,7 +568,7 @@ void shim_main(uint64_t dtb)
 	con_hex("SCTLR0", mi.sctlr_before);
 	con_hex("SCTLR1", mi.sctlr_after);
 	con_hex("TCR", rsr("tcr_el1"));
-	con_hex2("PARANGE", "mmfr0=", rsr("id_aa64mmfr0_el1") & 0xf, "tg16=", (rsr("id_aa64mmfr0_el1") >> 20) & 0xf);
+	con_hex2("MPIDR", "lo=", (uint32_t)rsr("mpidr_el1") & 0xffff, "cluster=", 0x100);
 	con_skip();
 	con_hex("PAR img", mmu_probe((uintptr_t)shim_main));
 	con_hex("PAR fb", mmu_probe(FB_PHYS + 0x1000));

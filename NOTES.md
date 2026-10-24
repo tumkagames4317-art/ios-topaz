@@ -1,5 +1,64 @@
 # iOS 16 on topaz (Redmi Note 12 4G, SM6225) — working notes
 
+## Agent handoff / active work (2026-10-24, ginkgo)
+
+**Second target: ginkgo (Redmi Note 8, SM6125 trinket).** The user asked for a
+ginkgo port alongside topaz. Work happens in `/home/comaru/ios16-port/`; the
+shim lives in this checkout under `shim/`.
+
+### ginkgo boot mechanism — SOLVED (observation, measured on device)
+
+- **ABL accepts only header v2 with a GZIP kernel.** v4 images (what
+  `shim/build.sh` produces for topaz) and uncompressed ARM64 Images make ABL
+  reset the phone at once. The stock LineageOS 24.0 `recovery.img` is v2+gzip.
+- The **stock recovery kernel is a real Linux kernel**; it brings up MMU, GIC
+  and timers, then execs `/init`, which in the Android ramdisk is a *symlink*
+  to `/system/bin/init` (2.4 MB PIE ELF).
+- **Replacing both `init` and `system/bin/init` in that ramdisk with our own
+  statically linked ELF runs our code in EL1 with full privilege.** Verified:
+  an init that calls PSCI `SYSTEM_RESET` (0x84000009) powers the phone off ~5 s
+  after `fastboot boot`, so execution is certain.
+- A payload **must be a real ELF**. `objcopy -O binary` output is refused by
+  the kernel and the phone resets; that one mistake produced a day of false
+  "trapped register" conclusions. `ID_AA64MMFR0_EL1` reads **fine** on ginkgo.
+  The earlier claim that it, `ICC_SRE_EL1` and `TCR_EL1` are hypervisor-trapped
+  in EL1 is **RETRACTED**.
+- `fastboot boot` frequently reports `FAILED (usb_read failed)` even when the
+  payload runs: ABL drops USB during handover. A disappearance from USB means
+  the phone powered off, not that our code faulted.
+
+Tooling in `/home/comaru/ios16-port/ginkgo-work/`:
+
+- `mkinit.sh PAYLOAD.elf OUT.img` — v2+gzip ginkgo boot image with the payload
+  installed as `/init` and `/system/bin/init`. Use this, not `shim/build.sh`.
+- `waitfb.sh [tries]` — poll for ginkgo in fastboot (the user powers the phone
+  on by hand; it is usually off between experiments).
+- Ready-made: `ginkgo-condiag.img` (text console on the splash framebuffer),
+  `ginkgo-fulldiag.img` (CurrentEL / MMFR0 / TGran16 / MIDR / MPIDR / CNTFRQ /
+  SCTLR / TCR + verdict), `ginkgo-hello.img`, `ginkgo-step30/120.img`.
+
+### Framebuffer / display on ginkgo (observation, 2026-10-24)
+
+- Our boot images passed `console=null` only, so the stock recovery kernel
+  **never initialised a display**; there is no simplefb the shim can paint.
+  `mkinit.sh` now passes the full stock cmdline (including
+  `video=vfb:640x400,bpp=32,memsize=3072000`), taken from the LineageOS
+  `recovery.img`, with `init_fatal_reboot_target` switched to `bootloader`.
+- Writes to `0x5c000000` are unsafe until the display exists: the DTBO we ship
+  contains no `cont_splash`/`framebuffer` node (it is an overlay with no
+  reserved-memory data), so that region is not guaranteed mapped or reserved.
+  A payload that merely *read* it there powered the phone off in ~5 s.
+- Consequence: the shim must either bring up MDP/DSI itself, or run with a
+  kernel cmdline/DTB that creates the framebuffer. Do not assume 0x5c000000.
+
+### Next concrete action (ginkgo)
+
+1. Phone was **off**, awaiting manual fastboot entry. When it appears, boot
+   `ginkgo-fulldiag.img` and read TGran16 off the panel: nonzero means the 16K
+   granule exists and xnu can run on this SoC.
+2. Then move the real shim (`shim/shim.c`) onto this ELF-init path and continue
+   bring-up from there.
+
 ## Agent handoff / active work (2026-10-20, topaz)
 
 **This checkout is ios-topaz**, not the sweet phone. Public overview: [`README.md`](README.md). Sweet's long engineering log starts under "sweet history" below — treat it as upstream context, not the current device state.
