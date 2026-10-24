@@ -178,22 +178,29 @@ void exc_handler(uint64_t slot, uint64_t *regs)
 	 * either Power (reboot straight to recovery) or Volume-Down (fastboot)
 	 * end the hang without a battery pull.
 	 */
-	con_str("HALT", "Vol-Down=fastboot Power=reboot");
-	for (;;) {
-		uint64_t action = pmic_wait_key();
-		if (action == PMIC_KEY_VOL_DOWN) {
-			con_str("EXIT", "rebooting to fastboot");
-			ufslog_str("EXIT", "rebooting to fastboot");
-			ufslog_flush();
-			reboot_to_fastboot();
-		}
-		if (action == PMIC_KEY_POWER) {
-			con_str("EXIT", "rebooting");
-			ufslog_str("EXIT", "rebooting");
-			ufslog_flush();
-			reset(0);
-		}
+	/*
+	 * Wait for a key, but never forever: the PMIC keys are not readable this
+	 * early (the SPMI arbiter needs clocks the RPM has not set up), so a
+	 * hung shim would otherwise need a battery pull. After the grace period,
+	 * reset straight into fastboot via IMEM. That makes the whole loop
+	 * unattended: flash -> boot -> park -> auto-return -> read the UFS log.
+	 */
+	con_str("HALT", "auto-fastboot in 60 s");
+	ufslog_str("HALT", "auto-fastboot in 60 s");
+	/*
+	 * pmic_wait_key() already caps itself at ~60 s, so call it ONCE. Calling
+	 * it in a loop multiplied the timeout (600 * 132 s = 22 hours).
+	 */
+	uint64_t action = pmic_wait_key();
+	if (action == PMIC_KEY_POWER) {
+		ufslog_str("EXIT", "power key: plain reset");
+		ufslog_flush();
+		reset(0);
 	}
+	con_str("EXIT", "rebooting to fastboot");
+	ufslog_str("EXIT", "rebooting to fastboot");
+	ufslog_flush();
+	reboot_now(0x77665501u);
 }
 
 /* ---- SMP ---- */
@@ -584,15 +591,11 @@ void shim_main(uint64_t dtb)
 	con_str("LOADER", why);
 	con_skip();
 	/* No payload: keep the probe results on screen, then park for keys. */
-	con_str("UFS", "probe done, waiting for a key");
+	con_str("UFS", "probe done, auto-fastboot in 60 s");
 	ufslog_flush();
-	for (;;) {
-		uint64_t k = pmic_wait_key();
-		if (k == PMIC_KEY_VOL_DOWN)
-			reboot_to_fastboot();
-		if (k == PMIC_KEY_POWER)
-			reset(0);
-	}
+	delay_ms(60000);
+	ufslog_flush();
+	reboot_now(0x77665501u);
 
 	stage = "fill off";
 	uint64_t fill_off = ticks_fill(RED);

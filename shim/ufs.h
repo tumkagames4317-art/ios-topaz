@@ -11,3 +11,4 @@ void test_ufs(void);
 int ufs_ready(void);
 uint32_t write_blocks(uint32_t lba, uint32_t count, const void *buf);
 uint32_t ufs_write_blocks(uint32_t lba, uint32_t count, const void *buf);
+uint32_t read_blocks_pub(uint32_t lba, uint32_t count, void *buf);

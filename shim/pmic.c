@@ -99,6 +99,33 @@ uint64_t pmic_wait_key(void)
 	return PMIC_KEY_NONE;
 }
 
+/*
+ * Leave the park without any user input.
+ *
+ * Reading the PMIC keys turned out not to work this early: the recipe in
+ * NOTES.md (SPMI arbiter @ 0x1c40000, PON +0x810) is proven inside xnu, where
+ * clocks and the RPM are up. Before that, with the MMU off, the arbiter does
+ * not answer, so a key press never reaches us.
+ *
+ * What does work is the other direction: tell ABL where to go, then reset. ABL
+ * reads the IMEM restart reason on start, so this lands in fastboot by itself.
+ * That removes the user from the loop entirely -- flash, boot, read the UFS
+ * log, repeat.
+ */
+void reboot_now(uint64_t imem_reason)
+{
+	REG32(0x0c12565cUL) = (uint32_t)imem_reason;
+	__asm__ volatile("dsb sy" ::: "memory");
+
+	register uint64_t x0 __asm__("x0") = 0x84000009u;	/* PSCI SYSTEM_RESET */
+	__asm__ volatile("hvc #0" :: "r"(x0) : "memory");
+
+	/* Fallback if PSCI is not there: arbiter reset (best effort). */
+	REG32(SPMI_RESET) = 1;
+	for (;;)
+		__asm__ volatile("wfi");
+}
+
 void reboot_to_fastboot(void)
 {
 	/*

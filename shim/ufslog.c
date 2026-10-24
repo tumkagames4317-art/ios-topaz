@@ -31,6 +31,7 @@
 #define LOG_TEXT_BYTES	(LOG_LBA_SPAN * 4096u)
 
 static int log_ready;
+static int ufslog_ready_flag;
 static uint32_t log_lba;		/* next block to write */
 static uint32_t log_used;		/* bytes used in the current block */
 static char log_buf[4096] __attribute__((aligned(4096)));
@@ -49,6 +50,31 @@ void ufslog_init(void)
 	log_lba = LOG_FIRST_LBA + 1;	/* block 0 of the region holds the header */
 	log_used = 0;
 	log_ready = 1;
+
+	/*
+	 * Prove the write path before relying on it: write a block, read it back
+	 * and compare. Without this a silently failing WRITE(10) would look
+	 * exactly like a shim that printed nothing, and we would chase the wrong
+	 * bug for hours.
+	 */
+	static char probe[4096] __attribute__((aligned(4096)));
+	for (unsigned i = 0; i < sizeof(probe); i++)
+		probe[i] = 0;
+	const char *tag = "SWEETLOG-PROBE";
+	for (int i = 0; tag[i]; i++)
+		probe[i] = tag[i];
+	uint32_t wr = write_blocks(LOG_FIRST_LBA, 1, probe);
+	for (unsigned i = 0; i < sizeof(probe); i++)
+		probe[i] = 0;
+	uint32_t rd = read_blocks_pub(LOG_FIRST_LBA, 1, probe);
+	int same = 1;
+	for (int i = 0; tag[i]; i++)
+		if (probe[i] != tag[i])
+			same = 0;
+	con_hex2("UFSp", "wr=", wr, "rd=", rd);
+	con_str("UFSp", same ? "write verified" : "write NOT verified");
+	ufslog_ready_flag = same ? 1 : 0;
+
 	ufslog_write("---- shim log start ----\n");
 }
 

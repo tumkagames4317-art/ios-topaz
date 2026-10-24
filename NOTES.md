@@ -65,6 +65,44 @@ make the loop unattended:
   IMEM: `qcom,msm-imem@c125000`, `imem-restart_reason@65c` -> **0x0c12565c**.
 - `ginkgo-work/loop.sh` flashes -> boots -> waits, with no user input.
 
+
+### >>> RESOLVED 2026-10-24 late: why every reading looked identical <<<
+
+**The panic was never from a new image.** Two independent numbers from the
+screen both identify the *same old build*, and only the old builds match:
+
+| image | `str x13,[x9]` offset | payload `mem_size` |
+|---|---|---|
+| old (`ginkgo-xnu-full`, `-ufsroot`, `-XNU-BOOTING`) | **0x3400** | **0x4d000000** |
+| current | 0x3940 | 0xc0000000 |
+
+Observed panic: `ELR = 0x40083400` (=> offset **0x3400**) and
+`X30 = 0x4d000000`. Both point at the **old topaz payload**.
+
+Root cause of the stale readings: `fastboot flash` was **not completing**. It
+printed `< waiting for 11a28f68 >` and the phone kept booting the previous
+image, so every new build was invisible. Only the 22:20 flash reported
+`Finished`.
+
+Arithmetic check that closes the case -- with `phys_base = 0xb0000000`:
+
+```
+pa_of_va_base = 0xb0000000 - 0xfffffe0006000000 = 0x200aa000000
+adt_pa        = 0xfffffe0008560000 + 0x200aa000000 = 0xb2560000
+```
+
+and the observed `FAR = 0xb2568264` sits inside that ADT (`0xb2560000` +
+property offset). The address is **outside ginkgo DRAM**, hence the
+synchronous external abort. With `phys_base = 0x80000000` the same formula
+gives `adt_pa = 0x82568000`, which is inside the real
+`0x80000000-0x13fffffff` range.
+
+**Therefore: nothing is wrong with the fixed build -- it has simply never
+run.** Use `ginkgo-work/flash-safe.sh`, which waits for fastboot, flashes and
+refuses to continue unless fastboot reports `Finished`, and
+`ginkgo-work/verify-flash.sh` to read `boot` back through recovery and confirm
+which build is really on the phone.
+
 ### Next concrete step
 `ginkgo-work/ginkgo-auto.img` is flashed and boots to the park. Read the UFS log
 with `ginkgo-work/read-log.sh`; the `SEGS end=` line gives the real `adt_pa`.

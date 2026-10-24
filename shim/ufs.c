@@ -139,7 +139,7 @@ static uint32_t scsi_dir(uint8_t lun, const uint8_t *cdb, unsigned cdb_len, void
 	return *status_out ? 4 : 0;
 }
 
-static uint32_t read_blocks(uint32_t lba, uint32_t count, void *buf)
+uint32_t read_blocks(uint32_t lba, uint32_t count, void *buf)
 {
 	uint8_t cdb[10] = { 0x28, 0, lba >> 24, lba >> 16, lba >> 8, lba, 0, count >> 8, count, 0 };
 	uint32_t ocs, st;
@@ -297,4 +297,10 @@ uint32_t ufs_write_blocks(uint32_t lba, uint32_t count, const void *buf)
 	if (!ufs_host_ok)
 		return 9;
 	return write_blocks(lba, count, buf);
+}
+
+/* Public alias so ufslog.c can verify its own writes. */
+uint32_t read_blocks_pub(uint32_t lba, uint32_t count, void *buf)
+{
+	return read_blocks(lba, count, buf);
 }

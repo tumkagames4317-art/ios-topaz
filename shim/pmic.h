@@ -12,3 +12,5 @@
 int pmic_init(void);
 uint64_t pmic_wait_key(void);
 void reboot_to_fastboot(void);
+/* Reset after telling ABL where to go. reason 0x77665501 = fastboot. */
+void reboot_now(uint64_t imem_reason);
