@@ -43,13 +43,19 @@ static char log_buf[4096] __attribute__((aligned(4096)));
  */
 void ufslog_init(void)
 {
-	if (!ufs_ready()) {
-		log_ready = 0;
-		return;
-	}
+	/*
+	 * Do NOT gate on ufs_ready() here. The first version did, and the log
+	 * came back as pure zeros, which told us nothing: a silent "host not
+	 * ready" looked exactly like "the shim never ran". The probe result is
+	 * recorded, and we then attempt the write regardless, so a failure is
+	 * visible as its own line rather than as an empty region.
+	 */
+	int host = ufs_ready();
 	log_lba = LOG_FIRST_LBA + 1;	/* block 0 of the region holds the header */
 	log_used = 0;
 	log_ready = 1;
+	ufslog_ready_flag = 0;
+	(void)host;
 
 	/*
 	 * Prove the write path before relying on it: write a block, read it back
@@ -71,11 +77,24 @@ void ufslog_init(void)
 	for (int i = 0; tag[i]; i++)
 		if (probe[i] != tag[i])
 			same = 0;
+	char hb[17];
+	const char *hd = "0123456789abcdef";
+	for (int i = 0; i < 16; i++)
+		hb[i] = hd[(host >> (4 * (15 - i))) & 0xf];
+	hb[16] = 0;
+	ufslog_write("---- shim log start ----\n");
+	ufslog_write("host_ok=");
+	ufslog_write(hb);
+	ufslog_write("\n");
+
 	con_hex2("UFSp", "wr=", wr, "rd=", rd);
 	con_str("UFSp", same ? "write verified" : "write NOT verified");
 	ufslog_ready_flag = same ? 1 : 0;
-
-	ufslog_write("---- shim log start ----\n");
+	ufslog_write("probe wr=");
+	{ char b[9]; for (int i = 0; i < 8; i++) b[i] = hd[(wr >> (4*(7-i))) & 0xf]; b[8]=0;
+	  ufslog_write(b); }
+	ufslog_write("\n");
+	ufslog_flush();
 }
 
 int ufslog_active(void)

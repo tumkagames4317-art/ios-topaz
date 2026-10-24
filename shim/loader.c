@@ -54,6 +54,36 @@ _Static_assert(__builtin_offsetof(struct boot_args, CommandLine) == 108, "boot_a
 _Static_assert(sizeof(struct boot_args) == 736, "boot_args layout");
 
 /* MMU off: everything is Device memory, so copy in aligned 8-byte words. */
+/*
+ * Clean the data cache for a range, so the bytes really reach DRAM.
+ *
+ * This is the bug that made xnu hang with no output. The shim runs with the
+ * MMU off but the D-cache ON (ABL leaves it enabled), so every store below
+ * landed in cache and never in memory. xnu starts with the MMU off and reads
+ * the kernel image straight from DRAM, so it executed whatever stale bytes
+ * happened to be there. Cleaning the I-cache at the end does not help: only a
+ * data-cache clean writes the stores out.
+ *
+ * CTR_EL0.DminLine tells us the line size; use the smallest, it is always safe.
+ */
+static void dcache_clean(uintptr_t start, uint64_t len)
+{
+	uint64_t ctr, dmin, line, tmp;
+	__asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
+	dmin = (ctr >> 16) & 0xf;		/* log2 words */
+	line = 4u << dmin;
+	__asm__ volatile("mrs %0, dczid_el0" : "=r"(tmp));
+	if (!(tmp & 0x10)) {			/* DC ZVA available */
+		uint64_t zline = 4u << (tmp & 0xf);
+		if (zline > line)
+			line = zline;
+	}
+	start &= ~(line - 1);
+	for (uintptr_t a = start; a < start + len; a += line)
+		__asm__ volatile("dc civac, %0" :: "r"(a) : "memory");
+	__asm__ volatile("dsb sy" ::: "memory");
+}
+
 static void copy64(uintptr_t dst, uintptr_t src, uint64_t n)
 {
 	volatile uint64_t *d = (volatile uint64_t *)dst;
@@ -285,11 +315,25 @@ const char *loader_boot(uintptr_t dtb)
 		copy64(dst, rd_start + s->file_off, s->file_size);
 		if (s->vmsize > s->file_size)
 			zero64(dst + ((s->file_size + 7) & ~7UL), s->vmsize - ((s->file_size + 7) & ~7UL));
+		/* Push this segment out to DRAM: xnu reads it with the MMU off. */
+		dcache_clean(dst, s->vmsize);
 	}
 	con_hex2("SEGS", "n=", p->nsegs, "end=", p->kernel_end + pa_of_va_base);
 
 	/* ADT, then boot_args, behind the kernel; everything below topOfKernelData is ours. */
 	uintptr_t adt_pa = p->kernel_end + pa_of_va_base;
+	/*
+	 * Sanity-check the ADT address BEFORE touching it. An external abort here
+	 * is what cost the whole night: with phys_base 0xb0000000 (topaz) the ADT
+	 * landed at 0xb2560000, which is not DRAM on ginkgo, and the first store
+	 * raised a synchronous external abort with no useful message. Now we say
+	 * so instead of dying.
+	 */
+	con_hex2("ADT", "pa=", adt_pa, "sz=", p->adt_size);
+	if (adt_pa < phys_base || adt_pa + p->adt_size > phys_base + mem_size) {
+		con_hex2("ADTBAD", "lo=", (uint32_t)phys_base, "hi=", (uint32_t)(phys_base + mem_size));
+		return "adt outside dram";
+	}
 	copy64(adt_pa, rd_start + p->adt_off, p->adt_size);
 	if (!adt_patch_chosen_u64(adt_pa, (uint32_t)p->adt_size, "dram-base", phys_base) ||
 	    !adt_patch_chosen_u64(adt_pa, (uint32_t)p->adt_size, "dram-size", mem_size))
@@ -325,7 +369,14 @@ const char *loader_boot(uintptr_t dtb)
 	con_hex("JUMP", entry_pa);
 	con_str("XNU", "jumping (fbcon clears screen)");
 
-	/* Everything was written with the MMU and caches off; drop any stale I-cache lines too. */
+	/*
+	 * The ADT and boot_args are the last things xnu reads, and both were just
+	 * written through the D-cache. Clean them, then drop stale I-cache lines,
+	 * before handing over.
+	 */
+	dcache_clean(adt_pa, p->adt_size);
+	dcache_clean(ba_pa, PAGE_16K);
+	dcache_clean(rd_start, 64);
 	__asm__ volatile("dsb sy; ic iallu; dsb sy; isb" ::: "memory");
 	((xnu_entry_t)entry_pa)(ba_pa);
 	return "xnu returned";

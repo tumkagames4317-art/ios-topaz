@@ -31,8 +31,10 @@
 #define PON_RESIN_N	(1u << 1)	/* Volume-Down */
 #define PON_BOTH	(PON_KPDPWR_N | PON_RESIN_N)
 
-/* SPMI PMIC arbiter reset (the "PS_HOLD" style reset used by ABL itself). */
-#define SPMI_RESET	(SPMI_ARB_BASE + 0x1000U)
+/* APCS watchdog: the last-resort reset path on every Qualcomm SoC. */
+#define APCS_WDT0_EN		0x0f017000UL
+#define APCS_WDT0_BARK_TIME	0x0f017008UL
+#define APCS_WDT0_BITE_TIME	0x0f01700cUL
 
 #define REG32(a)	(*(volatile uint32_t *)(a))
 
@@ -118,10 +120,19 @@ void reboot_now(uint64_t imem_reason)
 	__asm__ volatile("dsb sy" ::: "memory");
 
 	register uint64_t x0 __asm__("x0") = 0x84000009u;	/* PSCI SYSTEM_RESET */
-	__asm__ volatile("hvc #0" :: "r"(x0) : "memory");
+	__asm__ volatile("smc #0" :: "r"(x0) : "memory");
 
-	/* Fallback if PSCI is not there: arbiter reset (best effort). */
-	REG32(SPMI_RESET) = 1;
+	/*
+	 * PSCI did not take. Fall back to a watchdog bite, which every Qualcomm
+	 * SoC resets on: APCS_WDT0 lives at 0x0f017000 and a zeroed enable
+	 * register with a short bark/bite makes the PMIC power-cycle the board.
+	 * If even that fails, spin -- a reset is never required for correctness,
+	 * only for convenience, and hanging is safer than guessing more writes.
+	 */
+	REG32(APCS_WDT0_EN) = 0;
+	REG32(APCS_WDT0_BARK_TIME) = 0x1000;
+	REG32(APCS_WDT0_BITE_TIME) = 0x2000;
+	REG32(APCS_WDT0_EN) = 1;
 	for (;;)
 		__asm__ volatile("wfi");
 }
@@ -146,10 +157,13 @@ void reboot_to_fastboot(void)
 
 	/* PSCI SYSTEM_RESET first: the standard path, keeps ABL happy. */
 	register uint64_t x0 __asm__("x0") = 0x84000009u;
-	__asm__ volatile("hvc #0" :: "r"(x0) : "memory");
+	__asm__ volatile("smc #0" :: "r"(x0) : "memory");
 
-	/* Fallback: arbiter reset, which is what ABL itself uses. */
-	REG32(SPMI_RESET) = 1;
+	/* Fallback: watchdog bite, as in reboot_now(). */
+	REG32(APCS_WDT0_EN) = 0;
+	REG32(APCS_WDT0_BARK_TIME) = 0x1000;
+	REG32(APCS_WDT0_BITE_TIME) = 0x2000;
+	REG32(APCS_WDT0_EN) = 1;
 	for (;;)
 		__asm__ volatile("wfi");
 }

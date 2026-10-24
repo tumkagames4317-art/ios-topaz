@@ -581,9 +581,11 @@ void shim_main(uint64_t dtb)
 	 */
 	stage = "ufs";
 	test_ufs();
+	con_hex2("GATE", "host_ok=", ufs_ready(), "ready=", ufs_ready() ? 1 : 0);
 	ufslog_init();
 	con_skip();
 	con_str("LOG", ufslog_active() ? "persistent log active" : "log unavailable");
+	ufslog_str("BOOT", "shim reached the log init");
 	if (!pmic_init())
 		con_str("PMIC", "no keys: park only");
 
