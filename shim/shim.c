@@ -8,6 +8,8 @@
  */
 #include <stdint.h>
 #include "console.h"
+#include "ufslog.h"
+#include "pmic.h"
 #include "mmu.h"
 #include "loader.h"
 #include "ufs.h"
@@ -160,8 +162,38 @@ void exc_handler(uint64_t slot, uint64_t *regs)
 	con_hex("SPSR", rsr("spsr_el1"));
 	con_hex("X0", regs[0]);
 	con_hex("X1", regs[1]);
+	uint64_t esr = rsr("esr_el1"), elr = rsr("elr_el1"), far = rsr("far_el1");
 	con_hex("X30", regs[29]);	/* stashed lr is just above the frame */
-	reset(40);
+	/*
+	 * Persist the whole panic to UFS so nobody has to photograph a screen
+	 * that only stays up for half a second. Everything con_* printed above is
+	 * already in the log; this adds the register block in one atomic flush.
+	 */
+	ufslog_panic(slot, stage, esr, elr, far, rsr("spsr_el1"),
+		     regs[0], regs[1], regs[29]);
+	con_str("LOGGED", ufslog_active() ? "panic written to UFS" : "ufs log unavailable");
+
+	/*
+	 * Park instead of resetting: the screen stays readable, and polling lets
+	 * either Power (reboot straight to recovery) or Volume-Down (fastboot)
+	 * end the hang without a battery pull.
+	 */
+	con_str("HALT", "Vol-Down=fastboot Power=reboot");
+	for (;;) {
+		uint64_t action = pmic_wait_key();
+		if (action == PMIC_KEY_VOL_DOWN) {
+			con_str("EXIT", "rebooting to fastboot");
+			ufslog_str("EXIT", "rebooting to fastboot");
+			ufslog_flush();
+			reboot_to_fastboot();
+		}
+		if (action == PMIC_KEY_POWER) {
+			con_str("EXIT", "rebooting");
+			ufslog_str("EXIT", "rebooting");
+			ufslog_flush();
+			reset(0);
+		}
+	}
 }
 
 /* ---- SMP ---- */
@@ -533,18 +565,34 @@ void shim_main(uint64_t dtb)
 		con_hex("CPU_ON", (uint64_t)r);
 	}
 	con_skip();
+
+	/*
+	 * Bring up UFS and the persistent log BEFORE the loader runs. The log
+	 * lives in userdata, so a later recovery boot can read every diagnostic
+	 * even when the loader panics -- which is what makes this fully
+	 * autonomous: no photographing a half-second panic screen.
+	 */
+	stage = "ufs";
+	test_ufs();
+	ufslog_init();
+	con_skip();
+	con_str("LOG", ufslog_active() ? "persistent log active" : "log unavailable");
+	if (!pmic_init())
+		con_str("PMIC", "no keys: park only");
+
 	const char *why = loader_boot(dtb);
 	con_str("LOADER", why);
 	con_skip();
-
-	/* No payload: probe the internal UFS while the MMU is still off. */
-	stage = "ufs";
-	test_ufs();
-	con_skip();
-	/* Keep the probe results on screen (later tests clear it); reset after 3 min. */
-	con_str("UFS", "probe done, reset in ~3 min");
-	delay_ms(180000);
-	reset(20);
+	/* No payload: keep the probe results on screen, then park for keys. */
+	con_str("UFS", "probe done, waiting for a key");
+	ufslog_flush();
+	for (;;) {
+		uint64_t k = pmic_wait_key();
+		if (k == PMIC_KEY_VOL_DOWN)
+			reboot_to_fastboot();
+		if (k == PMIC_KEY_POWER)
+			reset(0);
+	}
 
 	stage = "fill off";
 	uint64_t fill_off = ticks_fill(RED);

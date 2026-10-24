@@ -190,7 +190,15 @@ extern char _end[];
 const char *loader_boot(uintptr_t dtb)
 {
 	uint64_t rd_start, rd_end;
-	uintptr_t emb = ((uintptr_t)_end + 0xfff) & ~0xfffUL;
+	/*
+	 * _end is a link-time constant (0x2d000) because the shim is linked at 0
+	 * and the kernel may load it anywhere (Image flags 0xa). Use the
+	 * PC-relative runtime address instead, or we read the payload from a
+	 * bogus low address and every header field is garbage -- which is what
+	 * produced the External Abort on adt_patch_chosen_u64 (FAR 0xb2568264).
+	 */
+	extern char *shim_end_va(void);
+	uintptr_t emb = ((uintptr_t)shim_end_va() + 0xfff) & ~0xfffUL;
 
 	/*
 	 * topaz: the ABL only passes the vendor_boot ramdisk for a v4 boot
@@ -238,14 +246,22 @@ const char *loader_boot(uintptr_t dtb)
 	if (p->version != 1 || (p->adt_off & 7) || (rd_start & 7))
 		return "bad payload header";
 
+	/*
+	 * ginkgo: the Android boot DTB advertises banks above 4 GiB
+	 * (0x14a000000+0xaa000000) that do not exist on SM6125 -- /proc/iomem on
+	 * the stock kernel ends at 0x13fffffff. Trusting the FDT there makes the
+	 * shim place the kernel and ADT outside real DRAM, which is exactly the
+	 * Data Abort at adt_patch_chosen_u64 (FAR 0xb2568264, stage loader).
+	 * The payload's values come from mkadt.py, which we feed the verified
+	 * /proc/iomem range, so prefer them and only log what the FDT claimed.
+	 */
 	uint64_t phys_base = p->phys_base;
 	uint64_t mem_size = p->mem_size;
 	uint64_t fdt_base = 0, fdt_size = 0;
 	if (fdt_memory_high(dtb, &fdt_base, &fdt_size)) {
-		phys_base = fdt_base;
-		mem_size = fdt_size;
 		con_hex("MEMFDT", fdt_base);
 		con_hex("MEMSZ", fdt_size);
+		con_str("MEMUSE", "payload (fdt ignored)");
 	} else {
 		con_str("MEMFDT", "using payload");
 	}

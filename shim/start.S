@@ -126,3 +126,14 @@ exc_common:
 	add	sp, sp, #(30 * 8)
 	ldp	x29, x30, [sp], #16
 	eret
+
+/*
+ * Runtime address of the byte just past our image. adr is PC-relative, so it
+ * yields the real loaded address even though the image is linked at 0 and the
+ * Image header says "place anywhere" (flags 0xa). loader.c must use this and
+ * not _end, whose linked value (0x2d000) is an offset, not an address.
+ */
+	.globl	shim_end_va
+shim_end_va:
+	adr	x0, _end
+	ret

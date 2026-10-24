@@ -4,6 +4,9 @@
  */
 #include "console.h"
 #include "font.h"
+#include "ufslog.h"
+
+
 
 #define SCALE		3
 #define CH_W		(8 * SCALE)
@@ -71,6 +74,11 @@ void con_str(const char *label, const char *s)
 	put_str(0, label, YELLOW);
 	put_str(LABEL_COLS, s, WHITE);
 	row++;
+	/*
+	 * Mirror to UFS. The panic screen on ginkgo lasts half a second, so the
+	 * on-screen text is unreadable; the log survives until recovery reads it.
+	 */
+	ufslog_str(label, s);
 }
 
 void con_hex(const char *label, uint64_t v)
@@ -93,5 +101,6 @@ void con_hex2(const char *label, const char *a, uint32_t va, const char *b, uint
 		fmt_hex(buf, vb, 8);
 		put_str(col, buf, WHITE);
 	}
+	ufslog_hex2(label, a, va, b, vb);
 	row++;
 }

@@ -1,3 +1,76 @@
+## >>> HANDOFF 2026-10-24 night (ginkgo) <<<
+
+**SHIM RUNS ON GINKGO (EL1) AND FINDS XNU.** First real boot of our code on this
+phone after a night of chasing a broken image format. Observed on screen:
+`SHIM sweet milestone 4: xnu loader` then `EMBED`/`PAYLOAD`/`SEGS` -- i.e. the
+shim copied all 10 XNU segments and only the ADT patch step failed.
+
+### The bug that blocked everything: dtb_size offset
+`bootimg.h` v2 header: `recovery_dtbo_size` is at **1632**, `dtb_size` at
+**1648** (u32) and `dtb_addr` at **1652** (u64). Every earlier image was built
+reading 1632, so `dtb_size` came out 0 and the images carried **no DTB at all**.
+Stock ginkgo boot.img has `dtb_size = 285805`, `dtb_addr = 0x1f00000`.
+Check with `qemu-aarch64 magiskboot unpack` -- it must print `DTB_SZ [285805]`.
+
+### Working image recipe
+1. Take the **stock** `boot.img` as the container (all header fields stay right).
+2. Replace only the kernel payload with `gzip(shim Image)`, padded to 4K, with
+   the SWEETXNU payload appended right after `_end`.
+3. Pad to exactly 67108864 (the partition size). `ginkgo-work/mkfull.sh` does it.
+4. `fastboot flash boot` + `fastboot reboot`. **Do not use mkbootimg.py.**
+
+### EL1 vs EL0 (why the shim must be the kernel)
+The shim needs EL1: it programs TTBR0/SCTLR and touches GIC/UFS MMIO. As
+`/init` the kernel starts us in **EL0**, where those are illegal -- a
+framebuffer write there is what produced an earlier bootloop. So the shim goes
+in as the **kernel**, never as the ramdisk init.
+
+### Memory map: trust /proc/iomem, not the DTB
+Stock Android DTB advertises banks above 4 GiB (`0x14a000000+0xaa000000`) that
+SM6125 does not have. `fdt_memory_high()` picked one, so the shim placed the
+kernel and ADT outside real DRAM and died with an **External Abort**
+(ESR 0x96000061, DFSC 0x21 = synchronous external abort, WnR=1) inside
+`adt_patch_chosen_u64`. Real ginkgo System RAM from `/proc/iomem`:
+`0x40000000-0x456fffff`, `0x61600000-0x7dcfffff`, **`0x80000000-0x13fffffff`**.
+So ADT gets `dram-base 0x80000000`, `dram-size 0xc0000000`
+(`MIDBASE=0x80000000 MIDSIZE=0xc0000000 python3 tools/mkadt.py out.adt --midmem`).
+
+### _end is a link-time constant, not a runtime address
+The shim links at 0 and the Image header says "place anywhere", so `_end`
+(`0x31000`) is an **offset**. `loader_boot` used it directly and therefore read
+the payload from a bogus low address. Fixed with a PC-relative helper in
+`start.S`:
+
+```
+	.globl shim_end_va
+shim_end_va:
+	adr	x0, _end
+	ret
+```
+
+**Rebuild with `rm -f out/*.o` first**: build.sh once reused stale objects and
+the fix silently did not make it into `out/Image` (verify with
+`objdump -d out/shim.elf | grep shim_end_va`).
+
+### Autonomous debugging (new, 2026-10-24)
+The panic screen lasts half a second, so photos are impossible. Two additions
+make the loop unattended:
+- `shim/ufslog.c` -- every `con_*` line and the full panic register block is
+  mirrored to **UFS**, in the **last 1025 blocks of userdata** (same spot as
+  patch 0047). Read it with `ginkgo-work/read-log.sh` after a recovery boot.
+- `shim/pmic.c` -- on panic the shim **parks** and polls the keys. Volume-Down
+  writes the IMEM restart reason `0x77665501` (fastboot) and resets; Power does
+  a plain reset. Registers from patch 0060: **SPMI arbiter v5 @ 0x1c40000,
+  observer window +0x800, PON status +0x810** -- not 0x0c000000.
+  IMEM: `qcom,msm-imem@c125000`, `imem-restart_reason@65c` -> **0x0c12565c**.
+- `ginkgo-work/loop.sh` flashes -> boots -> waits, with no user input.
+
+### Next concrete step
+`ginkgo-work/ginkgo-auto.img` is flashed and boots to the park. Read the UFS log
+with `ginkgo-work/read-log.sh`; the `SEGS end=` line gives the real `adt_pa`.
+If it is `0x82568000` the ADT patch should succeed and the next stop is XNU
+itself; if it is `0xb2560000` the shim is still reading a stale payload.
+
 # iOS 16 on topaz (Redmi Note 12 4G, SM6225) — working notes
 
 ## Agent handoff / active work (2026-10-24, ginkgo)
