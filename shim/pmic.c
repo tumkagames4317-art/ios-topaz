@@ -31,10 +31,20 @@
 #define PON_RESIN_N	(1u << 1)	/* Volume-Down */
 #define PON_BOTH	(PON_KPDPWR_N | PON_RESIN_N)
 
-/* APCS watchdog: the last-resort reset path on every Qualcomm SoC. */
-#define APCS_WDT0_EN		0x0f017000UL
-#define APCS_WDT0_BARK_TIME	0x0f017008UL
-#define APCS_WDT0_BITE_TIME	0x0f01700cUL
+/*
+ * APCS watchdog ("qcom,kpss-wdt", DTB base qcom,wdt@f017000): the last-resort
+ * reset path on every Qualcomm SoC. The register offsets are the kpss layout
+ * from the upstream qcom-wdt driver, not a linear block starting at 0: EN is at
+ * 0x08 and the timeouts at 0x10/0x14, with RST and STS between them. Writing
+ * "0" to the base is therefore a *ping*, not a disable -- which is why earlier
+ * attempts to arm the watchdog here silently did nothing.
+ */
+#define APCS_WDT0_BASE		0x0f017000UL
+#define APCS_WDT0_RST		(APCS_WDT0_BASE + 0x04)
+#define APCS_WDT0_EN		(APCS_WDT0_BASE + 0x08)
+#define APCS_WDT0_STS		(APCS_WDT0_BASE + 0x0c)
+#define APCS_WDT0_BARK_TIME	(APCS_WDT0_BASE + 0x10)
+#define APCS_WDT0_BITE_TIME	(APCS_WDT0_BASE + 0x14)
 
 #define REG32(a)	(*(volatile uint32_t *)(a))
 
@@ -48,10 +58,11 @@ static int pmic_ok;
 void watchdog_arm(uint32_t bark_ticks, uint32_t bite_ticks)
 {
 	REG32(APCS_WDT0_EN) = 0;
+	REG32(APCS_WDT0_RST) = 1;		/* restart the counter */
 	REG32(APCS_WDT0_BARK_TIME) = bark_ticks;
 	REG32(APCS_WDT0_BITE_TIME) = bite_ticks;
 	__asm__ volatile("dsb sy" ::: "memory");
-	REG32(APCS_WDT0_EN) = 1;
+	REG32(APCS_WDT0_EN) = 1;		/* QCOM_WDT_ENABLE = BIT(0) */
 	__asm__ volatile("dsb sy" ::: "memory");
 }
 

@@ -455,7 +455,7 @@ const char *loader_boot(uintptr_t dtb)
 	 * without anyone pressing keys. xnu reprograms the watchdog itself once its
 	 * platform drivers are up, so a working boot is unaffected.
 	 */
-	watchdog_arm(0x1000, 0x180000);
+	watchdog_arm(0x1000, 0x40000);
 	((xnu_entry_t)entry_pa)(ba_pa);
 
 	/*
