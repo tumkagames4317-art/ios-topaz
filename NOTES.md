@@ -1,3 +1,24 @@
+## >>> HANDOFF 2026-10-25 14:43 (ginkgo): the watcher no longer gives up <<<
+
+Every attempt to flash in the last half hour died of the same self-inflicted
+cause, not of anything to do with the phone:
+`autoloop.ps1` called `Wait-Fastboot 600 'before flash'` and then **broke out of
+the cycle loop** on timeout. With the phone unplugged for 25+ minutes the
+watcher therefore exited after ten minutes every time, and each successive
+launch looked like "the phone never showed up".
+
+It now takes `-BeforeFlashTimeoutSec`, defaulting to **0 = wait for ever**, and
+logs a line every two minutes so a long wait is visible instead of looking like
+a hang. The post-reboot timeout keeps its own value: once the phone HAS been
+flashed, giving up is correct, because a boot that never returns is a real
+result worth recording.
+
+Armed: `pwsh-fa83b78a29f244e4` on `build/probeB/ginkgo-probeB.img`
+(md5 `1e16ab2cc9ceb2cec4cc51da76ee2513`), the image that carries the corrected
+PON restart-reason bit position.
+
+---
+
 ## >>> HANDOFF 2026-10-25 14:42 (ginkgo): THE PON RESTART REASON IS IN THE WRONG BITS <<<
 
 This is the first defect found that explains why *every* previous image failed
