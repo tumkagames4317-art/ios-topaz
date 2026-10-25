@@ -1,3 +1,79 @@
+## >>> HANDOFF 2026-10-25 14:42 (ginkgo): THE PON RESTART REASON IS IN THE WRONG BITS <<<
+
+This is the first defect found that explains why *every* previous image failed
+to land in fastboot, and it was found by reading this phone's real kernel
+source instead of by guessing at registers.
+
+### What the actual driver does
+
+`android_kernel_xiaomi_sm6250` (the LineageOS kernel for this exact device),
+`drivers/input/misc/qpnp-power-on.c`:
+
+```c
+int qpnp_pon_set_restart_reason(enum pon_restart_reason reason)
+{
+        ...
+        if (!pon->store_hard_reset_reason)
+                return 0;                             /* <-- gate */
+        ...
+        if (is_pon_gen2(pon) && !pon->legacy_hard_reset_offset)
+                qpnp_pon_masked_write(pon, QPNP_PON_SOFT_RB_SPARE(pon),
+                                      GENMASK(7, 1), (reason << 1));
+        else
+                qpnp_pon_masked_write(pon, QPNP_PON_SOFT_RB_SPARE(pon),
+                                      GENMASK(7, 2), (reason << 2));
+```
+
+**There are two different bit layouts**, and DT decides which one is live --
+not the PMIC generation by itself.
+
+### What this device selects
+
+The boot DTB was extracted from `images/01-current-прошит-сейчас.img` (it sits
+at file offset `0x753000`, `dtb_size` 285805) and inspected:
+
+| DT property | present? |
+|---|---|
+| `qcom,store-hard-reset-reason` | **yes** (string offset +4418) |
+| `qcom,system-reset` | **yes** (string offset +4400) |
+| `qcom,use-legacy-hard-reset-offset` | **NO** -- not in the strings block at all |
+
+So on ginkgo the **gen2 / non-legacy** branch is the live one:
+**mask `GENMASK(7,1)`, shift 1.**
+
+### The bug this file had
+
+`automity.c` wrote the legacy layout -- mask `GENMASK(7,2)`, `reason << 2` --
+and asserted in its own comment that "PM6125 is a gen2 PON, so the reason sits
+in bits [7:2]". That is the opposite of what DT says. Concretely, for
+BOOTLOADER = 0x02:
+
+| layout | byte written |
+|---|---|
+| legacy `reason << 2` (old code) | `0x08` |
+| gen2 `reason << 1` (correct) | `0x04` |
+
+Every reset this project has ever triggered wrote `0x08`, which ABL reads as a
+*different* reason -- so ABL did exactly what it was told and booted normally.
+The `qpnp_pon_set_restart_reason` gate (`store_hard_reset_reason`) is satisfied
+here, so the write path was live; only the bit position was wrong.
+
+### What was changed
+
+`pon_set_restart_reason()` now writes the gen2 layout as primary, checks the
+read-back honestly (a refused SPMI store leaves the byte unchanged, which the
+old code reported as success whenever the desired value happened to equal it),
+and falls back to the legacy layout, reporting which one landed.
+
+Images: `build/probeB/ginkgo-probeB.img` (md5 `1e16ab2cc9ceb2cec4cc51da76ee2513`)
+and `build/emmc12/ginkgo-emmc12.img` (md5 `d83b862300daa9d013445af7df42f77b`).
+
+**Still unproven on hardware** -- the phone has been off USB since 14:16. This
+is the single most promising lead in the project so far, but it remains a
+reading of source and DT, not an observation of the device.
+
+---
+
 ## >>> HANDOFF 2026-10-25 14:38 (ginkgo): two images armed, probe first <<<
 
 The phone has been off USB since ~14:16, so nothing below has run yet. Two

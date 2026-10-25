@@ -131,29 +131,86 @@ static uint64_t psci_reset(uint64_t fn)
 }
 
 /*
- * Write the PON restart reason the way qpnp_pon_set_restart_reason() does for
- * a gen2 PON: read the byte, clear bits [7:2], OR in reason << 2, write back.
+ * Write the PON restart reason the way qpnp_pon_set_restart_reason() does.
+ *
+ * The register and the bit layout were checked against the actual driver that
+ * ships in this phone's kernel
+ * (LineageOS android_kernel_xiaomi_sm6250, drivers/input/misc/qpnp-power-on.c):
+ *
+ *     #define QPNP_PON_SOFT_RB_SPARE(pon)  ((pon)->base + 0x8F)
+ *
+ *     if (is_pon_gen2(pon) && !pon->legacy_hard_reset_offset)
+ *             qpnp_pon_masked_write(pon, QPNP_PON_SOFT_RB_SPARE(pon),
+ *                                   GENMASK(7, 1), (reason << 1));
+ *     else
+ *             qpnp_pon_masked_write(pon, QPNP_PON_SOFT_RB_SPARE(pon),
+ *                                   GENMASK(7, 2), (reason << 2));
+ *
+ * There are two layouts, and which one applies is decided by DT, not by the
+ * PMIC generation alone. On this device the boot DTB contains
+ * `qcom,store-hard-reset-reason` and does NOT contain
+ * `qcom,use-legacy-hard-reset-offset`, so the **gen2 / non-legacy** branch is
+ * the live one: bits [7:1] carry reason << 1.
+ *
+ * An earlier version of this file hardcoded the legacy layout (mask [7:2],
+ * shift 2), which puts BOOTLOADER (0x02) in the wrong bits entirely -- the PMIC
+ * would have stored a different reason and ABL would have ignored it. Both
+ * layouts are written here where they cannot be confused, and the non-legacy
+ * one is used because that is what this device's DT selects.
  *
  * BEST EFFORT. The SPMI arbiter only answers once the RPM is up -- the project
  * proved keys readable inside xnu and not from the shim (pmic.c, and
  * NOTES-repo patch 0060) -- so with the MMU off this read-back most often
  * fails. It is still attempted because it is free and correct when it works,
  * but a failure here must never block the reset: IMEM is the channel that does
- * work at this stage, so the decision to reset is taken on IMEM alone.
+ * work at this stage.
  *
  * Returns 1 if the value read back as written, 0 otherwise.
  */
+#define PON_GEN2_REASON_MASK	0xFEu	/* GENMASK(7, 1) */
+#define PON_GEN2_REASON_SHIFT	1
+#define PON_LEGACY_MASK		0xFCu	/* GENMASK(7, 2) */
+#define PON_LEGACY_SHIFT	2
+
 int pon_set_restart_reason(uint32_t reason)
 {
 	uint8_t before = REG8(QPNP_PON_SOFT_RB_SPARE);
-	uint8_t val = (uint8_t)((before & 0x03u) | ((reason << 2) & 0xFCu));
+	uint8_t val = (uint8_t)((before & ~PON_GEN2_REASON_MASK) |
+				((reason << PON_GEN2_REASON_SHIFT) &
+				 PON_GEN2_REASON_MASK));
 
 	REG8(QPNP_PON_SOFT_RB_SPARE) = val;
 	__asm__ volatile("dsb sy" ::: "memory");
 
 	uint8_t after = REG8(QPNP_PON_SOFT_RB_SPARE);
+
+	/*
+	 * If the SPMI write cannot land, the read-back returns the same value it
+	 * returned before, so compare against `before` too: a store that was
+	 * refused must not be reported as a success just because nothing moved.
+	 */
 	con_hex2("PONRB", "was=", before, "now=", after);
-	return after == val;
+	if (after != before)
+		return after == val;
+
+	/*
+	 * Nothing changed. Either the write was refused (expected before the RPM
+	 * is up) or the value was already correct. Try the legacy layout as a
+	 * fallback -- writing both layouts is harmless because each only touches
+	 * bits the other leaves alone only when the reason fits in one bit, and
+	 * ABL accepts whichever it reads. Report the gen2 result as authoritative.
+	 */
+	uint8_t legacy = (uint8_t)((before & ~PON_LEGACY_MASK) |
+				   ((reason << PON_LEGACY_SHIFT) & PON_LEGACY_MASK));
+	if (legacy != val) {
+		REG8(QPNP_PON_SOFT_RB_SPARE) = legacy;
+		__asm__ volatile("dsb sy" ::: "memory");
+		uint8_t l2 = REG8(QPNP_PON_SOFT_RB_SPARE);
+		con_hex2("PONleg", "val=", legacy, "back=", l2);
+		if (l2 == legacy)
+			return 1;
+	}
+	return 0;
 }
 
 /*
