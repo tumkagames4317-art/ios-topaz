@@ -1,4 +1,4 @@
-/*
+﻿/*
  * eMMC block I/O for the ginkgo shim, behind the same interface ufslog uses.
  *
  * ---- Why this file exists -----------------------------------------------
@@ -280,12 +280,14 @@ static int cmd(uint32_t idx, uint32_t arg, uint32_t resp_type, uint32_t *resp)
 	uint16_t cmdreg = (uint16_t)(idx << 8);
 
 	if (resp_type == 1)
-		cmdreg |= 0x0001u;		/* R1/R5/R6/R7, 48-bit */
+		cmdreg |= 0x0002u;		/* RESP_SHORT: R1/R5/R6/R7, 48-bit */
 	else if (resp_type == 2)
-		cmdreg |= 0x0002u;		/* R2, 136-bit */
+		cmdreg |= 0x0001u;		/* RESP_LONG: R2, 136-bit */
 
-	if (resp_type != 0)
-		cmdreg |= 0x0008u;		/* CRC check enable */
+	if (resp_type != 0) {
+		cmdreg |= 0x0008u;		/* CMD_CRC */
+		cmdreg |= 0x0010u;		/* CMD_INDEX */
+	}
 
 	if (!wait_cmd_free())
 		return 0;
@@ -327,9 +329,11 @@ static int pio_block(uint32_t lba, void *buf, int dir)
 	wr16(SDHCI_BLOCK_COUNT, 1);
 	wr16(SDHCI_TRANSFER_MODE, tm);
 
-	/* DATA_PRESENT (bit 5) | RESP_TYPE 1 (bit 1) | CRC check (bit 3). */
+	/* CMD_DATA (0x20) | RESP_SHORT (0x02) | CMD_CRC (0x08) | CMD_INDEX (0x10).
+	 * Bits [1:0] are RESP_LONG=1 / RESP_SHORT=2 (sdhci.h), so a 48-bit R1
+	 * response is 0x02 -- the old value 0x01 asked for 136 bits it never gets. */
 	uint16_t cmdreg = (uint16_t)(((dir ? 17u : 24u) << 8) | 0x0020u |
-				     0x0001u | 0x0008u);
+				     0x0002u | 0x0008u | 0x0010u);
 	wr16(SDHCI_NORMAL_INT_STATUS, 0xffff);
 	wr16(SDHCI_ERROR_INT_STATUS, 0xffff);
 	wr32(SDHCI_ARGUMENT, lba);

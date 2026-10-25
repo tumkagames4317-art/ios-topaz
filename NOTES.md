@@ -1,3 +1,245 @@
+﻿## 17:55 MSK 2026-10-25 -- SPMI facts measured tonight (autonomy -> fastboot)
+
+Written while the phone was off USB, so these are the readings collected
+during the session with `-DSWEET_DIAG=1..4` builds. All values are from the
+panel, transcribed by the user.
+
+### Proven on hardware
+- IMEM write at 0x0c12565c WORKS. Pattern 0x12345678 written and read back
+  identically (`Y1 pre` / `Y2 post`). Address confirmed from the device DTB:
+  `restart_reason@65c` inside `qcom,msm-imem@c125000`.
+- Dropping PSHOLD (0x0440b00) resets the board; the panel flickers.
+- PSCI SYSTEM_RESET resets the board.
+- SPMI READS work: PON_RT_STS read as 0x00000000, not 0xffffffff.
+
+### Measured PON state (SWEET_DIAG=1, `A1..A4`)
+    A1 rtsts = 0x00000000   PMIC answers
+    A2 rctl2 = 0x00000000   RESET_EN is CLEAR -- reset line off
+    A3 spare = 0x00000000   reason byte empty
+    A4 rctl  = 0x00000000   power-off type 0 (shutdown), not warm
+IMEM at the same moment: `A5 imem = EFBBFB3E` (garbage, ABL's leftovers).
+
+### SPMI writes do NOT land
+Every write attempt leaves the target unchanged and reads back zero:
+`PONPS ctl=0 en=0`, `PONRB was=0 now=0`, `R1 warm=0 pon=0`.
+The IMEM write in the same build succeeds, so this is specific to SPMI.
+
+### Register bases: the ones in NOTES were WRONG until tonight
+Parsing the device DTB properly (the earlier reads were byte-misaligned)
+gives the real `reg` pairs for `qcom,spmi@1c40000`, `reg-names` order
+`core chnls obsrvr intr cnfg`:
+
+    core   0x01c40000  size 0x1100
+    chnls  0x01e00000  size 0x200      <- writes go here
+    obsrvr 0x03e00000  size 0x100000   <- reads come from here
+    intr   0x03f00000  size 0xa0000
+    cnfg   0x01c0a000  size 0x26000
+
+The old code used `SPMI_ARB_BASE + 0x800` = 0x1c40800 for PON, which is
+inside `core`, not `obsrvr`. It happens to read plausible values, which is
+why the mistake survived so long. The observer window for EE0 is
+`obsrvr + 0x10000*ee + 0x80*apid`.
+
+### APID table
+Readable at `obsrvr + 0x900` (words 0x140, 0x494, ...; 144 non-zero of 512
+entries), but NOT at `cnfg + 0x900` (all zero), and the PPID walk finds no
+PPID 0x800 -- so the word layout does not match what `spmi-pmic-arb.c`
+assumes for this firmware.
+
+### Two code defects found and fixed tonight (both real)
+1. PON registers sit at ODD offsets (0x5A, 0x5B, 0x8F). A 32-bit access
+   raises an alignment exception under `-mstrict-align`, which is what made
+   every PS_HOLD attempt look like a hang. Use REG8 for these.
+2. The observer window is read-only (`PMIC_ARB_CHANNEL_OBS`). A plain store
+   there does nothing at all. Writes need the command protocol:
+   WDATA0 <- data, CMD <- (opc<<27)|((addr&0xff)<<4)|bc, then poll STATUS
+   for DONE.
+
+### eMMC: response-type bits were inverted (verified against sdhci.h 55-58)
+`SDHCI_CMD_RESP_LONG` is 0x01 (136-bit) and `RESP_SHORT` is 0x02 (48-bit);
+the old `cmd()` had them the other way round, so CMD1 asked for a 136-bit
+response an eMMC never sends. Fixed in `cmd()` and the data path, together
+with `CMD_INDEX` (0x10), which `sdhci.c` requires alongside CRC.
+
+### Next action
+`work/build/m1/ginkgo-m1.img` prints a marker before each of the five SPMI
+region reads, to find which access stalls. If every region reads 0xffffffff
+the PMIC is unreachable from here and the fastboot route needs the recovery
+fallback instead of SPMI.
+
+## >>> HANDOFF 2026-10-25 16:30 (ginkgo): eMMC -- park6 re-read, four variant images built <<<
+
+park6 left the card stuck at `CMD1 error inverted power-up complex`. Re-reading
+the *transcript* rather than the driver changed three of the conclusions:
+
+1. **`cfg=0x0A1D` in park3 was written by the driver, not set early enough.**
+   The old `clock_on()` cleared `SD_CLK_EN` *and then* waited for
+   `INTERNAL_CLK_STABLE` -- on v3+ that bit is "internal clock running", not
+   "selected divider stable", so it passed immediately, the loop returned with
+   `SD_CLK_EN = 0`, and the "workaround" that set `SD_CLK_EN` afterwards ran
+   *after* `SOFTWARE_RESET` had already been attempted. So the reset really did
+   run with no SD clock in every build so far, and the "reset stuck" line was
+   accurate. `clock_set()` now polls `CLOCK_CONTROL.INTERNAL_CLK_STABLE` **and**
+   `PRESENT_STATE.SD_CLOCK_STABLE` (bit 3, `0x08`), which is the one the reset
+   path actually needs.
+2. **`SOFTWARE_RESET.bit0` clears `CLOCK_CONTROL` (and `POWER_CONTROL` on
+   v4.1) and does not restore them.** Even a *successful* runtime reset leaves
+   the controller with no card clock. The code now re-asserts power + clock
+   after the reset before it touches CMD1.
+3. **`CLK_PLL_EN` (bit 3) was never set.** On v4.1 the internal clock cannot
+   come up without it; it is now set in `clock_set()`. Also `POWER_CONTROL` is
+   written with `0x0F` (3.3 V) unconditionally, not just `BUS_POWER`.
+
+Other defects fixed in `emmc.c` on the way (all previously guessed wrong):
+
+* **CMD3 ignored the card's RCA.** It sent `1u << 16` and then used that same
+  guess for CMD7 without reading R6. Now RCA comes from `resp[0] >> 16`, with 1
+  claimed if the card answers 0.
+* **CMD1 OCR was `0x40FF8000`.** That has the low half of the 3.3 V window
+  *clear* (`[23:16] = 0x80`, i.e. 2.7-2.8 V only). Now
+  `0x00FF8000 | ACCESS_SECTOR(29) | HCS(30) = 0x60FF8000`.
+* **CMD1 asked for a CRC check.** R3 has no CRC field, so a CRC request is a
+  guaranteed `CMD_CRC_ERROR`. CMD1/CMD0 now pass `crc = 0`; CMD2/CMD3/CMD7/CMD13
+  keep it (they do have CRCs).
+* **`SDHCI_VENDOR_SPEC` bit 16 (`INVERSE_CRC_CHECK`)** is now cleared, as Linux's
+  `sdhci_msm_probe()` does. With it set the controller sends and expects
+  inverted CRC7.
+* **1-bit / no-high-speed / SDMA** is now asserted *after* the reset too (a
+  v4.1 `SRES_ALL` clears `HOST_CONTROL`), not only before it.
+* Failure lines now name the cause: `cmd1_n=` / `err=` (raw
+  `ERROR_INT_STATUS`, plus `0x1000x` = CMD_COMPLETE timeout, `0x10000|ps` = CMD
+  line never freed, `0x80000000` = card answered with OCR[31] clear),
+  `ocr=`, `ps=`, `clk sel=`, `rst=`.
+
+**Important for reading a failure:** a failing eMMC means no log. `ufslog_init()`
+writes through `write_blocks()`, which returns immediately while
+`userdata_first_card_lba == 0`. So on any failed boot the *panel is the only
+evidence* -- which is why the three lines above exist.
+
+### Images built (all `-DSWEET_PARK_ONLY=1 -DSWEET_AUTONOMY_PROBE=1`)
+
+| image | md5 | extra define | checks |
+|---|---|---|---|
+| `build/emmc20/ginkgo-emmc20.img` | `9e196c4141aeb404708bcb321868f66d` | `EMMC_FAST_BASE=1` | the clock, not the reset, is the blocker: keep ABL's clock if it is running and *legal* (`DIV == 0` or `1..8`); otherwise step down only as far as `/2`. `0xA180` is a reserved code, so it is always reprogrammed |
+| `build/emmc21/ginkgo-emmc21.img` | `209c1178f0aff5535e53ac5e4090ebcd` | `EMMC_SLOW_INIT=1` | the opposite hypothesis (inherited clock too fast): try `sel=2`..`8` with `SD_CLK_EN` dropped first, identify at the slowest that locks, come back up to `/2` afterwards |
+| `build/emmc22/ginkgo-emmc22.img` | `571299b636d260d09abf7f4d07da23ff` | `EMMC_NO_HOST_RESET=1` | drop `SOFTWARE_RESET` entirely; only CMD/DATA reset + card-side CMD0, exactly like Linux's `mmc_rescan()`. Tells us whether the stuck host reset matters at all |
+| `build/emmc23/ginkgo-emmc23.img` | `51ae3bada827cab784b104e812fcb343` | `SWEET_EMMC_DEBUG=1` | baseline (all fixes, no variant) with every panel line mirrored into ufslog -- so the *first* boot where the card works leaves the whole trace on the card instead of on a photograph |
+
+Flash `emmc20` first. Panel lines expected from a *working* card:
+
+```
+EMMC base=04744000 caps=742DCB02
+EMMC ctl_in=XXXX vs=XXXXXXXX
+EMMC clk sel=... ctl=XXXXXXXX
+EMMC rst=00000000 ps=XXXXXXXX
+EMMC rca=... ocr=...
+EMMC state=00000004 stbits=XXXXXXXX
+EMMC lba0[510]=00000055 lba0[511]=000000AA
+EMMC card ready, 512-byte PIO
+EMMC userdata_lba=... ent=...
+```
+
+Note `EMMC cmd1_n=... err=...` only appears when CMD1 fails; `err` is the raw
+`ERROR_INT_STATUS`.
+
+### Next step
+
+Flash `emmc20` first. Expected ladders (each failure is its own single line):
+
+* `EMMC clk sel=00000000 dtly=` ... `EMMC card ready` -> the clock theory was
+  right; then `userdata_lba=` and the log is live.
+* `EMMC cmd1_n=XXXXXXXX err=00000001` -> real CMD timeout: card genuinely not
+  answering, look at `ps=`.
+* `EMMC cmd1_n=... err=00000002` -> CRC: the inverse-CRC or the CRC-request
+  path, `vs=` on the second line says what `VENDOR_SPEC` looked like.
+* `EMMC rst=00000001` -> full reset still refuses; switch to `emmc22`.
+
+---
+
+## >>> HANDOFF 2026-10-25 16:00 (ginkgo): FIRST HARDWARE READINGS -- IMEM works, eMMC does not <<<
+
+The park-only build (`-DSWEET_PARK_ONLY=1`) did what it was for: it held the
+panel still and printed the real state. **These are the first actual
+measurements from this device**, after a day of inference.
+
+Panel, transcribed by the user:
+
+```
+MAIN sweet milestone 4: xnu loader
+EMMC base=04744000 caps=742DCB02
+EMMC reset stuck: block not clocked
+EMMCh wr=00090001 rd=00000001
+EMMCp write NOT verified
+GATE emmc=00000800 log=00000001
+LOG persistent log active
+PANIC autonomy panic: resetting to fastboot
+POWER max=000906B0 bma=00000000
+POWlog vmi=0000E000 buck=00000000
+AUTO ... imem=77665500
+PARK park-only build: hold, read IMEM from recovery
+```
+
+### What is now *proven*, not guessed
+
+1. **The IMEM write works.** `imem=77665500` is the value read *back* after the
+   store, and `0x77665500` is exactly `IMEM_REASON_BOOTLOADER`. So the shim can
+   reach and modify IMEM restart_reason at `0x0c12565c`. That half of the
+   mechanism is sound.
+2. **The console layout is fine** -- `base=04744000` is the correct SDHCI
+   address, so the panel prints what it is given.
+3. **The eMMC driver fails at its first step**, and the message names it:
+   `reset stuck: block not clocked`. `CAPABILITIES` reads `0x742DCB02`, so the
+   block *is* reachable over the bus, but `SDHCI_SOFTWARE_RESET` never
+   self-clears.
+
+### The eMMC bug that caused it
+
+`test_emmc()` asserted `SDHCI_SOFTWARE_RESET` **before** starting the internal
+clock. The reset bit only self-clears once that clock runs, so the driver gave
+up immediately. The order was corrected earlier in the session but had never run
+on hardware; this reading confirms the diagnosis exactly.
+
+Correct order (SD Host Controller Simplified Spec 3.0, and `sdhci_init()` in
+Linux): power -> internal clock stable -> assert/release reset -> SD clock.
+
+`CAPABILITIES[15:8]` reads **203 MHz**, confirming that field is the broken
+`SDHCI_QUIRK_CAP_CLOCK_BASE_BROKEN` value and must not drive the divider.
+
+### What recovery told us about the platform
+
+`/sys/fs/pstore/console-ramoops-0` from the last Android boot:
+
+```
+PMIC@SID0 Power-on reason: Triggered from Hard Reset and 'cold' boot
+PMIC@SID0: Power-off reason: Triggered from PS_HOLD (PS_HOLD/MSM Controlled Shutdown)
+PMIC@SID2 Power-on reason: Triggered from CBL (External Power Supply)
+```
+
+Two facts follow:
+
+* **PM6125 is SID0** and carries `qcom,power-on@800`, so the address
+  `0x01c40000 + 0x800 + 0x8F` used for `PON_SOFT_RB_SPARE` names the right slave
+  and register. **PMI632 is SID2/SID3** and has its own PON node; ABL may
+  consult either, which is a second place to write if SID0 alone does not move
+  the boot.
+* The previous shutdown was **PS_HOLD**, a warm reset from the PMIC rather than
+  a cold boot -- the correct vehicle for carrying a restart reason.
+
+`/dev/mem` does not exist in this recovery, so PMIC/IMEM registers cannot be
+read from adb; the panel and ramoops are the channels that work.
+
+### Next concrete step
+
+Flash `build/park2/ginkgo-park2.img` (md5 `ae8ba55235e8c3955c7e326164f67a72`),
+which has the corrected clock-then-reset order, and read the panel:
+
+* expected progress: `EMMC rca=... state=4`, `lba0[510]=55 lba0[511]=aa`,
+  `userdata_lba=...` -- the log is then live for the first time;
+* if it still says `reset stuck even with clock running`, the SDCC core clock
+  really is gated by ABL and needs an RPMh vote before the card can be used.
+
+---
+
 ## >>> HANDOFF 2026-10-25 14:46 (ginkgo): a watcher that actually survives, at last <<<
 
 Two separate reasons the unattended watcher kept dying, both now understood and
@@ -25,7 +267,7 @@ schtasks /Run    /TN "DSHginkgoWatch"
 
 `watch-probeB.cmd` loops `autoloop.ps1` forever; `autoloop.ps1` itself waits
 without a deadline. Verified: task status stays `Running` across a 80 s window
-that would have killed a job, and keeps polling `fastboot devices` — so the
+that would have killed a job, and keeps polling `fastboot devices` вЂ” so the
 moment the phone appears it will be flashed without anyone touching anything.
 
 Note: `/RL HIGHEST` fails here (needs elevation). Plain user-level task is
@@ -85,7 +327,7 @@ not the PMIC generation by itself.
 
 ### What this device selects
 
-The boot DTB was extracted from `images/01-current-прошит-сейчас.img` (it sits
+The boot DTB was extracted from `images/01-current-РїСЂРѕС€РёС‚-СЃРµР№С‡Р°СЃ.img` (it sits
 at file offset `0x753000`, `dtb_size` 285805) and inspected:
 
 | DT property | present? |
@@ -679,7 +921,7 @@ with `ginkgo-work/read-log.sh`; the `SEGS end=` line gives the real `adt_pa`.
 If it is `0x82568000` the ADT patch should succeed and the next stop is XNU
 itself; if it is `0xb2560000` the shim is still reading a stale payload.
 
-# iOS 16 on topaz (Redmi Note 12 4G, SM6225) — working notes
+# iOS 16 on topaz (Redmi Note 12 4G, SM6225) вЂ” working notes
 
 ## Agent handoff / active work (2026-10-24, ginkgo)
 
@@ -687,7 +929,7 @@ itself; if it is `0xb2560000` the shim is still reading a stale payload.
 ginkgo port alongside topaz. Work happens in `/home/comaru/ios16-port/`; the
 shim lives in this checkout under `shim/`.
 
-### ginkgo boot mechanism — SOLVED (observation, measured on device)
+### ginkgo boot mechanism вЂ” SOLVED (observation, measured on device)
 
 - **ABL accepts only header v2 with a GZIP kernel.** v4 images (what
   `shim/build.sh` produces for topaz) and uncompressed ARM64 Images make ABL
@@ -710,9 +952,9 @@ shim lives in this checkout under `shim/`.
 
 Tooling in `/home/comaru/ios16-port/ginkgo-work/`:
 
-- `mkinit.sh PAYLOAD.elf OUT.img` — v2+gzip ginkgo boot image with the payload
+- `mkinit.sh PAYLOAD.elf OUT.img` вЂ” v2+gzip ginkgo boot image with the payload
   installed as `/init` and `/system/bin/init`. Use this, not `shim/build.sh`.
-- `waitfb.sh [tries]` — poll for ginkgo in fastboot (the user powers the phone
+- `waitfb.sh [tries]` вЂ” poll for ginkgo in fastboot (the user powers the phone
   on by hand; it is usually off between experiments).
 - Ready-made: `ginkgo-condiag.img` (text console on the splash framebuffer),
   `ginkgo-fulldiag.img` (CurrentEL / MMFR0 / TGran16 / MIDR / MPIDR / CNTFRQ /
@@ -752,22 +994,22 @@ xnu.
 
 ## Agent handoff / active work (2026-10-20, topaz)
 
-**This checkout is ios-topaz**, not the sweet phone. Public overview: [`README.md`](README.md). Sweet's long engineering log starts under "sweet history" below — treat it as upstream context, not the current device state.
+**This checkout is ios-topaz**, not the sweet phone. Public overview: [`README.md`](README.md). Sweet's long engineering log starts under "sweet history" below вЂ” treat it as upstream context, not the current device state.
 
 ### State (observation from tree, 2026-10-20)
 
 - Target: Xiaomi **topaz/tapas**, Qualcomm **SM6225 khaje**, iPhone X userland **16.7.16 / 20H392**.
-- Kernel patches: sweet **0001–0079** + topaz **0080–0146** (latest: `0146-topaz-ionet-cpp-flags.patch`).
-- Documented as bootable to lock screen (~3 min) on 4× Gold (A73); Silver parked (no 16K granule).
+- Kernel patches: sweet **0001вЂ“0079** + topaz **0080вЂ“0146** (latest: `0146-topaz-ionet-cpp-flags.patch`).
+- Documented as bootable to lock screen (~3 min) on 4Г— Gold (A73); Silver parked (no 16K granule).
 - In-tree and default-on unless boot-arg disables: FT5452 touch, PM6125 keys, SM5602/bq battery, Gold max cpufreq, MDP direct scanout, PM6125 RTC read+write.
-- WLAN: 0113–0126 bring-up; **0129–0143** stack; **0144–0146** IONetworkingFamily (`sweet_ionet` + `iokitcpp` + `.cpo` flags); **0145** `TopazWlan` is `IOEthernetController`. `tw0` still attaches unless `sweetwlanif=0`. Offline header check (below) did not find a missing KPI symbol in the previously suspected set. No IO80211 / configd confirmation / resolv apply.
+- WLAN: 0113вЂ“0126 bring-up; **0129вЂ“0143** stack; **0144вЂ“0146** IONetworkingFamily (`sweet_ionet` + `iokitcpp` + `.cpo` flags); **0145** `TopazWlan` is `IOEthernetController`. `tw0` still attaches unless `sweetwlanif=0`. Offline header check (below) did not find a missing KPI symbol in the previously suspected set. No IO80211 / configd confirmation / resolv apply.
 - Phone-side confirmation of input/battery/scanout/RTC/MEMFDT/WLAN is **not recorded here** (no device in this session). Prefer `SWEET TOUCH:`, `SWEET KEYS:`, `SWEET RTC:`, `SWEET WLAN:`, `assoc:`, `SWEET WLAN WPA:`, shim `MEMFDT`/`MEMSZ`.
-- `sweethw=1` still means sweet SM7150 USB MMIO — **do not enable on topaz**.
-- `gh` 2.102.0 is logged in as `turgayasuk-sketch` with `workflow` scope. Public repo `https://github.com/turgayasuk-sketch/ios-topaz`, default branch `topaz`. CI **39378826721** PASSED in 7m13s (https://github.com/turgayasuk-sketch/ios-topaz/actions/runs/39378826721) but dxb skipped patches **0127–0146**. First break: `0127` corrupt (`@@ -0,0 +1,252 @@` had 203 lines). `0129` had an extra context line after `@@ -39,6 +39,7 @@`. Hunk counts through `0146` were recounted after CI **39379923401** (cancelled) still rejected `0127` (`@@` fragment at line 244) and `0130` (line 47). Those headers now include the extra context line, pushed as `39758d6`. CI **39380746344** FAILED (https://github.com/turgayasuk-sketch/ios-topaz/actions/runs/39380746344): `0127`–`0129` applied; `0130` skipped (`patch fragment without header` at line 680 — a blank line between hunks; `git apply` rejects that). The compile then died in `TopazModem.cpo` with `'sys/topaz_wlan.h' file not found` (iokit sees `EXPORT_HDRS`, and `0129` never added the header to `bsd/sys/Makefile` `XNU_ONLY_EXPORTS`). Fix: drop that blank line; export `topaz_wlan.h`. Local `git apply --check` on `0130` now gets past syntax (missing tree). The Makefile hunk applies on xnu-8796.141.3 `bsd/sys/Makefile`. Pushed as `ff4a1ff`. CI **39382060692** FAILED (https://github.com/turgayasuk-sketch/ios-topaz/actions/runs/39382060692): `0130` and `0131` applied; `0132` skipped (`TopazModem.cpp:4888`). Compile error in `TopazModem.cpo`: `a_begin` / `a_arm` undeclared. Cause: `0131`'s hunk `@@ -486,100 +520,29 @@` deleted the `0130` helpers (`a_teardown`, `a_fail`, `a_arm`, `a_start_auth`, `a_start_assoc`, `a_begin`) instead of keeping them. Those lines are context again, and `a_teardown` now sets `a_ptk = false` (the line `0132` already expects). Local `git apply --check` on `0131` gets past syntax. Pushed as `49a1c20`. CI **39383167699** is in progress: https://github.com/turgayasuk-sketch/ios-topaz/actions/runs/39383167699. No `xnu/out-*` downloaded.
+- `sweethw=1` still means sweet SM7150 USB MMIO вЂ” **do not enable on topaz**.
+- `gh` 2.102.0 is logged in as `turgayasuk-sketch` with `workflow` scope. Public repo `https://github.com/turgayasuk-sketch/ios-topaz`, default branch `topaz`. CI **39378826721** PASSED in 7m13s (https://github.com/turgayasuk-sketch/ios-topaz/actions/runs/39378826721) but dxb skipped patches **0127вЂ“0146**. First break: `0127` corrupt (`@@ -0,0 +1,252 @@` had 203 lines). `0129` had an extra context line after `@@ -39,6 +39,7 @@`. Hunk counts through `0146` were recounted after CI **39379923401** (cancelled) still rejected `0127` (`@@` fragment at line 244) and `0130` (line 47). Those headers now include the extra context line, pushed as `39758d6`. CI **39380746344** FAILED (https://github.com/turgayasuk-sketch/ios-topaz/actions/runs/39380746344): `0127`вЂ“`0129` applied; `0130` skipped (`patch fragment without header` at line 680 вЂ” a blank line between hunks; `git apply` rejects that). The compile then died in `TopazModem.cpo` with `'sys/topaz_wlan.h' file not found` (iokit sees `EXPORT_HDRS`, and `0129` never added the header to `bsd/sys/Makefile` `XNU_ONLY_EXPORTS`). Fix: drop that blank line; export `topaz_wlan.h`. Local `git apply --check` on `0130` now gets past syntax (missing tree). The Makefile hunk applies on xnu-8796.141.3 `bsd/sys/Makefile`. Pushed as `ff4a1ff`. CI **39382060692** FAILED (https://github.com/turgayasuk-sketch/ios-topaz/actions/runs/39382060692): `0130` and `0131` applied; `0132` skipped (`TopazModem.cpp:4888`). Compile error in `TopazModem.cpo`: `a_begin` / `a_arm` undeclared. Cause: `0131`'s hunk `@@ -486,100 +520,29 @@` deleted the `0130` helpers (`a_teardown`, `a_fail`, `a_arm`, `a_start_auth`, `a_start_assoc`, `a_begin`) instead of keeping them. Those lines are context again, and `a_teardown` now sets `a_ptk = false` (the line `0132` already expects). Local `git apply --check` on `0131` gets past syntax. Pushed as `49a1c20`. CI **39383167699** is in progress: https://github.com/turgayasuk-sketch/ios-topaz/actions/runs/39383167699. No `xnu/out-*` downloaded.
 
 ### Next concrete action
 
-1. CI: when run `39383167699` finishes, read remaining skips and the first compiler diagnostic. Keep repairing until `0146` compiles (`IONetworkController.cpo` / `TopazWlan.cpo`, no skip of `0127`–`0146`). Run `39378826721` did not build IONetworkingFamily.
+1. CI: when run `39383167699` finishes, read remaining skips and the first compiler diagnostic. Keep repairing until `0146` compiles (`IONetworkController.cpo` / `TopazWlan.cpo`, no skip of `0127`вЂ“`0146`). Run `39378826721` did not build IONetworkingFamily.
 2. Phone (after a green kernel): `sweetwlanif=0 modem=1 wifi=1`, join, confirm ioreg `IOEthernetInterface` link up when authorized and traffic on that ifnet (not `tw0`). IO80211 still closed-source.
 
 ### Docs sync (2026-10-20)
@@ -781,110 +1023,110 @@ xnu.
 
 ### PM6125 RTC (2026-10-20)
 
-- **Done (offline):** patch `0127-topaz-pm6125-rtc.patch` — `bsd/dev/sweet_rtc.c` (SPMI OBS read @0x6048, GPS/Unix heuristic), UFS calls `sweet_rtc_init()`, `SweetPlatformExpert::{get,set}GMTTimeOfDay`.
-- **Done (offline):** patch `0128-topaz-pm6125-rtc-write.patch` — SPMI EXT_WRITEL on chnls `0x01e00000 + 0x10000*APID`, Linux disable/write/enable sequence @0x6040, alarm PPID 0x61 best-effort, `setGMTTimeOfDay` → `sweet_rtc_write_unix`. Needs `write_ee==0` or settime is skipped (`SWEET RTC: … no settime`).
+- **Done (offline):** patch `0127-topaz-pm6125-rtc.patch` вЂ” `bsd/dev/sweet_rtc.c` (SPMI OBS read @0x6048, GPS/Unix heuristic), UFS calls `sweet_rtc_init()`, `SweetPlatformExpert::{get,set}GMTTimeOfDay`.
+- **Done (offline):** patch `0128-topaz-pm6125-rtc-write.patch` вЂ” SPMI EXT_WRITEL on chnls `0x01e00000 + 0x10000*APID`, Linux disable/write/enable sequence @0x6040, alarm PPID 0x61 best-effort, `setGMTTimeOfDay` в†’ `sweet_rtc_write_unix`. Needs `write_ee==0` or settime is skipped (`SWEET RTC: вЂ¦ no settime`).
 - Boot-args: `sweetrton=0`, `sweetrtoffset=N` (default +315964800; `-1` = raw).
 - **Not phone-tested / not CI-built in this workspace.**
 
 ### WLAN ifnet stub (2026-10-20)
 
-- **Done (offline):** patch `0129-topaz-wlan-ifnet.patch` — `<sys/topaz_wlan.h>`, `bsd/dev/topaz_wlan_if.c` attaches `tw0` from `topaz_wlan_ready_hook` (armed in AppleCLCD::start before `topaz_modem_init`). `sweetwlanif=0` skips. Output drops; no assoc.
+- **Done (offline):** patch `0129-topaz-wlan-ifnet.patch` вЂ” `<sys/topaz_wlan.h>`, `bsd/dev/topaz_wlan_if.c` attaches `tw0` from `topaz_wlan_ready_hook` (armed in AppleCLCD::start before `topaz_modem_init`). `sweetwlanif=0` skips. Output drops; no assoc.
 - Needs `modem=1 wifi=1` firmware on the root. **Not phone-tested / not CI-built here.**
 
 ### WLAN open association (2026-10-20)
 
-- **Done (offline):** patch `0130-topaz-wlan-assoc-open.patch` — topaz-woa `assoc.c` open AUTH/ASSOC into TopazModem; `wifissid=` auto-join; `topaz_wlan_connect_bss` / `topaz_wlan_associated`. Privacy/WPA2 BSS refused (superseded by 0131 for privacy).
+- **Done (offline):** patch `0130-topaz-wlan-assoc-open.patch` вЂ” topaz-woa `assoc.c` open AUTH/ASSOC into TopazModem; `wifissid=` auto-join; `topaz_wlan_connect_bss` / `topaz_wlan_associated`. Privacy/WPA2 BSS refused (superseded by 0131 for privacy).
 - **Not phone-tested / not CI-built here.**
 
 ### WLAN WPA2-PSK + HTT TX/RX hook (2026-10-20)
 
-- **Done (offline):** patch `0131-topaz-wlan-wpa2-htt.patch` — RSN IE in assoc req; `PEER_FLAG_NEED_PTK_4WAY`; defer AUTHORIZE until `topaz_wlan_install_key()`; `wifipsk=` recorded; HTT RX → EAPOL; `topaz_wlan_tx`; APIs `authorized` / `install_key` / `tx`.
+- **Done (offline):** patch `0131-topaz-wlan-wpa2-htt.patch` вЂ” RSN IE in assoc req; `PEER_FLAG_NEED_PTK_4WAY`; defer AUTHORIZE until `topaz_wlan_install_key()`; `wifipsk=` recorded; HTT RX в†’ EAPOL; `topaz_wlan_tx`; APIs `authorized` / `install_key` / `tx`.
 - **Not phone-tested / not CI-built here.** Apply-checked against reconstructed 0125+0130 excerpts only.
 
 ### WLAN WPA2-PSK 4-way (2026-10-20)
 
-- **Done (offline):** patch `0132-topaz-wlan-wpa2-4way.patch` — `bsd/dev/topaz_wlan_wpa.c` (PBKDF2-HMAC-SHA1 PMK, PRF PTK, EAPOL MIC, AES key-unwrap GTK); TopazModem arms on assoc + `wifipsk=`, feeds EAPOL from HTT RX, TX msg2/msg4 via `topaz_wlan_tx`, installs TK/GTK.
+- **Done (offline):** patch `0132-topaz-wlan-wpa2-4way.patch` вЂ” `bsd/dev/topaz_wlan_wpa.c` (PBKDF2-HMAC-SHA1 PMK, PRF PTK, EAPOL MIC, AES key-unwrap GTK); TopazModem arms on assoc + `wifipsk=`, feeds EAPOL from HTT RX, TX msg2/msg4 via `topaz_wlan_tx`, installs TK/GTK.
 - **Not phone-tested / not CI-built here.** Crypto vectors aligned with IEEE 802.11i / independent PTK hierarchy (not host-tested in this workspace).
 
 ### WLAN tw0 HTT datapath (2026-10-20)
 
-- **Done (offline):** patch `0133-topaz-wlan-tw0-datapath.patch` — `topaz_wlan_tx_ethernet` / `topaz_wlan_if_input`; HTT RX non-EAPOL → ethernet into `tw0`; `tw0` output → ToDS 802.11+LLC → HTT. Requires `topaz_wlan_authorized()` (open or PTK). QoS RX hdr handled. No DHCP/IO80211.
+- **Done (offline):** patch `0133-topaz-wlan-tw0-datapath.patch` вЂ” `topaz_wlan_tx_ethernet` / `topaz_wlan_if_input`; HTT RX non-EAPOL в†’ ethernet into `tw0`; `tw0` output в†’ ToDS 802.11+LLC в†’ HTT. Requires `topaz_wlan_authorized()` (open or PTK). QoS RX hdr handled. No DHCP/IO80211.
 - **Not phone-tested / not CI-built here.**
 
 ### WLAN tw0 static IPv4 (2026-10-20)
 
-- **Done (offline):** patch `0134-topaz-wlan-tw0-ipv4.patch` — `wifiip=` / `wifimask=` (default /24) / `wifigw=`; `topaz_wlan_if_on_authorized()` after open AUTHORIZE or PTK install; `proto_plumb` + `SIOCAIFADDR` (ue0-style). No DHCP.
+- **Done (offline):** patch `0134-topaz-wlan-tw0-ipv4.patch` вЂ” `wifiip=` / `wifimask=` (default /24) / `wifigw=`; `topaz_wlan_if_on_authorized()` after open AUTHORIZE or PTK install; `proto_plumb` + `SIOCAIFADDR` (ue0-style). No DHCP.
 - **Not phone-tested / not CI-built here.**
 
 ### WLAN tw0 DHCP (2026-10-20)
 
-- **Done (offline):** patch `0135-topaz-wlan-tw0-dhcp.patch` — `wifiip=dhcp` or `wifidhcp=1`; DISCOVER/REQUEST over HTT ethernet; OFFER/ACK parse on `topaz_wlan_if_input`; retransmit via `topaz_wlan_if_poll(g_ms)` from modem `radio_poll`; then same `SIOCAIFADDR` as 0134. No lease renew / DNS.
+- **Done (offline):** patch `0135-topaz-wlan-tw0-dhcp.patch` вЂ” `wifiip=dhcp` or `wifidhcp=1`; DISCOVER/REQUEST over HTT ethernet; OFFER/ACK parse on `topaz_wlan_if_input`; retransmit via `topaz_wlan_if_poll(g_ms)` from modem `radio_poll`; then same `SIOCAIFADDR` as 0134. No lease renew / DNS.
 - Apply-checked against reconstructed 0134 `topaz_wlan.h` / `topaz_wlan_if.c` + `radio_poll` excerpt. **Not phone-tested / not CI-built here.**
 
 ### WLAN tw0 DHCP renew (2026-10-20)
 
-- **Done (offline):** patch `0136-topaz-wlan-tw0-dhcp-renew.patch` — option 51 lease; T1 at 50% → RENEW REQUEST with ciaddr; ACK refreshes timer; NAK → DISCOVER; DNS opt 6 logged only.
+- **Done (offline):** patch `0136-topaz-wlan-tw0-dhcp-renew.patch` вЂ” option 51 lease; T1 at 50% в†’ RENEW REQUEST with ciaddr; ACK refreshes timer; NAK в†’ DISCOVER; DNS opt 6 logged only.
 - Apply-checked on post-0135 `topaz_wlan_if.c`. **Not phone-tested / not CI-built here.**
 
 ### WLAN tw0 gratuitous ARP (2026-10-20)
 
-- **Done (offline):** patch `0137-topaz-wlan-tw0-garp.patch` — after successful `SIOCAIFADDR`, broadcast ARP request SPA=TPA=our IP via HTT; `wifigarpon=0` skips.
+- **Done (offline):** patch `0137-topaz-wlan-tw0-garp.patch` вЂ” after successful `SIOCAIFADDR`, broadcast ARP request SPA=TPA=our IP via HTT; `wifigarpon=0` skips.
 - Apply-checked on post-0136 `topaz_wlan_if.c`. **Not phone-tested / not CI-built here.**
 
 ### WLAN sysctl scan/join (2026-10-20)
 
-- **Done (offline):** patch `0138-topaz-wlan-sysctl.patch` — `bsd/dev/topaz_wlan_sysctl.c`: `kern.topaz_wlan.{ready,associated,authorized,scan,bss,connect}`. Scan sleeps off the modem thread (safe from sysctl). WPA2 still needs boot-arg `wifipsk=`.
+- **Done (offline):** patch `0138-topaz-wlan-sysctl.patch` вЂ” `bsd/dev/topaz_wlan_sysctl.c`: `kern.topaz_wlan.{ready,associated,authorized,scan,bss,connect}`. Scan sleeps off the modem thread (safe from sysctl). WPA2 still needs boot-arg `wifipsk=`.
 - Apply-checked (files + new TU). **Not phone-tested / not CI-built here.**
 
 ### WLAN runtime PSK sysctl (2026-10-20)
 
-- **Done (offline):** patch `0139-topaz-wlan-sysctl-psk.patch` — `topaz_wlan_set_psk()` in TopazModem (updates `a_boot_psk` for 0132 4-way); `kern.topaz_wlan.psk` write sets/clears, read returns `set` or empty. Boot-arg `wifipsk=` still works.
+- **Done (offline):** patch `0139-topaz-wlan-sysctl-psk.patch` вЂ” `topaz_wlan_set_psk()` in TopazModem (updates `a_boot_psk` for 0132 4-way); `kern.topaz_wlan.psk` write sets/clears, read returns `set` or empty. Boot-arg `wifipsk=` still works.
 - Apply-checked. **Not phone-tested / not CI-built here.**
 
 ### WLAN IOService nub (2026-10-20)
 
-- **Done (offline):** patch `0140-topaz-wlan-ioservice-nub.patch` — `TopazWlan` IOService on IOResources; properties `TopazWlanReady` / `Associated` / `Authorized` / `MAC`, `BSD Name=tw0`; 2 s poll. Not IONetworkInterface (configd still blind). `topazwlannub=0` skips.
+- **Done (offline):** patch `0140-topaz-wlan-ioservice-nub.patch` вЂ” `TopazWlan` IOService on IOResources; properties `TopazWlanReady` / `Associated` / `Authorized` / `MAC`, `BSD Name=tw0`; 2 s poll. Not IONetworkInterface (configd still blind). `topazwlannub=0` skips.
 - Apply-checked. **Not phone-tested / not CI-built here.**
 
 ### WLAN disconnect / teardown restore (2026-10-20)
 
-- **Done (offline):** patch `0141-topaz-wlan-disconnect-clear-ip.patch` — restore `a_teardown` / `a_fail` / `a_arm` / `a_start_*` / `a_begin` removed by 0131; on teardown reset PTK/WPA and `topaz_wlan_if_on_disconnected()` (`SIOCDIFADDR` + DHCP idle).
+- **Done (offline):** patch `0141-topaz-wlan-disconnect-clear-ip.patch` вЂ” restore `a_teardown` / `a_fail` / `a_arm` / `a_start_*` / `a_begin` removed by 0131; on teardown reset PTK/WPA and `topaz_wlan_if_on_disconnected()` (`SIOCDIFADDR` + DHCP idle).
 - Observation: reconstructed 0131 tree had only forward decls for those helpers (link would fail). Apply-checked on excerpts. **Not phone-tested / not CI-built here.**
 
 ### WLAN status / DNS expose (2026-10-20)
 
-- **Done (offline):** patch `0142-topaz-wlan-status-dns.patch` — `topaz_wlan_if_ipv4()` stores applied IPv4 + DHCP opt-6 DNS; `kern.topaz_wlan.status` / `dns`; TopazWlan ioreg `TopazWlanIPv4` / `Netmask` / `Gateway` / `DNS` (removed when no address). Does not program resolv/configd.
+- **Done (offline):** patch `0142-topaz-wlan-status-dns.patch` вЂ” `topaz_wlan_if_ipv4()` stores applied IPv4 + DHCP opt-6 DNS; `kern.topaz_wlan.status` / `dns`; TopazWlan ioreg `TopazWlanIPv4` / `Netmask` / `Gateway` / `DNS` (removed when no address). Does not program resolv/configd.
 - Apply-checked on post-0141/0139/0140 excerpts. **Not phone-tested / not CI-built here.**
 
 ### WLAN static DNS boot-arg (2026-10-20)
 
-- **Done (offline):** patch `0143-topaz-wlan-wifidns.patch` — `wifidns=A.B.C.D` after static `wifiip=` stores `tw_cfg_dns` for 0142 sysctl/ioreg. DHCP still uses option 6.
+- **Done (offline):** patch `0143-topaz-wlan-wifidns.patch` вЂ” `wifidns=A.B.C.D` after static `wifiip=` stores `tw_cfg_dns` for 0142 sysctl/ioreg. DHCP still uses option 6.
 - Apply-checked on post-0142 `topaz_wlan_if.c`. **Not phone-tested / not CI-built here.**
 
 ### IONetworkingFamily vendor wire-up (2026-10-20)
 
-- **Done (offline):** `0144-stage-ionetworkingfamily.sh` fetches pin `f9f7e57b…` (tag **IONetworkingFamily-170.140.2**) into `iokit/Families/IONetworkingFamily` + public headers under `iokit/IOKit/network/`; minimal `AssertMacros.h`; fix bare `IOEthernet*.h` includes.
-- **Done (offline):** patch `0144-topaz-ionetworking-family.patch` — `options SWEET_IONET` / `sweet_ionet` in IOKIT_BASE; 12 family TUs in `files.arm64`; `IONetworkStack` personality (IOResources + IOBSD).
+- **Done (offline):** `0144-stage-ionetworkingfamily.sh` fetches pin `f9f7e57bвЂ¦` (tag **IONetworkingFamily-170.140.2**) into `iokit/Families/IONetworkingFamily` + public headers under `iokit/IOKit/network/`; minimal `AssertMacros.h`; fix bare `IOEthernet*.h` includes.
+- **Done (offline):** patch `0144-topaz-ionetworking-family.patch` вЂ” `options SWEET_IONET` / `sweet_ionet` in IOKIT_BASE; 12 family TUs in `files.arm64`; `IONetworkStack` personality (IOResources + IOBSD).
 - Apply-checked on reconstructed config/files/KernelConfigTables excerpts. **Not CI-built / not phone-tested.** Guess: first CI will need compile fixes.
 
 ### WLAN IOEthernetController (2026-10-20)
 
-- **Done (offline):** patch `0145-topaz-wlan-ethernet-controller.patch` — `TopazWlan` subclasses `IOEthernetController`, `attachInterface()` publishes `IOEthernetInterface`, `outputPacket` → `topaz_wlan_tx_ethernet`, RX thunk from `topaz_wlan_if_input`, link = authorized. `sweetwlanif=0` drops `tw0` so only the IONetwork ifnet is used. `topazwlannub=0` skips.
+- **Done (offline):** patch `0145-topaz-wlan-ethernet-controller.patch` вЂ” `TopazWlan` subclasses `IOEthernetController`, `attachInterface()` publishes `IOEthernetInterface`, `outputPacket` в†’ `topaz_wlan_tx_ethernet`, RX thunk from `topaz_wlan_if_input`, link = authorized. `sweetwlanif=0` drops `tw0` so only the IONetwork ifnet is used. `topazwlannub=0` skips.
 - Apply-checked on post-0142/0143 excerpts. **Not CI-built / not phone-tested.** Depends on 0144 family actually compiling.
 
 ### IONetworkingFamily C++ compile flags (2026-10-20)
 
-- **Done (offline):** patch `0146-topaz-ionet-cpp-flags.patch` — family `.cpp` lines are `optional sweet_ionet iokitcpp` (xnu config requires every tag). `iokit/conf/Makefile.template` adds `-I` the family dir and kext warning waivers on the `*.cpo` objects plus `TopazWlan.cpo`.
+- **Done (offline):** patch `0146-topaz-ionet-cpp-flags.patch` вЂ” family `.cpp` lines are `optional sweet_ionet iokitcpp` (xnu config requires every tag). `iokit/conf/Makefile.template` adds `-I` the family dir and kext warning waivers on the `*.cpo` objects plus `TopazWlan.cpo`.
 - Apply-checked on post-0144 excerpts. **Not CI-built.**
 - **KPI check (2026-10-20, headers only):** IONetworkingFamily-170.140.2 against raw xnu-8796.141.3. All 55 `ifnet_*` names the family calls are in `bsd/net/kpi_interface.h`, including `ifnet_init_eparams` fields `pre_enqueue`, `output_ctl`, `output_sched_model`, `start_delay_qlen`, `input_poll`, `set_bpf_tap`. `IFNET_LQM_THRESH_GOOD`/`OFF` live in `bsd/net/if_private.h` (included from `if.h` under `PRIVATE`); `makedefs/MakeInc.def` puts `-DPRIVATE` in kernel `DEFINES`, and iokit `CFLAGS` include `$(DEFINES)`. Also present: `IFCAP_AV`, `IOMallocType`/`IOMallocData`, `__kpi_deprecated`, `OSMemberFunctionCast`, `MACHINE_NETWORK_GROUP`/`MACHINE_NETWORK_WORKLOOP`, `IOPMrootDomain::publishFeature`. `TopazWlan` overrides match `getHardwareAddress(IOEthernetAddress *)`, `setMulticastMode`, `setPromiscuousMode`, `enable`/`disable(IONetworkInterface *)`, `outputPacket(mbuf_t, void *)`. Guess retired: those names are not the first-break set. A real compile can still fail on a signature or a header the scan did not open.
 
 ---
 
-# sweet history — iOS 16 on sweet (Redmi Note 10 Pro, SM7150)
+# sweet history вЂ” iOS 16 on sweet (Redmi Note 10 Pro, SM7150)
 
-## Agent handoff / active work (2026-10-15, latest) — sweet, superseded for topaz agents
+## Agent handoff / active work (2026-10-15, latest) вЂ” sweet, superseded for topaz agents
 
-### >>> GINKGO PORT 2026-10-25 08:05 — shim now reaches XNU (read first) <<<
+### >>> GINKGO PORT 2026-10-25 08:05 вЂ” shim now reaches XNU (read first) <<<
 
 Redmi Note 8 (ginkgo, SM6125 trinket) port, tree `ginkgo-diag`. **The shim gets
 all the way to `XNU jumping` with no panic.** This is the furthest it has ever
@@ -957,16 +1199,16 @@ Build/flash recipe and the rest of the night's findings are in
 
 **LIVE LOG over USB (0077, boot 0077s): no more recovery round-trips.** Boot an image with `sweetusb=2`, run `tools/sweet-usbnet.sh logs/live-NAME.txt` on the PC: it waits for the phone's CDC-ECM interface, sets 192.168.7.1/24 (sudo) and prints/saves the kernel console the phone streams every 100 ms as UDP to 192.168.7.1:5140 (starts with the last 64 KiB). `ping 192.168.7.2` checks the link. Current image: `shim/out/shim-boot-0077s.img` (kernel 0077, ADT sweet-0069hi, cpus=6, sweetfb_noconsole=1, sweetfb_hz=30, sweetusb=2). The recovery pull (`tools/sweet-log-pull.sh`) is still the way after a panic/hang before USB comes up.
 
-**🎉 USB networking works (boot 0076s, 18:24 local): `ping 192.168.7.2` from the PC answers in ~1 ms, 0 % loss (200-packet burst, 1500-byte frames, 512/1024-byte frames).** 0075: CDC-ECM function (bulk 0x81/0x01, interrupt 0x82 NETWORK_CONNECTION; host MAC 02:00:5e:77:ee:01) + kernel ethernet ifnet `ue0` (legacy output, header strip like if_fake) with 192.168.7.2/24 set from the kernel (proto_plumb + SIOCAIFADDR on an in-kernel socket). 0076: received frames into one cluster mbuf (mbuf_allocpacket gave a first mbuf of length 0 -> panic "Failed mbuf validity check: len -14"). Host side (Linux cdc_ether, interface `enp0s20f0u3u1`): `nmcli dev set IF managed no; sudo ip addr add 192.168.7.1/24 dev IF; sudo ip link set IF up`. Boot image `shim/out/shim-boot-0076s.img` (`sweetusb=2`). iOS itself does not see ue0 yet (configd needs an IONetworkInterface in IOKit).
+**рџЋ‰ USB networking works (boot 0076s, 18:24 local): `ping 192.168.7.2` from the PC answers in ~1 ms, 0 % loss (200-packet burst, 1500-byte frames, 512/1024-byte frames).** 0075: CDC-ECM function (bulk 0x81/0x01, interrupt 0x82 NETWORK_CONNECTION; host MAC 02:00:5e:77:ee:01) + kernel ethernet ifnet `ue0` (legacy output, header strip like if_fake) with 192.168.7.2/24 set from the kernel (proto_plumb + SIOCAIFADDR on an in-kernel socket). 0076: received frames into one cluster mbuf (mbuf_allocpacket gave a first mbuf of length 0 -> panic "Failed mbuf validity check: len -14"). Host side (Linux cdc_ether, interface `enp0s20f0u3u1`): `nmcli dev set IF managed no; sudo ip addr add 192.168.7.1/24 dev IF; sudo ip link set IF up`. Boot image `shim/out/shim-boot-0076s.img` (`sweetusb=2`). iOS itself does not see ue0 yet (configd needs an IONetworkInterface in IOKit).
 
 **USB device mode works (boot 0074s, 17:45 local): the host enumerates the phone at high speed as `1209:0001 ios-sweet "Sweet iOS (USB bring-up)"`.** 0072 read-only probe: ABL leaves the USB30_PRIM GDSC and all 7 USB clocks on, DWC3 v3.20a (GSNPSID 0x5533320a) in device mode (GCTL 0x00112000), halted (DCTL RUN_STOP 0, DSTS 0x00d3de04), event buffer still at ABL's 0xfdfc8000, QUSB2 PHY alive. 0073 (`sweetusb=2`): DCTL soft reset, own event buffer (polled, interrupt masked), ep0 DEPSTARTCFG/SETEPCONFIG/SETTRANSFRESOURCE, setup TRB, RUN_STOP; control-transfer state machine as Linux ep0.c; descriptors: vendor class, no data endpoints. It ran but no event came: **0074** forces the VBUS session in the Qualcomm wrapper (QSCRATCH 0xa6f8800: HS_PHY_CTRL |= UTMI_OTG_VBUS_VALID(20)|SW_SESSVLD_SEL(28), SS_PHY_CTRL |= LANE0_PWR_PRESENT(24), as Linux dwc3_qcom_vbus_override_enable) -> connect + enumeration. Image `shim/out/shim-boot-0074s.img`. Black Phone app: main thread waits in -[VMVoicemailManager fetchAccounts] (sync XPC; voicemail needs the modem).
 
 **Navigation works (boot 0071s on v14, log `logs/boot-0071s.txt`):** swipe up from the bottom edge returns to the home screen; app switcher works. Two fixes: **0070** pid_hibernate (syscall 435 was nosys on the macOS config -> SIGSYS killed SpringBoard in -[SBToAppsWorkspaceTransaction _didComplete] when an app left the foreground; the only CONFIG_EMBEDDED-only entry in syscalls.master); **0071** touches starting within 48 px of an edge carry kIOHIDDigitizerEventFromEdgeTip (UIKit `_UIEventHIDTouchEdgeTypeForHIDEvent` reads the digitizer EventMask 0xb0007 bits 0x800/0x1000/0x2000/0x40000). Diagnosed, not fixed: Settings (Preferences) SIGTRAP in PodcastsUI func_1cdc47c58: force-unwrap of `URL.volumeTotalCapacity` (nil on our HFS+ root). Phone/Photos/Messages show black (MobilePhone launches, no crash) - next: stack samples via boot-arg `sweetsample=MobilePhone,MobileSlideShow,MobileSMS,SpringBoard` (image `shim/out/shim-boot-0071s.img`).
 
-**🎉🎉 MILESTONE 2026-10-18 ~15:30 local: iOS 16.7 SPRINGBOARD HOME SCREEN ON THE PHONE** (boot `shim/out/shim-boot-0069s.img` = kernel 0069 + ADT `shim/out/sweet-0069hi.adt`, image **v14**; log `logs/boot-0069s-v14-HOMESCREEN.txt`). Home screen with a few apps, Settings opens, Control Center / lock screen / notification center work, touch + buttons work, 6 A55 cores (`cpus=6`), `sweetfb_noconsole=1 sweetfb_hz=30`. Known issue: cannot leave Settings (home gesture / AssistiveTouch home do nothing) - to investigate.
+**рџЋ‰рџЋ‰ MILESTONE 2026-10-18 ~15:30 local: iOS 16.7 SPRINGBOARD HOME SCREEN ON THE PHONE** (boot `shim/out/shim-boot-0069s.img` = kernel 0069 + ADT `shim/out/sweet-0069hi.adt`, image **v14**; log `logs/boot-0069s-v14-HOMESCREEN.txt`). Home screen with a few apps, Settings opens, Control Center / lock screen / notification center work, touch + buttons work, 6 A55 cores (`cpus=6`), `sweetfb_noconsole=1 sweetfb_hz=30`. Known issue: cannot leave Settings (home gesture / AssistiveTouch home do nothing) - to investigate.
 What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user client), 0059 iPhone X identity (hw.product etc.), 0060 SPMI keys + GENI touch, 0061 1125x2436 presented display, 0062 RPMh L11C touch power + IOPMPowerSource battery, 0063 GENI FIFO packing (Goodix GT9896), 0064 PRIV_WORK_INTERVAL grant (SpringBoard "Failed to create work interval"), 0065 SMP via PSCI (6 A55), 0066 crash map regions, 0067 console mute without cons_ops write, 0068 IOSurface lookup of an already-mapped surface returns base -1 (backboardd snapshot crash), 0069 UFS log flush 10 s. Image v13: CommCenter removed from launchd.plist, BKNoWatchdogs. **Image v14** = v13 + Setup skipped (`/var/mobile/Library/Preferences/com.apple.purplebuddy.plist` SetupDone/SetupFinishedAllSteps true, SetupVersion 11, daemonizeNeedsToRun false; purplebuddy.notbackedup mini-buddy flags false; managedconfiguration.notbackedup LockdownActivationIndicatesCloudConfigurationAvailable false; springboard MCForceShowCloudConfigurationUI false) + mobileactivationd data ark seeded (`/private/var/containers/Data/System/D90C94C4-F94E-4FCF-8A28-A93BE3846D8E/Library/internal/data_ark.plist`, -ActivationState Activated etc.) + MediaToolbox D22/D221/Default SubServerConfiguration StartRecorderServer=false (mediaserverd crash loop: portrait-filter prewarm called NULL GL). **Activation:** ADT /chosen certificate-production-status 0, effective-production-status-ap 0, certificate-security-mode 1, effective-security-mode-sep 1 -> mobileactivationd's native Hactivation branch (Codex `codex/activation/report.md`; alternative 4-byte daemon patch documented there). Fallback image v13; v12 deleted.
 
-**🎉 TOUCH WORKS (boot 0063u on image v13, 2026-10-18 ~13:15 local):** tapping (i) on Setup's Hello opens the device-info sheet; swipe-up is recognised (spinner, then back to Hello - under investigation). Chain: RPMh L11C vote (0062, `bsd/dev/sweet_rpmh.c`) -> GT9896 @0x5d on GENI SE7 (0063 fixed FIFO packing: register address went out byte-swapped) -> sweet_hid_touch -> SweetHIDTouch -> backboardd. Battery icon OK (0062 SweetBattery IOPMPowerSource, static 100 %). **Image v13** (= v12 + CommCenter jobs removed from launchd.plist + `BKNoWatchdogs`=true and `FBLaunchWatchdogExceptions{com.apple.purplebuddy:100}` in /var/mobile/Library/Preferences/com.apple.springboard.plist): Setup no longer killed by the scene-create watchdog (it blocked in CoreTelephony getSubscriptionInfo -> CommCenter, Codex `codex/setup/report.md`; that report also lists how to skip Setup: SetupDone/SetupFinishedAllSteps/SetupVersion=11 in com.apple.purplebuddy.plist + activation check). v9 deleted, fallback = v12. Input latency ~1 min with 1 CPU -> Codex task 11 = SMP via PSCI (`codex/smp/`).
+**рџЋ‰ TOUCH WORKS (boot 0063u on image v13, 2026-10-18 ~13:15 local):** tapping (i) on Setup's Hello opens the device-info sheet; swipe-up is recognised (spinner, then back to Hello - under investigation). Chain: RPMh L11C vote (0062, `bsd/dev/sweet_rpmh.c`) -> GT9896 @0x5d on GENI SE7 (0063 fixed FIFO packing: register address went out byte-swapped) -> sweet_hid_touch -> SweetHIDTouch -> backboardd. Battery icon OK (0062 SweetBattery IOPMPowerSource, static 100 %). **Image v13** (= v12 + CommCenter jobs removed from launchd.plist + `BKNoWatchdogs`=true and `FBLaunchWatchdogExceptions{com.apple.purplebuddy:100}` in /var/mobile/Library/Preferences/com.apple.springboard.plist): Setup no longer killed by the scene-create watchdog (it blocked in CoreTelephony getSubscriptionInfo -> CommCenter, Codex `codex/setup/report.md`; that report also lists how to skip Setup: SetupDone/SetupFinishedAllSteps/SetupVersion=11 in com.apple.purplebuddy.plist + activation check). v9 deleted, fallback = v12. Input latency ~1 min with 1 CPU -> Codex task 11 = SMP via PSCI (`codex/smp/`).
 
 **INPUT WORKS (boot 0060u on a freshly flashed v12, log `logs/boot-0060u.txt`):** power, volume up, volume down reach iOS (PMIC -> sweet_keys.c -> SweetHIDButtons -> backboardd). Power locks/unlocks (screen "off" shows the kernel console because the panel never really turns off). **Device identity fixed: iPhone X** (home indicator, Face-ID-style Setup). Earlier test (0059u, `sweethidtest=15` fake Home presses) advanced Setup from Hello to the language list.
 - **0058** HID: `iokit/Kernel/arm/hid/`: IOHIDEventServiceUserClient + IOHIDEventServiceQueue + IOHIDEvent compiled UNCHANGED from Apple IOHIDFamily-1915.140.3 (= exact version of the iOS 16.7 IOHIDLib, clone in `research/iohid-1915`) over our minimal IOHIDEventService (SweetHID.cpp: SweetHIDButtons consumer page 0x0C power 0x30 / vol 0xE9/0xEA / menu 0x40; SweetHIDTouch digitizer collections). C hooks `sweet_hid_key(key, down)` (0 power, 1 vol+, 2 vol-, 3 home) and `sweet_hid_touch(finger, down, x, y)`. HID logs go to IOLog. Boot-arg `sweethidtest=N` = fake Home press every N s.
@@ -1008,7 +1250,7 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
 4. Apply Codex 0058 (UFS speed), consider cpus>1, check whether installcoordinationd/mediaserverd loops are gone, analyse mobileactivationd.
 5. Hide kernel console over the GUI when not debugging: boot-arg sweetfb_noconsole=1 (but then panics are not on screen).
 
-- **🎉 MILESTONE: iOS GUI ON THE PHONE - Setup.app "Hello" screen (2026-10-17 ~21:30 UTC, boot 0057u on image v12).** Photo: `/run/media/dipa/android/ios-sweet-work/MILESTONE-setup-hello-2026-10-17.jpg` (animated "dobar d(an)" hello lettering, status bar "iPod" + battery icon, bottom "Pritisnite Home za otvaranje" = "Press Home to open" (locale hr), (i) button). Rendered by iOS 16.7 SpringBoard/Setup through CoreAnimation -> backboardd -> kernel IOSurface (IOCoreSurfaceRoot) -> kernel AppleCLCD swaps -> ABL panel memory. What made it: data migration finally skipped (v12: `LastSystemVersion` 20H392 in the plain `/var/mobile/Library/Preferences/com.apple.migration.plist`; ADT `/chosen/unique-chip-id` + `chip-id` for IOPlatformUUID), 0057 (no ext resolver -> ACL containers work), plus everything before (0046 display/IOSurface, 0050 Sandbox policy, display-scale 3, containers dirs, RENAME_SWAP, AKS 35/101, 10 Hz present).
+- **рџЋ‰ MILESTONE: iOS GUI ON THE PHONE - Setup.app "Hello" screen (2026-10-17 ~21:30 UTC, boot 0057u on image v12).** Photo: `/run/media/dipa/android/ios-sweet-work/MILESTONE-setup-hello-2026-10-17.jpg` (animated "dobar d(an)" hello lettering, status bar "iPod" + battery icon, bottom "Pritisnite Home za otvaranje" = "Press Home to open" (locale hr), (i) button). Rendered by iOS 16.7 SpringBoard/Setup through CoreAnimation -> backboardd -> kernel IOSurface (IOCoreSurfaceRoot) -> kernel AppleCLCD swaps -> ABL panel memory. What made it: data migration finally skipped (v12: `LastSystemVersion` 20H392 in the plain `/var/mobile/Library/Preferences/com.apple.migration.plist`; ADT `/chosen/unique-chip-id` + `chip-id` for IOPlatformUUID), 0057 (no ext resolver -> ACL containers work), plus everything before (0046 display/IOSurface, 0050 Sandbox policy, display-scale 3, containers dirs, RENAME_SWAP, AKS 35/101, 10 Hz present).
   **Missing (next work, in rough order):**
   - **Input: no touch, no power button, no volume buttons** (no HID drivers; backboardd looks for IOHIDDevice / HIDServiceSupport services). Setup is stuck on "Hello".
   - **Device identity: it thinks it is an iPod with a Home button** (status bar "iPod", "Press Home to open"): MobileGestalt has no product/model identity (no /product node, product-type, etc.) - give it iPhone10,3 / home-button-less (Face ID class) identity.
@@ -1123,7 +1365,7 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
 - **DECIDED (user, 2026-10-15): 64 GiB `iosroot` on LUN0 (sda), taken from userdata (wipes Android user data; Android/super kept).** Planned GPT (4K LBAs): userdata 0x2B8C00..0xD7D6FF (~43 GiB, keep type/unique GUIDs and attributes); iosroot 0xD7D700..0x1D7D6FF (0x1000000 blocks = 64 GiB, 1 MiB aligned); backup GPT area unchanged. Procedure: user backs up phone data -> boot OrangeFox recovery (adb) -> back up GPT (sgdisk --backup + raw dd of LBA 0-5 and last 6 blocks) to research/ -> sgdisk edit -> Format Data -> verify Android boots to setup. NOT EXECUTED YET.
 - **INTERNAL UFS WORKS FROM THE SHIM (read-only), user authorized internal-UFS approach incl. flashing (2026-10-15, "i allow everything").** Shim probe `shim/ufs.c` (commit `12ed3ed` + filter): ufshc@1d84000 is UFSHCI 2.1 (ver 0x210, cap 0x1587031F, 32 slots), ABL leaves HCE=1, HCS=0x10F (device present, lists ready, UIC ready); probe takes over UTRL at its own buffer (verifies UTRLBA readback before any doorbell), TEST UNIT READY/READ CAPACITY/READ(10) all succeed. LUN0 = 0x1D7D800 x 4 KiB (~126.6 GB), valid GPT (64 entries at LBA 2). Photos IMG_20261015_212916/213325/213429. Big LUN0 partitions (start in 4K LBAs / MiB): super 0xCA00/0x2200 (8.5 GiB), logdump 0x22CA00/64, minidump 0x230A00/128, rawdump 0x238A00/128, recovery 0x240C00/128, cache 0x248C00/384 ext4, exaid 0x260C00/384, cust 0x278C00/1024 ext4, **userdata 0x2B8C00/0x1AC4B MiB (~107 GiB), fs unreadable = encrypted (metadata encryption)**. cache..cust contiguous = only 1.75 GiB (too small for iOS ~10+ GiB). Plan needing user consent: shrink userdata in GPT (wipes Android data) and add an `iosroot` partition at the end of LUN0. LUNs 1-5 not listed yet (sdb..sdf backed up in backup/lun).
 - **fastboot limit measured (2026-10-15, read-only getvar):** `max-download-size: 805306368` (768 MiB); `max-fetch-size` unsupported; `is-userspace: no` (ABL fastboot). A `fastboot boot` image (shim+kernel+RAM disk) must be < 768 MiB, so the 2.5 GiB iOS shared cache cannot ride in the boot RAM disk even if XNU gets all RAM. Real userland needs storage access (UFS driver, or USB host) or a much smaller cache. Unlocking full RAM is still needed later (GUI).
-- **iOS 16 USERLAND SOURCE (Claude, 2026-10-15).** Chose **iPhone X (iPhone10,3/10,6, D22/D221AP)** iOS **16.7.16 (20H392)** over iPhone 8: same A11 (no PAC -> plain arm64, runs on Kryo 470/ARMv8.2), last iOS for A11; X userland is home-button-less and tall-screen (1125x2436 vs sweet 1080x2400), better fit for later GUI. Note the X has its OWN SystemOS cryptex (different digest from iPhone 8's). IPSW URL in `research/ipsw-x/URL.txt` (+ BuildManifest). Images on the user's external SSD (NOT in git, do not format that disk: it holds the user's photos): `/run/media/dipa/android/ios-sweet-ipsw/iPhone10,3_16.7.16_20H392/` — `087-86593-047.dmg` = Cryptex1,SystemOS (2,743,074,816 B), `087-86698-044.dmg` = OS rootfs (4,730,814,044 B), both zip CRC-32 verified, plus Firmware/*.root_hash/.trustcache/.mtree. AppOS cryptex is 087-86715-047.dmg (10 MB, same as iPhone 8).
+- **iOS 16 USERLAND SOURCE (Claude, 2026-10-15).** Chose **iPhone X (iPhone10,3/10,6, D22/D221AP)** iOS **16.7.16 (20H392)** over iPhone 8: same A11 (no PAC -> plain arm64, runs on Kryo 470/ARMv8.2), last iOS for A11; X userland is home-button-less and tall-screen (1125x2436 vs sweet 1080x2400), better fit for later GUI. Note the X has its OWN SystemOS cryptex (different digest from iPhone 8's). IPSW URL in `research/ipsw-x/URL.txt` (+ BuildManifest). Images on the user's external SSD (NOT in git, do not format that disk: it holds the user's photos): `/run/media/dipa/android/ios-sweet-ipsw/iPhone10,3_16.7.16_20H392/` вЂ” `087-86593-047.dmg` = Cryptex1,SystemOS (2,743,074,816 B), `087-86698-044.dmg` = OS rootfs (4,730,814,044 B), both zip CRC-32 verified, plus Firmware/*.root_hash/.trustcache/.mtree. AppOS cryptex is 087-86715-047.dmg (10 MB, same as iPhone 8).
   - Images are raw APFS; files use LZBITMAP (decmpfs type 14). 7z cannot decode. Tools: `ipsw` 3.1.738 (AUR ipsw-bin, user-approved) needs apfs-fuse on Linux; **apfs-fuse** built in user space (system cmake broken: cmake 4.4.4 wants libjsoncpp.so.27, jsoncpp 1.9.6 installed = partial upgrade, NOT fixed) with pip cmake + `-DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DCMAKE_CXX_FLAGS="-include cstdint"`, installed to `~/.local/bin/apfs-fuse` (+apfs-dump-quick). Mount via a comma-free symlink (apfs-fuse splits options on ',' in `iPhone10,3`; exFAT has no symlinks -> put link elsewhere): `apfs-fuse LINK/087-86698-044.dmg MNT` -> `MNT/root/...`; unmount `fusermount3 -u MNT`.
   - Verified from headers: `dyld_shared_cache_arm64` magic `dyld_v1   arm64`; `/sbin/launchd`, `/usr/lib/dyld` = cputype 0x100000c subtype 0 (plain arm64). libSystem exists only inside the cache.
   - **BLOCKER for real userland via RAM disk:** shared cache = 3.10 GiB in 44 files (~2.5 GiB without the 592 MB `.symbols`), but the kernel manages only 1.20 GiB (0xb0000000..0xfd000000). Options: (A) give XNU the phone's full ~6 GB (banks 0x80000000+2G and 0x100000000+0xfcc00000, carve-out holes need pmap support) AND check fastboot max-download-size for a multi-GB boot image; (B) storage driver (Qualcomm UFS) to read a root from flash (no flashing allowed: would need a file/partition strategy); (C) run against individual dylibs extracted from the cache (uncertain).

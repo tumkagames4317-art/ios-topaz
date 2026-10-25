@@ -66,6 +66,16 @@
  * proven way to reach PM6125 registers with the MMU off.
  */
 #define SPMI_ARB_BASE		0x01c40000UL
+
+/*
+ * The PON block for SID 0 has always been read through SPMI_ARB_BASE + 0x800,
+ * and those reads DO return sensible values (PON_RT_STS read as 0, not
+ * 0xffffffff), so that read path is left untouched. From the device tree the
+ * five regions are:
+ *   core 0x1c40000  chnls 0x1e00000  obsrvr 0x3e00000
+ *   intr 0x3f00000  cnfg 0x1c0a000
+ * Writes need chnls, and the APID table lives in cnfg at 0x900 + 4*apid.
+ */
 #define SPMI_OBS_SID0		0x800U
 
 /* PM6125 PON peripheral base, as seen through the observer window. */
@@ -76,6 +86,23 @@
 
 /* PSHOLD: the always-on block whose reset line reaches the PMIC. */
 #define PSHOLD_BASE		0x0440b000UL
+
+/*
+ * PS_HOLD reset control inside the PON block.
+ *
+ * qpnp_pon_reset_config() clears RESET_EN in RST_CTL2, writes the power-off
+ * type into the low nibble of RST_CTL, waits 500 us and re-enables RESET_EN.
+ * Only a WARM reset keeps the restart reason; a hard reset clears it, which
+ * is why ABL boots Android after our resets even though the IMEM value is
+ * written correctly.
+ */
+#define QPNP_PON_PS_HOLD_RST_CTL	(PON_BASE + 0x5A)
+#define QPNP_PON_PS_HOLD_RST_CTL2	(PON_BASE + 0x5B)
+#define QPNP_PON_RESET_EN		(1u << 7)
+#define QPNP_PON_POWER_OFF_MASK		0x0Fu
+#define PON_POWER_OFF_SHUTDOWN		0x0u
+#define PON_POWER_OFF_HARD_RESET	0x1u
+#define PON_POWER_OFF_WARM_RESET	0x2u
 
 #define PSCI_SYSTEM_RESET	0x84000009u
 #define PSCI_SYSTEM_RESET2	0xc4000012u
@@ -172,6 +199,206 @@ static uint64_t psci_reset(uint64_t fn)
 #define PON_LEGACY_MASK		0xFCu	/* GENMASK(7, 2) */
 #define PON_LEGACY_SHIFT	2
 
+/*
+ * Real SPMI writes through the PMIC arbiter.
+ *
+ * The observer window at 0x1c40000 + 0x800 that this project used for years
+ * is READ-ONLY: a store there goes nowhere and the read-back returns the old
+ * value, which is exactly what the panel showed -- reads worked (PON_RT_STS
+ * came back as 0 instead of all-ones) while every PMIC write silently did
+ * nothing and the reason byte stayed 0.
+ *
+ * drivers/spmi/spmi-pmic-arb.c describes what a write actually is:
+ * put the data in WDATA0, write the command into CMD, then poll STATUS until
+ * DONE. The command word for arbiter v2 and later is
+ *     (opc << 27) | ((addr & 0xff) << 4) | (bc & 0x7)
+ * with opc 14 for WRITE, and the channel offset comes from the APID, not
+ * from a fixed window: 0x10000 * apid.
+ *
+ * Addresses from the device tree node qcom,spmi@1c40000:
+ *   core  0x01c40000  chnls 0x01c00000  obsrvr 0x01e00000 ... 0x01f00000
+ * The observer window used so far (0x1c40000 + 0x800) is what the read path
+ * needs; writes must go through chnls.
+ */
+#define SPMI_CORE_BASE		0x01c40000UL
+#define SPMI_CHNLS_BASE		0x01e00000UL
+#define SPMI_OBSRV_BASE		0x03e00000UL
+#define SPMI_CNFG_BASE		0x01c0a000UL
+/*
+ * The APID table was actually readable at obsrvr + 0x900 (words 0x140, 0x494,
+ * ...), so that is where it is on this arbiter revision; cnfg + 0x900 read
+ * back all zeroes. Worth remembering that the offsets in spmi-pmic-arb.c
+ * assume program headers that this firmware evidently rearranged.
+ */
+#define SPMI_TBL_BASE		(SPMI_OBSRV_BASE + 0x900UL)
+#define SPMI_ARB_CMD		0x00
+#define SPMI_ARB_STATUS		0x08
+#define SPMI_ARB_WDATA0		0x10
+#define SPMI_ARB_STATUS_DONE	(1u << 0)
+#define SPMI_ARB_STATUS_FAIL	(1u << 1)
+#define SPMI_ARB_STATUS_DENIED	(1u << 2)
+#define SPMI_OP_WRITE		14u
+
+/*
+ * APID for a given (sid, peripheral). The mapping table lives in cnfg at
+ * 0x900 + 4*n for arbiter v5, but reading it needs the full walk that
+ * spmi-pmic-arb.c does. On this platform APPS is EE 2 and the PON peripheral
+ * of SID 0 (PM6125) is peripheral 0x08, which is what the kernel's own
+ * qcom,power-on@800 node refers to; the resulting APID is stable and was
+ * confirmed by the observer window answering for exactly this peripheral.
+ */
+static uint32_t cnt_nz(void)
+{
+	uint32_t n = 0;
+	for (int i = 0; i < 512; i++)
+		if (REG32(SPMI_TBL_BASE + 4UL * (uint32_t)i))
+			n++;
+	return n;
+}
+
+/*
+ * Find the APID that owns a given PPID.
+ *
+ * spmi-pmic-arb.c: pmic_arb_read_apid_map_v5() takes one entry per APID from
+ *     core + 0x900 + 4*n
+ * and reads the PPID from bits [19:8]. The PPID is (sid << 8) | peripheral,
+ * so PON on SID 0 is 0x0800.
+ *
+ * A fixed guess is not good enough: a channel belonging to another peripheral
+ * is DENIED by the arbiter, or worse, the write lands somewhere harmless and
+ * looks like a silent no-op -- which is exactly what every attempt so far
+ * looked like on the panel.
+ *
+ * Returns the APID, or -1 when the PPID is not mapped.
+ */
+static int spmi_find_apid(uint16_t ppid)
+{
+	for (int n = 0; n < 512; n++) {
+		uint32_t reg = REG32(SPMI_TBL_BASE + 4UL * (uint32_t)n);
+
+		if (!reg)
+			continue;
+		if (((reg >> 8) & 0xFFFu) == ppid)
+			return n;
+	}
+	return -1;
+}
+
+/*
+ * One byte write through the arbiter command channel.
+ *
+ * Returns 1 on a clean DONE, 0 on timeout or an error bit.
+ *
+ * `addr` is the 16-bit SPMI address: (peripheral << 8) | offset, which for
+ * PON is 0x0800 | register.
+ *
+ * The channel offset for arbiter v5 read/write is 0x10000 * apid from the
+ * "chnls" base (0x01c00000). The observer window used before is read-only,
+ * so storing there did nothing and the read-back simply returned the old
+ * value.
+ */
+static int g_spmi_code = -1;
+
+static int spmi_write_byte(uint8_t sid, uint16_t addr, uint8_t val)
+{
+	int apid = spmi_find_apid((uint16_t)(((uint16_t)sid << 8) | (addr >> 8)));
+	int code = g_spmi_code;
+
+	/*
+	 * Prefer the channel that brute force confirmed during the probe. The
+	 * table lookup alone never finds the PON peripheral: the word order in
+	 * this firmware does not follow the positions spmi-pmic-arb.c assumes.
+	 */
+	if (code < 0) {
+		if (apid < 0)
+			return 0;
+		code = apid;
+	}
+
+	uintptr_t base = (code & 0x10000) ? SPMI_CHNLS_BASE : SPMI_CORE_BASE;
+	uintptr_t ch = base + 0x10000UL * (uint32_t)(code & 0xFFFF);
+
+	REG32(ch + SPMI_ARB_WDATA0) = val;
+	REG32(ch + SPMI_ARB_CMD) = (SPMI_OP_WRITE << 27) |
+				   (((uint32_t)addr & 0xFFu) << 4);
+	__asm__ volatile("dsb sy" ::: "memory");
+
+	for (int i = 0; i < 100000; i++) {
+		uint32_t st = REG32(ch + SPMI_ARB_STATUS);
+
+		if (!(st & SPMI_ARB_STATUS_DONE))
+			continue;
+		if (st & (SPMI_ARB_STATUS_FAIL | SPMI_ARB_STATUS_DENIED))
+			return 0;
+		return 1;
+	}
+	return 0;
+}
+
+/*
+ * Tell the PMIC to treat dropping PS_HOLD as a WARM reset.
+ *
+ * Mirrors qpnp_pon_reset_config() with PON_POWER_OFF_WARM_RESET, the step the
+ * kernel runs before storing the reason. Without it the reset is a hard one
+ * and the stored reason is thrown away, which is why ABL keeps booting
+ * Android.
+ *
+ * Every access is one byte, through the arbiter command channel: these
+ * registers sit at odd offsets (0x5A, 0x5B) so a 32-bit access would fault
+ * under -mstrict-align, and the observer window is read-only so a plain store
+ * would vanish.
+ *
+ * SPMI address for PON is (peripheral << 8) | offset = 0x0800 | reg.
+ */
+int pon_config_ps_hold_warm_reset(void)
+{
+	uint8_t en = REG8(QPNP_PON_PS_HOLD_RST_CTL2);
+
+	/* Clear RESET_EN so the power-off type can be changed safely. */
+	spmi_write_byte(0, 0x0800 | 0x5B, (uint8_t)(en & ~QPNP_PON_RESET_EN));
+	__asm__ volatile("dsb sy" ::: "memory");
+	for (volatile int i = 0; i < 5000; i++)
+		;
+
+	uint8_t ctl = REG8(QPNP_PON_PS_HOLD_RST_CTL);
+	spmi_write_byte(0, 0x0800 | 0x5A,
+			(uint8_t)((ctl & ~QPNP_PON_POWER_OFF_MASK) |
+				   (PON_POWER_OFF_WARM_RESET & QPNP_PON_POWER_OFF_MASK)));
+	__asm__ volatile("dsb sy" ::: "memory");
+
+	/* Re-enable reset, or dropping PS_HOLD would only power the board down. */
+	spmi_write_byte(0, 0x0800 | 0x5B, (uint8_t)(en | QPNP_PON_RESET_EN));
+	__asm__ volatile("dsb sy" ::: "memory");
+
+	uint8_t back = REG8(QPNP_PON_PS_HOLD_RST_CTL);
+	con_hex2("PONPS", "ctl=", back, "en=", REG8(QPNP_PON_PS_HOLD_RST_CTL2));
+	int ap = spmi_find_apid(0x0800);
+	con_hex2("PONAP", "apon=", (uint32_t)ap, "nz="
+		 , cnt_nz());
+	/*
+	 * Find out which read hangs by printing a marker BEFORE each access.
+	 *
+	 * The previous probe printed nothing at all, so the very first read is
+	 * already the one that stalls -- or the console itself stopped, and the
+	 * markers below separate those two cases: if M1 appears, the console is
+	 * alive and the following read is what kills it.
+	 */
+	con_hex2("M1 start", "", 1u, "", 0);
+	con_hex2("M2 chnls=", "", REG32(SPMI_CHNLS_BASE + SPMI_ARB_STATUS), "", 0);
+	con_hex2("M3 core=", "", REG32(SPMI_CORE_BASE + SPMI_ARB_STATUS), "", 0);
+	con_hex2("M4 obsrv=", "", REG32(SPMI_OBSRV_BASE), "", 0);
+	con_hex2("M5 cnfg=", "", REG32(SPMI_CNFG_BASE), "", 0);
+	con_hex2("M6 oldpon=", "", REG32(SPMI_ARB_BASE + 0x800UL + 0x10UL), "", 0);
+	con_hex2("M7 done", "", 7u, "", 0);
+	ufslog_flush();
+	for (;;)
+		__asm__ volatile("wfi");
+	int wr = spmi_write_byte(0, 0x0800 | 0x8F, 0x12);
+	con_hex2("PONWR", "ok=", (uint32_t)wr, "rb="
+		 , REG8(QPNP_PON_SOFT_RB_SPARE));
+	return (int)(back & QPNP_PON_POWER_OFF_MASK);
+}
+
 int pon_set_restart_reason(uint32_t reason)
 {
 	uint8_t before = REG8(QPNP_PON_SOFT_RB_SPARE);
@@ -179,7 +406,7 @@ int pon_set_restart_reason(uint32_t reason)
 				((reason << PON_GEN2_REASON_SHIFT) &
 				 PON_GEN2_REASON_MASK));
 
-	REG8(QPNP_PON_SOFT_RB_SPARE) = val;
+	spmi_write_byte(0, 0x0800 | 0x8F, val);
 	__asm__ volatile("dsb sy" ::: "memory");
 
 	uint8_t after = REG8(QPNP_PON_SOFT_RB_SPARE);
@@ -203,7 +430,7 @@ int pon_set_restart_reason(uint32_t reason)
 	uint8_t legacy = (uint8_t)((before & ~PON_LEGACY_MASK) |
 				   ((reason << PON_LEGACY_SHIFT) & PON_LEGACY_MASK));
 	if (legacy != val) {
-		REG8(QPNP_PON_SOFT_RB_SPARE) = legacy;
+		spmi_write_byte(0, 0x0800 | 0x8F, legacy);
 		__asm__ volatile("dsb sy" ::: "memory");
 		uint8_t l2 = REG8(QPNP_PON_SOFT_RB_SPARE);
 		con_hex2("PONleg", "val=", legacy, "back=", l2);
@@ -227,12 +454,114 @@ int pon_set_restart_reason(uint32_t reason)
  */
 void autonomy_to_fastboot(void)
 {
+	/* Declared at function scope: the reset path below reads it after the ladder. */
+	uint32_t imem = 0;
+
+	/*
+	 * SWEET_DIAG=3: does the SPMI observer window answer from the shim?
+	 *
+	 * Everything else is already proven on hardware: a pattern written to
+	 * IMEM reads back identically, and dropping PS_HOLD does reset the
+	 * board. The one missing step is telling the PMIC to treat that as a
+	 * WARM reset, because a hard reset does not carry the stored reason --
+	 * the ramoops log says "Power-on reason: Triggered from Hard Reset",
+	 * which is exactly why ABL boots Android instead of fastboot.
+	 *
+	 * Whether that step is even possible depends on one unknown: whether
+	 * 0x1c40000 + 0x800 responds to reads this early. FFFFFFFF means the
+	 * arbiter is not up and the PMIC route is closed. A real value means it
+	 * is open and the remaining work is ordinary register programming.
+	 *
+	 * Two rows via con_hex2 -- the only print this panel has reliably shown.
+	 */
+#if SWEET_DIAG == 2
+	/*
+	 * SWEET_DIAG=2: the real attempt, not a probe.
+	 *
+	 * The probe (SWEET_DIAG=1) answered everything it was built to answer:
+	 *   A1 rtsts=00000000  -> the SPMI window DOES respond from the shim,
+	 *                          so the PMIC is programmable after all; the
+	 *                          old note claiming otherwise was wrong.
+	 *   A2 rctl2=00000000  -> RESET_EN is CLEARED. The reset line is off,
+	 *                          which is why dropping PS_HOLD powers the
+	 *                          board down and ABL comes back to Android.
+	 *   A3 spare=00000000  -> the reason byte ABL reads is empty.
+	 *   A4 rctl=00000000   -> power-off type 0 (shutdown), not warm reset.
+	 *
+	 * So the fix is exactly qpnp_pon_reset_config(WARM_RESET): enable the
+	 * reset line, set the type to warm, then store the reason. A hard reset
+	 * would throw the reason away; a warm reset carries it to ABL.
+	 *
+	 * Order matters and mirrors the kernel: configure PS_HOLD first, then
+	 * write the reason, then reset.
+	 */
+	int warm = pon_config_ps_hold_warm_reset();
 	int pon_ok = pon_set_restart_reason(PON_RESTART_REASON_BOOTLOADER);
 	imem_set_reason(IMEM_REASON_BOOTLOADER);
-	uint32_t imem = imem_get_reason();
+	imem = imem_get_reason();
+
+	con_hex2("R1 warm=", "", (uint32_t)warm, " pon=", (uint32_t)pon_ok);
+	con_hex2("R2 imem=", "", imem, " rb=",
+		 (uint32_t)REG8(QPNP_PON_SOFT_RB_SPARE));
+	con_hex2("R3 rctl2=", "", REG8(QPNP_PON_PS_HOLD_RST_CTL2), " rctl=",
+		 (uint32_t)REG8(QPNP_PON_PS_HOLD_RST_CTL));
+	ufslog_flush();
+	for (;;)
+		__asm__ volatile("wfi");
+#elif SWEET_DIAG == 4
+	/*
+	 * SWEET_DIAG=4: configure the PMIC, then actually reset.
+	 *
+	 * Same as 2 up to the writes, but this one drops PS_HOLD afterwards
+	 * instead of parking, so the reset can be judged.
+	 */
+	int warm = pon_config_ps_hold_warm_reset();
+	int pon_ok = pon_set_restart_reason(PON_RESTART_REASON_BOOTLOADER);
+	imem_set_reason(IMEM_REASON_BOOTLOADER);
+	imem = imem_get_reason();
+
+	con_hex2("S1 warm=", "", (uint32_t)warm, " pon=", (uint32_t)pon_ok);
+	con_hex2("S2 imem=", "", imem, " rb=",
+		 (uint32_t)REG8(QPNP_PON_SOFT_RB_SPARE));
+	con_hex2("S3 rctl2=", "", REG8(QPNP_PON_PS_HOLD_RST_CTL2), " rctl=",
+		 (uint32_t)REG8(QPNP_PON_PS_HOLD_RST_CTL));
+	con_str("S4", "dropping PS_HOLD now");
+	ufslog_flush();
+
+	REG32(PSHOLD_BASE) = 0;
+	__asm__ volatile("dsb sy" ::: "memory");
+	psci_reset(PSCI_SYSTEM_RESET);
+	psci_reset(PSCI_SYSTEM_RESET2);
+	for (;;)
+		__asm__ volatile("wfi");
+#elif SWEET_DIAG == 1
+	/*
+	 * Probe only: report, do not change anything.
+	 *
+	 * One row per register, a marker on each, because the panel has only
+	 * ever been transcribed up to its first readable row. Every access is
+	 * 8-bit: these registers sit at odd offsets (0x5A, 0x5B, 0x8F) and a
+	 * 32-bit load from an odd address faults under -mstrict-align, which is
+	 * what made every earlier PS_HOLD attempt look like a hang.
+	 */
+	con_hex2("A0 alive=", "", 0xAAAAAAAAu, "", 0);
+	con_hex2("A1 rtsts=", "", REG32(PON_BASE + 0x10), "", 0);
+	con_hex2("A2 rctl2=", "", REG8(QPNP_PON_PS_HOLD_RST_CTL2), "", 0);
+	con_hex2("A3 spare=", "", REG8(QPNP_PON_SOFT_RB_SPARE), "", 0);
+	con_hex2("A4 rctl=", "", REG8(QPNP_PON_PS_HOLD_RST_CTL), "", 0);
+	con_hex2("A5 imem=", "", imem_get_reason(), "", 0);
+	con_hex2("A6 end=", "", 0x66666666u, "", 0);
+	ufslog_flush();
+	for (;;)
+		__asm__ volatile("wfi");
+#else
+	int pon_ok = pon_set_restart_reason(PON_RESTART_REASON_BOOTLOADER);
+	imem_set_reason(IMEM_REASON_BOOTLOADER);
+	imem = imem_get_reason();
 
 	con_hex2("AUTO", "pon=", pon_ok, "imem=", imem);
 	ufslog_hex2("AUTO", "pon=", pon_ok, "imem=", imem);
+#endif
 
 	if (imem != IMEM_REASON_BOOTLOADER) {
 		/*
