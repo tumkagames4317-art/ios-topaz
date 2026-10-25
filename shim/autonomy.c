@@ -298,6 +298,64 @@ static int spmi_find_apid(uint16_t ppid)
  * value.
  */
 static int g_spmi_code = -1;
+static uint32_t g_v1_val;
+static uint32_t g_v1_val2;
+
+/*
+ * Command-channel access in the v1-compatible layout.
+ *
+ * The arbiter reports version 0x50010000 but answers on the v1 channel at
+ * core + 0x800 (its STATUS and WDATA0 read back sensibly), while the v5
+ * wr_base at 0x1e00000 stalls the bus outright. So the v1 protocol is what
+ * this firmware actually exposes, and it is the only way in.
+ */
+#define SPMI_V1_CH	(SPMI_CORE_BASE + 0x800UL)
+
+#define SPMI_OP_READ	15u
+
+/*
+ * One transaction. `write` selects the opcode; the value to store comes from
+ * *val, and a read result is returned through it.
+ *
+ * The command word is (opc << 27) | ((sid & 0xf) << 20) | (addr << 4) | (bc & 7)
+ * where addr is the 16-bit (peripheral << 8) | offset.
+ */
+static int spmi_v1_xfer(int write, uint8_t sid, uint16_t addr, uint32_t *val)
+{
+	uintptr_t ch = SPMI_V1_CH;
+
+	/* Clear any stale completion before starting. */
+	REG32(ch + 0x08) = 0;
+	__asm__ volatile("dsb sy" ::: "memory");
+
+	if (write)
+		REG32(ch + 0x10) = *val;
+
+	REG32(ch + 0x00) = ((write ? 14u : SPMI_OP_READ) << 27) |
+			   (((uint32_t)sid & 0xFu) << 20) |
+			   (((uint32_t)addr & 0xFFFFu) << 4) |
+			   0u;
+	__asm__ volatile("dsb sy" ::: "memory");
+
+	for (int i = 0; i < 100000; i++) {
+		uint32_t st = REG32(ch + 0x08);
+
+		if (!(st & 1u))
+			continue;
+		if (st & 0x6u)
+			return 0;
+		if (!write)
+			*val = REG32(ch + 0x18) & 0xFFu;
+		return 1;
+	}
+	return 0;
+}
+
+static int spmi_v1_read(uint8_t sid, uint16_t addr, uint32_t *out)
+{
+	*out = 0;
+	return spmi_v1_xfer(0, sid, addr, out);
+}
 
 static int spmi_write_byte(uint8_t sid, uint16_t addr, uint8_t val)
 {
@@ -376,20 +434,37 @@ int pon_config_ps_hold_warm_reset(void)
 	con_hex2("PONAP", "apon=", (uint32_t)ap, "nz="
 		 , cnt_nz());
 	/*
-	 * Find out which read hangs by printing a marker BEFORE each access.
+	 * The arbiter answers in its v1-compatible layout, not the v5 one.
 	 *
-	 * The previous probe printed nothing at all, so the very first read is
-	 * already the one that stalls -- or the console itself stopped, and the
-	 * markers below separate those two cases: if M1 appears, the console is
-	 * alive and the following read is what kills it.
+	 * Reading core+0x08 gives 0x00000000 (STATUS, idle) and core+0x10 gives
+	 * 0x00001043 -- those are the per-EE channel's STATUS and WDATA0, the
+	 * same registers spmi-pmic-arb.c uses when it treats the arbiter as v1
+	 * (wr_base == rd_base == core). chnls (0x1e00000) stalls the bus, so the
+	 * v5 wr_base is unusable here.
+	 *
+	 * That also explains a long-standing illusion: reading core+0x800+0x10
+	 * and calling it PON_RT_STS was reading WDATA0 of the channel, which is
+	 * zero whenever no transaction is in flight. It looked like a live PMIC
+	 * read because zero is a plausible status value.
+	 *
+	 * v1 channel for EE 0 lives at core + 0x800, with
+	 *   CMD +0x00  CONFIG +0x04  STATUS +0x08  WDATA0 +0x10  RDATA0 +0x18
+	 * and the command word is
+	 *   (opc << 27) | ((sid & 0xf) << 20) | (addr << 4) | (bc & 0x7)
 	 */
-	con_hex2("M1 start", "", 1u, "", 0);
-	con_hex2("M2 chnls=", "", REG32(SPMI_CHNLS_BASE + SPMI_ARB_STATUS), "", 0);
-	con_hex2("M3 core=", "", REG32(SPMI_CORE_BASE + SPMI_ARB_STATUS), "", 0);
-	con_hex2("M4 obsrv=", "", REG32(SPMI_OBSRV_BASE), "", 0);
-	con_hex2("M5 cnfg=", "", REG32(SPMI_CNFG_BASE), "", 0);
-	con_hex2("M6 oldpon=", "", REG32(SPMI_ARB_BASE + 0x800UL + 0x10UL), "", 0);
-	con_hex2("M7 done", "", 7u, "", 0);
+	con_hex2("Q1 st=", "", REG32(SPMI_V1_CH + 0x08), " cfg=",
+		 REG32(SPMI_V1_CH + 0x04));
+	con_hex2("Q2 cmd=", "", REG32(SPMI_V1_CH + 0x00), " rd=",
+		 REG32(SPMI_V1_CH + 0x18));
+
+	/* Read PON_RT_STS (sid 0, addr 0x0810) properly through the channel. */
+	int rok = spmi_v1_read(0, 0x0810, &g_v1_val);
+	con_hex2("Q3 rok=", "", (uint32_t)rok, " val=", g_v1_val);
+
+	/* Read the spare byte ABL uses for the restart reason. */
+	int rok2 = spmi_v1_read(0, 0x088F, &g_v1_val2);
+	con_hex2("Q4 rok2=", "", (uint32_t)rok2, " spare=", g_v1_val2);
+	con_hex2("Q5 done", "", 5u, "", 0);
 	ufslog_flush();
 	for (;;)
 		__asm__ volatile("wfi");
