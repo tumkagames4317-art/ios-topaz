@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Persistent console log written straight into userdata over UFS.
  *
  * Why: on ginkgo the panic screen flashes for half a second, so every
@@ -83,12 +83,12 @@ void ufslog_init(void)
 		hb[i] = hd[(host >> (4 * (15 - i))) & 0xf];
 	hb[16] = 0;
 	ufslog_write("---- shim log start ----\n");
-	ufslog_write("host_ok=");
+	ufslog_write("emmc_ok=");
 	ufslog_write(hb);
 	ufslog_write("\n");
 
-	con_hex2("UFSp", "wr=", wr, "rd=", rd);
-	con_str("UFSp", same ? "write verified" : "write NOT verified");
+	con_hex2("EMMCp", "wr=", wr, "rd=", rd);
+	con_str("EMMCp", same ? "write verified" : "write NOT verified");
 	ufslog_ready_flag = same ? 1 : 0;
 	ufslog_write("probe wr=");
 	{ char b[9]; for (int i = 0; i < 8; i++) b[i] = hd[(wr >> (4*(7-i))) & 0xf]; b[8]=0;
@@ -199,3 +199,4 @@ void ufslog_panic(uint64_t slot, const char *stage, uint64_t esr, uint64_t elr,
 	ufslog_write("==== END ====\n");
 	ufslog_flush();
 }
+

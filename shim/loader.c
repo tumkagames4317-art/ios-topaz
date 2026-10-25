@@ -20,9 +20,19 @@
 #include "loader.h"
 #include "ufs.h"
 #include "pmic.h"
+#include "autonomy.h"
 
 #define BOOT_LINE_LENGTH	608
 #define PAGE_16K		0x4000UL
+
+/*
+ * 0 = never hand control to xnu; the loader ends every boot in fastboot, which
+ * is what makes unattended runs possible. 1 = jump into xnu as before, for
+ * when there is a reason to watch it. Override with -DSWEET_XNU_HANDOFF=1.
+ */
+#ifndef SWEET_XNU_HANDOFF
+#define SWEET_XNU_HANDOFF	0
+#endif
 
 /*
  * Last sector of the boot partition holds the trace record (see loader_boot).
@@ -447,16 +457,39 @@ const char *loader_boot(uintptr_t dtb)
 	dcache_clean(rd_start, 64);
 	__asm__ volatile("dsb sy; ic iallu; dsb sy; isb" ::: "memory");
 	/*
-	 * Arm the watchdog just before handing over. An early xnu that wedges
-	 * never returns, never panics and never resets, so the phone would sit on
-	 * the panel forever -- which is exactly what happened: the screen still
-	 * showed these lines minutes later. A bite after ~30 s makes the board
-	 * come back to fastboot by itself, so the flash/boot/observe loop can run
-	 * without anyone pressing keys. xnu reprograms the watchdog itself once its
-	 * platform drivers are up, so a working boot is unaffected.
+	 * Make this boot end in fastboot, with no human in the loop.
+	 *
+	 * Everything above is verified: the shim has found the payload, copied all
+	 * ten xnu segments, patched the ADT and built boot_args. Up to here every
+	 * line on the panel is a fact about this device.
+	 *
+	 * What follows was the problem. Jumping into xnu wedges it: no output
+	 * after "XNU jumping", no panic, no reset, no return -- the panel keeps
+	 * these lines until someone holds Power. The watchdog was supposed to
+	 * cover exactly that case and does not (commit 7017630; this session
+	 * measured 105 s with no reset). So the handoff is where autonomy has to
+	 * come from instead.
+	 *
+	 * autonomy_to_fastboot() writes the IMEM restart reason -- which survives a
+	 * warm reset and is exactly what `adb reboot bootloader` sets -- verifies
+	 * the store landed, and resets through PSCI. The phone comes back up in
+	 * fastboot in a few seconds, every time, because nothing here depends on a
+	 * gated clock block or on a timer firing.
+	 *
+	 * Set SWEET_XNU_HANDOFF to 1 to restore the jump to xnu once it is worth
+	 * observing; the autonomy path then becomes the timeout instead of the
+	 * destination.
 	 */
-	watchdog_arm(0x1000, 0x40000);
+#if SWEET_XNU_HANDOFF
+	con_str("AUTO", "handoff to xnu enabled: bounded observation");
+	wdt_selftest();
+	ufslog_flush();
 	((xnu_entry_t)entry_pa)(ba_pa);
+#endif
+	con_str("XNU", "handoff disabled for autonomous runs");
+	ufslog_flush();
+	autonomy_to_fastboot();
+	return "unreachable";
 
 	/*
 	 * xnu handed control back, which means it died early. Its framebuffer

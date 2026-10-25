@@ -1,3 +1,256 @@
+## >>> HANDOFF 2026-10-25 14:25 (ginkgo): eMMC driver replaces the UFS log path <<<
+
+`shim/emmc.c` is new: a minimal SDHCI-v5 PIO driver for `sdhci@4744000` that
+provides the **same block interface** `ufslog.c` already uses, so the log now
+has a working backing store on this phone for the first time.
+
+What it does: power on, software reset, internal clock at 400 kHz, CMD0/1/2/3/7,
+verify transfer state with CMD13, CMD16 for 512-byte blocks, then single-block
+PIO reads/writes through `SDHCI_BUFFER`. No DMA, no high-speed timing, no
+tuning -- the log does not need speed and every one of those is a way to fail.
+
+Two details that would otherwise be silent bugs:
+
+1. **Block-size translation.** `ufslog` works in 4096-byte blocks (it was
+   written for UFS); this card is driven in 512-byte blocks. `write_blocks()`
+   multiplies the LBA by 8 and issues 8 transfers per caller block. Without
+   that, a 4096-byte buffer written as one 512-byte block loses 7/8 of every
+   log line *while reporting success* -- exactly the class of bug that cost
+   this project a night.
+2. **Read-back verification.** `ufslog_init()` already writes a probe block and
+   reads it back; the eMMC path is proven by that on every boot, and the result
+   is printed as `EMMCp wr=.. rd=.. write verified`.
+
+`shim.c` now calls `test_emmc()` instead of `test_ufs()` and prints
+`GATE emmc=0/1 log=0/1`. `build-shim.ps1` links `emmc.c` when it exists and
+falls back to `ufs.c`, because both define `ufs_ready`/`write_blocks`.
+
+Read the log from recovery afterwards with:
+
+```
+adb shell "dd if=/dev/block/by-name/userdata bs=4096 skip=11641087 count=1025 \
+           of=/sdcard/ufslog.bin"
+adb pull /sdcard/ufslog.bin
+```
+
+### Unproven, and what to check first
+
+The driver has compiled clean but has **not been booted on the phone yet**
+(device was disconnected while it was written). On the first boot with
+`build/emmc6/ginkgo-emmc6.img`, the panel should show, in order:
+
+| line | meaning |
+|---|---|
+| `EMMC base=... caps=...` | the block decoded at all |
+| `EMMC capbase_mhz=.. div=255` | CAPABILITIES read; the value is *not* trusted |
+| `OCR ...` | CMD1 completed and the card reported power-up complete |
+| `EMMC rca=.. state=4` | CMD3/CMD7 worked, card is in transfer state |
+| `EMMC lba0[510]=55 lba0[511]=aa` | a real read of the boot sector |
+| `EMMC card ready, 512-byte PIO` | the driver is usable |
+| `GATE emmc=1 log=1` | ufslog took it |
+| `EMMCp wr=0 rd=0 write verified` | a 4 KB block survived write -> read-back |
+
+Failure modes and what they mean:
+
+* `EMMC reset stuck: block not clocked` -- the SDCC core clock is gated; ABL
+  did not leave it running for us. Needs an RPMh/clock vote before the card can
+  be touched at all.
+* `400 kHz clock did not start` -- CLOCK_CONTROL[0] never sets; same root cause.
+* `CMD1 never reported power-up complete` -- clock runs but the card does not
+  answer: divider wrong, or the bus is not powered (POWER_CONTROL).
+* `LBA0 has no boot signature` -- commands complete but data is wrong; suspect
+  the PIO fifo word order or the 1-bit bus setting.
+
+Three bugs were found and fixed in this driver *before* it ever ran, each of
+which would have been silent or a hard fault:
+
+1. the caller's buffer was cast to `uint32_t*` for the fifo copy. With the MMU
+   off every access is Device memory, where an unaligned 32-bit access is an
+   alignment fault; the PIO loop now goes through bytes.
+2. `PRESENT_STATE` reports *busy* as a set bit, so the CMD/DAT-inhibit wait
+   needed a "wait until clear" loop. The first version used `wait_bits()` with
+   an inverted mask, which could never actually wait.
+3. the clock divider was derived from `CAPABILITIES[15:8]`, a field Qualcomm's
+   own driver marks broken (`SDHCI_QUIRK_CAP_CLOCK_BASE_BROKEN`). It is now a
+   fixed slow divider, correct for any plausible input clock.
+
+A fourth would have made the log useless even with a working card:
+
+4. **`ufslog`'s LBA is relative to userdata, not to the card.** The comment in
+   `ufslog.c` says "userdata on ginkgo is 47686090752 bytes = 11642112 blocks of
+   4096", and the log sits at block 11641087 of *userdata*. userdata is
+   `mmcblk0p87`; the whole card is only 122142720 sectors, so that number
+   cannot be a card address. The driver therefore reads the GPT (header at
+   LBA1, entries at LBA2, name at offset 56) to find userdata's `first_lba` and
+   adds it. If the GPT cannot be read the log stays **disabled** rather than
+   writing to a guessed sector.
+
+---
+
+## >>> HANDOFF 2026-10-25 14:15 (ginkgo): GINKGO HAS NO UFS -- it is eMMC <<<
+
+**The single most important hardware fact found so far, and it invalidates the
+logging and storage half of this project on this device.**
+
+Redmi Note 8 (`ginkgo`, SM6125) ships **eMMC**, not UFS. Verified from the
+running device through LineageOS recovery (root adb):
+
+```
+# ls /sys/block/
+loop0..loop15  mmcblk0  mmcblk0rpmb  mmcblk1  ram0..  zram0     <- no sd* / no ufs
+# cat /sys/block/mmcblk0/device/name
+S0J9K8                       (Samsung eMMC)
+# cat /sys/block/mmcblk0/device/type
+MMC
+# ls /proc/device-tree/soc/ | grep sdhci
+sdhci@4744000    sdhci@4784000
+# cat /proc/cmdline   ->  androidboot.boot_devices=soc/4744000.sdhci
+                           androidboot.bootdevice=4744000.sdhci
+# ls /dev/block/by-name/userdata -> mmcblk0p87   (93136896 sectors)
+```
+
+Controller: `qcom,sdhci-msm-v5` at **0x04744000** (size 0x1000). SD card is the
+second instance at 0x04784000.
+
+### Consequences
+
+1. **`shim/ufs.c` cannot work here, and `ufslog` is dead by construction.**
+   The project targets `topaz`/`sweet`, which are UFS phones. Every read of the
+   log region on this phone has returned only the old `TESTMARK` string that a
+   previous session wrote by hand -- the shim has never logged a single byte.
+   The "UFS probe done / host_ok=0 / hce=0 / hcs=0x8008" results are the UFS
+   controller refusing to come up because **the block does not exist**.
+   A replacement must drive `sdhci-msm-v5` at 0x04744000 instead.
+
+2. The log region maths are still usable, but they point into `userdata` =
+   `mmcblk0p87`. Reading it from recovery works:
+   `dd if=/dev/block/by-name/userdata bs=4096 skip=11641087 count=1025`.
+
+3. The two autonomy paths that need a *device-side* store (persisting state
+   across a reboot) can now be built on eMMC, which is far better documented
+   than the UFS host.
+
+### IMEM address confirmed from the device's own DTB
+
+```
+# od -An -tx4 /proc/device-tree/soc/qcom,msm-imem@c125000/reg
+ 0050120c 00100000              -> base 0x0c125000
+# od -An -tx4 .../restart_reason@65c/reg
+ 5c060000 04000000              -> offset 0x65c
+```
+So `0x0c12565c` is correct, and it is the same node ABL and the kernel use.
+
+### A working debug channel exists: recovery + root adb
+
+`fastboot boot android-backup/stock-recovery.img` (temporary -- **no partition
+write**) lands in LineageOS recovery on this phone, and `adb shell` there is
+**uid=0 (root)**. That gives:
+- direct `dd` access to every partition including `userdata`,
+- `/sys/firmware/devicetree/base/...` for the device's own DTB,
+- `dmesg`/`/proc` from a real Linux kernel on the same hardware.
+
+This is a far better observability channel than photographing a half-second
+shim screen, and it costs one button press per session instead of a photo.
+
+### Autonomy status (honest)
+
+Not working yet. Every image since `01-current` bootloops as
+"Redmi -> ~0.5 s of shim -> reboot" and never reaches fastboot, including a
+minimal probe build that does nothing but reset immediately after the pre-UFS
+point. Changes made this session that are still unproven on hardware:
+- restart reason corrected to `0x77665500` (fastboot) from `0x77665501`
+  (which means "unknown reason");
+- PMIC `PON_SOFT_RB_SPARE` write (best effort -- the SPMI arbiter needs the RPM);
+- `psci_reset()` now declares x1-x17 clobbered and passes x1-x3, matching the
+  `smc()` that is proven on this board;
+- the panic park loop now resets to fastboot instead of spinning for ever;
+- the silver core resets to fastboot if gold never takes over.
+
+The likely reason none of it was ever observed: **the shim never reaches the
+code that prints because it faults earlier, and there is no working log to say
+where.** Getting an eMMC-backed log out is therefore the prerequisite for
+everything else, not a side quest.
+
+---
+
+## >>> HANDOFF 2026-10-25 13:40 (ginkgo): why auto-fastboot never worked <<<
+
+**Two defects in the "reset to fastboot" recipe, both found today by reading
+Qualcomm's own driver instead of trusting the project docs.**
+
+### 1. The IMEM code was wrong
+
+`docs/REPORT.md`, `INSTRUCTIONS.md`, `pmic.c` and the old `shim.c` all use
+`0x77665501` and call it "fastboot". From `drivers/power/reset/msm-poweroff.c`
+(LineageOS sm6250 kernel) the actual mapping is:
+
+| reboot command | restart_reason | PON reason |
+|---|---|---|
+| `bootloader` | **0x77665500** | `PON_RESTART_REASON_BOOTLOADER` = 0x02 |
+| `recovery`   | 0x77665502 | `PON_RESTART_REASON_RECOVERY` = 0x01 |
+| anything else| 0x77665501 | UNKNOWN |
+
+So `0x77665501` means "restarted, reason unknown" -- ABL sees no fastboot
+request and boots normally. The phone therefore reboots every 30-60 s and never
+stops in fastboot: exactly the bootloop seen on the panel.
+
+`0x77665500` (the value already used by `shim.c:122` for
+`RESTART_BOOTLOADER`) is the correct one.
+
+### 2. The PMIC register was never written -- and it is the one ABL reads
+
+`msm-poweroff.c` does not rely on IMEM alone. Alongside the IMEM store it calls
+`qpnp_pon_set_restart_reason()`, defined in `drivers/input/misc/qpnp-power-on.c`:
+
+```
+QPNP_PON_SOFT_RB_SPARE(pon) = pon->base + 0x8F
+gen2 PON: masked_write(base + 0x8F, GENMASK(7,2), reason << 2)
+```
+
+PM6125 is a gen2 PON, so the reason lives in bits [7:2] of that byte. ABL reads
+the PMIC; if that byte is untouched the reason is UNKNOWN no matter what IMEM
+says. This explains the old note in this file ("IMEM restart_reason is seen but
+ABL still boots Android"): only half the message was being sent.
+
+Reach it through the SPMI arbiter v5 observer window that `pmic.c` already uses
+for key status: `0x1c40000 + 0x800 + 0x8F` for SID 0.
+
+### The reset itself
+
+PSCI SYSTEM_RESET (`0x84000009`, `smc #0`) is the route to use. The APCS
+watchdog is **not** available on SM6125: measured again today, 105 s with no
+reset -- the block is gated. `PSHOLD` (`qcom,pshold`, 0x0440b000) is the last
+resort; it power-cycles rather than warm-resets.
+
+### Implementation
+
+`shim/autonomy.c`: `pon_set_restart_reason()` does the read-modify-write with a
+read-back check, `autonomy_to_fastboot()` writes PMIC then IMEM, verifies both,
+then resets. `loader.c` and the `loader_boot` failure path in `shim.c` both end
+in it, so a failed payload stage can no longer fall into the old
+"wait 60 s then reset blindly" loop.
+
+### Build toolchain (no WSL, no aarch64-gcc needed)
+
+The machine has no WSL distribution and no admin rights, so the shim is built
+with clang/lld for `aarch64-none-elf`:
+
+- `work/tools/llvm/bin/{clang,ld.lld}.exe` (LLVM 18.1.8 release)
+- `work/tools/include/{stdint,stddef}.h` -- minimal freestanding headers
+- `work/tools/support/libc_min.c` -- `strcmp`/`strncmp`/`strlen`, which clang
+  emits calls to even under `-ffreestanding`
+- `work/tools/build-shim.ps1` -- mirrors `shim/build.sh`
+- `work/tools/mkimage.py` -- mirrors `images/mkfull.sh`
+
+**One trap worth remembering:** `lld --oformat=binary` drops the space
+`shim.ld` reserves after `.bss` (the stacks and `_end`), so the file ends at the
+last initialised byte while `start.S` still puts `image_size = _end` in the
+header. ABL copies what the header claims and `loader.c` looks for the payload
+at `align_up(shim_end_va)`, i.e. past EOF -> "no SWEETXNU payload". The build
+script now pads the Image to `image_size`.
+
+---
+
 ## >>> HANDOFF 2026-10-24 night (ginkgo) <<<
 
 **SHIM RUNS ON GINKGO (EL1) AND FINDS XNU.** First real boot of our code on this

@@ -13,6 +13,16 @@
 #include "mmu.h"
 #include "loader.h"
 #include "ufs.h"
+#include "autonomy.h"
+
+/*
+ * 1 = diagnostic build that stops right after the UFS probe and resets to
+ * fastboot, so the autonomy mechanism can be tested with no other code able to
+ * fail first. Set from the build script; 0 in normal builds.
+ */
+#ifndef SWEET_AUTONOMY_PROBE
+#define SWEET_AUTONOMY_PROBE	0
+#endif
 
 #define IMEM_RESTART_REASON	0x0c12565cUL	/* qcom,msm-imem@c125000 restart_reason@65c */
 #define RESTART_BOOTLOADER	0x77665500U
@@ -201,26 +211,29 @@ void exc_handler(uint64_t slot, uint64_t *regs)
 	con_str("LOGGED", ufslog_active() ? "panic written to UFS" : "ufs log unavailable");
 
 	/*
-	 * Park instead of resetting: the screen stays readable, and polling lets
-	 * either Power (reboot straight to recovery) or Volume-Down (fastboot)
-	 * end the hang without a battery pull.
+	 * Do not sit in this loop waiting for a key.
+	 *
+	 * pmic_wait_key() cannot see keys this early: the SPMI arbiter needs the
+	 * RPM, which is not up before xnu runs, so it returns "no key" forever.
+	 * The loop below therefore never leaves, the shim wedges, and the platform
+	 * watchdog is what eventually resets the board -- with no restart reason
+	 * set, so ABL boots Android again. On the panel that is: "Redmi", half a
+	 * second of shim, reboot, forever. That is the bootloop, and it is why the
+	 * phone never once stopped in fastboot.
+	 *
+	 * autonomy_to_fastboot() writes the IMEM reason, verifies it, and resets
+	 * deliberately, so a panic lands in fastboot instead of looping. The panic
+	 * text is already on the panel and in the UFS log by now, so nothing is
+	 * lost by leaving immediately.
 	 */
+	con_str("HALT", "panic: auto-fastboot now");
+	ufslog_str("HALT", "panic: auto-fastboot now");
+	ufslog_flush();
+	autonomy_to_fastboot();
+
 	/*
-	 * Wait for a key, but never forever: the PMIC keys are not readable this
-	 * early (the SPMI arbiter needs clocks the RPM has not set up), so a
-	 * hung shim would otherwise need a battery pull. After the grace period,
-	 * reset straight into fastboot via IMEM. That makes the whole loop
-	 * unattended: flash -> boot -> park -> auto-return -> read the UFS log.
-	 */
-	con_str("HALT", "auto-fastboot in 60 s");
-	ufslog_str("HALT", "auto-fastboot in 60 s");
-	/*
-	 * Hold the panic screen up indefinitely. The automatic reset below is
-	 * convenient when a log survives, but nothing on ginkgo has ever reached
-	 * the log or the boot-trace sector, so the panel is the only channel that
-	 * works -- and a 60-second window is too short to read by eye or capture
-	 * with a camera. Staying here until a key is pressed turns every failure
-	 * into a readable, photographable screen.
+	 * Only reachable if every reset path refused; keep the panel up so the
+	 * dump can still be read, and let a key out if one ever becomes visible.
 	 */
 	for (;;) {
 		uint64_t a = pmic_wait_key();
@@ -233,7 +246,7 @@ void exc_handler(uint64_t slot, uint64_t *regs)
 			con_str("EXIT", "vol-down: rebooting to fastboot");
 			ufslog_str("EXIT", "rebooting to fastboot");
 			ufslog_flush();
-			reboot_now(0x77665501u);
+			autonomy_to_fastboot();
 		}
 	}
 }
@@ -361,6 +374,21 @@ static void __attribute__((noreturn)) gold_main(uint64_t dtb)
 		con_hex2("SPEED", "silver=", (uint32_t)silver_ticks, "gold=", (uint32_t)gt);
 		delay_ms(1000);
 		con_skip();
+#if SWEET_AUTONOMY_PROBE
+		/*
+		 * The probe belongs HERE, not in shim_main.
+		 *
+		 * shim_main runs on the silver cluster only to hand off and park, so
+		 * a probe placed there never runs on the CPU that actually owns the
+		 * boot. Gold is the CPU that gets this far, so this is where the
+		 * autonomy mechanism has to be exercised.
+		 */
+		con_str("PROBE", "gold: autonomy probe -> fastboot");
+		__asm__ volatile("dsb sy" ::: "memory");
+		autonomy_to_fastboot();
+		for (;;)
+			__asm__ volatile("wfi");
+#endif
 		con_str("LOADER", loader_boot(dtb));
 	}
 	for (;;)
@@ -600,7 +628,21 @@ void shim_main(uint64_t dtb)
 		__asm__ volatile("dsb sy" ::: "memory");
 		int64_t r = smc(PSCI_CPU_ON, 0x100, (uintptr_t)secondary_entry, 4);
 		if (r == 0) {
-			for (;;)	/* parked with DAIF masked (start.S) */
+			/*
+			 * Gold accepted the handoff. Park here, but not for ever: if
+			 * gold dies before it reaches its own panic path, nobody would
+			 * ever set a restart reason, and the platform watchdog would
+			 * reset the board into a normal boot -- the "Redmi, half a
+			 * second of shim, reboot" loop. Give gold a generous window to
+			 * become the one running the boot, then take the reset into our
+			 * own hands so the phone still lands in fastboot.
+			 */
+			for (volatile uint64_t spin = 0; spin < 2000000000ULL; spin++)
+				if ((spin & 0xfffff) == 0)
+					__asm__ volatile("yield");
+			con_str("SILVER", "gold never took over: -> fastboot");
+			autonomy_to_fastboot();
+			for (;;)	/* unreachable on success */
 				__asm__ volatile("wfi");
 		}
 		gold_dtb = 0;
@@ -614,31 +656,65 @@ void shim_main(uint64_t dtb)
 	 * even when the loader panics -- which is what makes this fully
 	 * autonomous: no photographing a half-second panic screen.
 	 */
-	stage = "ufs";
+	stage = "emmc";
 	/*
-	 * The probe is what brings the UFS host up and points it at our transfer
-	 * list, which the log needs before it can write anything. It also proved
-	 * reliable and quick, so it stays in the xnu path: without it the log is
-	 * silently empty and a silent xnu becomes undebuggable.
+	 * Bring up the card that holds the log. On ginkgo that is eMMC behind
+	 * sdhci@4744000, not UFS -- see emmc.c. Until this works the log is
+	 * silently empty and every failure has to be read off a half-second
+	 * screen, so it stays in the path and its result is printed.
 	 */
-	test_ufs();
+	test_emmc();
 	ufslog_init();
-	con_hex2("GATE", "host_ok=", ufs_ready(), "ready=", 1);
+	con_hex2("GATE", "emmc=", emmc_ok(), "log=", ufslog_active());
 	con_skip();
 	con_str("LOG", ufslog_active() ? "persistent log active" : "log unavailable");
 	ufslog_str("BOOT", "shim reached the log init");
 	if (!pmic_init())
 		con_str("PMIC", "no keys: park only");
 
+#if SWEET_AUTONOMY_PROBE
+	/*
+	 * Diagnostic build: end the boot here, before loader_boot can fault.
+	 *
+	 * Every panic path now calls autonomy_to_fastboot(), but the phone still
+	 * cycles, which means the fault happens before any of those paths run --
+	 * possibly inside loader_boot, possibly on the silver cluster, possibly
+	 * before shim_main at all. This build removes every one of those suspects:
+	 * by the time the panel shows GATE the two things autonomy actually needs
+	 * (IMEM reachable with the MMU off, and PSCI SYSTEM_RESET accepted from
+	 * EL1) have both been exercised, and nothing else can fail.
+	 *
+	 * If this build lands in fastboot, the mechanism is sound and the defect is
+	 * later in the boot. If it still cycles, the mechanism itself is wrong and
+	 * no amount of work on the loader will fix it.
+	 */
+	con_str("PROBE", "autonomy probe: resetting to fastboot now");
+	__asm__ volatile("dsb sy" ::: "memory");
+	autonomy_to_fastboot();
+	for (;;)
+		__asm__ volatile("wfi");
+#endif
+
 	const char *why = loader_boot(dtb);
 	con_str("LOADER", why);
 	con_skip();
-	/* No payload: keep the probe results on screen, then park for keys. */
-	con_str("UFS", "probe done, auto-fastboot in 60 s");
+	/*
+	 * loader_boot returned, so the payload stage failed before the handoff.
+	 *
+	 * The old path here waited 60 s and then called reboot_now(), which reset
+	 * the board without asking ABL for fastboot: the phone came back, failed
+	 * the same way, and cycled forever with nothing on USB. That is exactly
+	 * the loop seen on the panel.
+	 *
+	 * autonomy_to_fastboot() is the fixed route: it writes the IMEM restart
+	 * reason, verifies the store, and only then resets, so the next start is a
+	 * fastboot start and the loop ends with the phone where we can drive it.
+	 * No delay: waiting 60 s only hides which failure happened.
+	 */
+	con_str("AUTO", why);
+	ufslog_str("LOADER", why);
 	ufslog_flush();
-	delay_ms(60000);
-	ufslog_flush();
-	reboot_now(0x77665501u);
+	autonomy_to_fastboot();
 
 	stage = "fill off";
 	uint64_t fill_off = ticks_fill(RED);
@@ -681,3 +757,4 @@ void shim_main(uint64_t dtb)
 	stage = "done";
 	reset(40);
 }
+
