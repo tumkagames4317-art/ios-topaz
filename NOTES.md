@@ -1,3 +1,70 @@
+## 21:20 MSK 2026-10-25 -- SPMI rewritten to the v5 protocol; core watchdog added
+
+### Why the core watchdog exists
+
+Autonomy works up to the xnu handoff (measured: 5-7 s back to fastboot, four
+cycles, and it survives `fastboot reboot`). It fails AT the handoff: once
+`loader.c` calls the xnu entry, no shim code runs again, so every timeout we
+own dies with that core. Measured: after `fastboot boot` hands over, the phone
+did not return to fastboot in 150 s. The APCS watchdog cannot cover this
+either (it never resets this SoC).
+
+So `watchdog_start_secondary()` (autonomy.c) starts a *different* core through
+PSCI CPU_ON before the jump; that core never enters xnu, keeps reading the
+generic timer (per-core, so xnu cannot stop it), and resets the board when the
+deadline passes.
+
+Two defects found while bringing that up, both worth remembering:
+
+1. **PSCI CPU_ON cannot target a C function.** It starts a secondary with no
+   stack, so the compiler's prologue pushes to a garbage SP and the core dies
+   silently. `start.S` already had `secondary_entry` for exactly this reason;
+   the watchdog needed its own stub, `wdt_secondary_entry`, which builds the
+   stack from `_sec_stacks` the same way.
+2. The `WD secondary armed mpidr=...` line proves only that CPU_ON returned 0,
+   i.e. firmware accepted the request — NOT that the core reached our code.
+   That line appeared while the core was in fact dying on a bad stack, so it
+   must not be read as "the watchdog is running".
+
+As of this entry the core still does not produce a reset; the next measurement
+is to make `wdt_secondary_main` call `reset_now()` immediately instead of
+waiting, which separates "the core never runs" from "reset_now does not work
+from a non-boot core".
+
+### SPMI: the write path was rewritten, not tuned
+
+The subagent audit (recovery-analyst) found the decisive defect by reading the
+code rather than the hardware: `spmi_write_byte()` returned 0 **before any MMIO
+access at all** --
+
+    int apid = spmi_find_apid(...);     /* always -1 */
+    int code = g_spmi_code;             /* never assigned, stays -1 */
+    if (code < 0) { if (apid < 0) return 0; }   /* <-- exit here, always */
+
+so no SPMI transaction was ever attempted. Everything reported as "writes do
+not land" was measuring a function that did nothing.
+
+It also corrected two addresses:
+
+- The channel was `core + 0x800`. `core` is only 0x1100 bytes and 0x800 is
+  `PMIC_ARB_EE_BLOCK` (the EE0 register bank), not a channel. Writes must use
+  `chnls + 0x10000 * apid`.
+- The APID map is `cnfg + 0x900` (0x01c0a900) for v5, not `obsrvr + 0x900`.
+  That is why the old walk found 144 non-zero words but never PPID 0x800.
+
+New `spmi_write_byte()` follows spmi-pmic-arb.c v5: claim ownership via
+`core + 0x1000` (`PMIC_ARB_ENABLE`), resolve the APID for PPID 0x0808 (PON,
+SID 0, peripheral 0x08), then WDATA0 -> CMD -> poll STATUS for DONE with
+FAIL/DENIED treated as errors.
+
+`spmi_probe_report()` now prints arbiter version (`core+0x5c4`), the enable
+register, the resolved APID/EE, and the channel's STATUS/CMD words, so the
+panel shows whether the arbiter is reachable at all rather than only the
+outcome of a write.
+
+Test image: `work/build/spmi/ginkgo-spmi.img`, md5
+`5C495C1B9C5C0FEDDE04DB6C25E49E4E`.
+
 ## 20:35 MSK 2026-10-25 -- FOUND IT: xnu prints to the wrong framebuffer
 
 The test image ran, shim handed over, and the panel stopped at

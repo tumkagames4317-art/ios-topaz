@@ -259,22 +259,26 @@ static uint32_t cnt_nz(void)
 /*
  * Find the APID that owns a given PPID.
  *
- * spmi-pmic-arb.c: pmic_arb_read_apid_map_v5() takes one entry per APID from
- *     core + 0x900 + 4*n
- * and reads the PPID from bits [19:8]. The PPID is (sid << 8) | peripheral,
- * so PON on SID 0 is 0x0800.
+ * For arbiter v5 -- and this one reports v5 (0x50010000), and its DT has the
+ * v5 reg-names list "core chnls obsrvr intr cnfg" -- the APID map lives in
+ * cnfg, not obsrvr:
  *
- * A fixed guess is not good enough: a channel belonging to another peripheral
- * is DENIED by the arbiter, or worse, the write lands somewhere harmless and
- * looks like a silent no-op -- which is exactly what every attempt so far
- * looked like on the panel.
+ *     pmic_arb_read_apid_map_v5(): core + PMIC_ARB_APID_MAP + 4*n
+ *     PMIC_ARB_APID_MAP = 0x900  -> cnfg + 0x900 = 0x01c0a900
+ *
+ * Reading obsrvr + 0x900 was the old guess and it is what produced the
+ * "144 non-zero words but no PPID 0x800" reading: obsrvr is the read-only
+ * observer window and has nothing to do with the APID map.
+ *
+ * The PPID in the map is (sid << 8) | peripheral. PON on PM6125 (SID 0) is
+ * peripheral 0x08, so PPID 0x0808.
  *
  * Returns the APID, or -1 when the PPID is not mapped.
  */
 static int spmi_find_apid(uint16_t ppid)
 {
 	for (int n = 0; n < 512; n++) {
-		uint32_t reg = REG32(SPMI_TBL_BASE + 4UL * (uint32_t)n);
+		uint32_t reg = REG32(SPMI_CNFG_BASE + 0x900UL + 4UL * (uint32_t)n);
 
 		if (!reg)
 			continue;
@@ -302,86 +306,89 @@ static uint32_t g_v1_val;
 static uint32_t g_v1_val2;
 
 /*
- * Command-channel access in the v1-compatible layout.
+ * ---- arbiter v5 command channel ----------------------------------------
  *
- * The arbiter reports version 0x50010000 but answers on the v1 channel at
- * core + 0x800 (its STATUS and WDATA0 read back sensibly), while the v5
- * wr_base at 0x1e00000 stalls the bus outright. So the v1 protocol is what
- * this firmware actually exposes, and it is the only way in.
+ * What a write actually is, from spmi-pmic-arb.c (v5 path):
+ *
+ *   channel base  = chnls + 0x10000 * apid
+ *   WDATA0   ch+0x10  <- data          (byte count decides how much counts)
+ *   CMD      ch+0x00  <- (opc << 27) | ((addr & 0xffff) << 4) | (bc & 7)
+ *   STATUS   ch+0x08  -> bit0 DONE, bit1 FAIL, bit2 DENIED
+ *
+ * opc 14 = WRITE, opc 15 = READ. `addr` is the 16-bit SPMI address
+ * (peripheral << 8) | offset. The SID does NOT appear in CMD on v5: it is
+ * encoded in the address and resolved through the APID map.
+ *
+ * The old code used core + 0x800 as the channel. That is not a channel at
+ * all: core is only 0x1100 bytes and 0x800 is the start of the EE0 register
+ * bank (PMIC_ARB_EE_BLOCK), so every "transaction" was really reading and
+ * writing EE status words. That is why reads looked plausible and writes
+ * never landed.
  */
-#define SPMI_V1_CH	(SPMI_CORE_BASE + 0x800UL)
-
-#define SPMI_OP_READ	15u
+#define SPMI_OP_READ		15u
 
 /*
- * One transaction. `write` selects the opcode; the value to store comes from
- * *val, and a read result is returned through it.
+ * Claim this execution environment's channels before touching them.
  *
- * The command word is (opc << 27) | ((sid & 0xf) << 20) | (addr << 4) | (bc & 7)
- * where addr is the 16-bit (peripheral << 8) | offset.
+ * pmic_arb_claim_ownership(): read PMIC_ARB_ENABLE at core + 0x1000; if our
+ * EE's bit is clear, set it. Without this the arbiter answers DENIED and the
+ * PMIC never sees the command. APPS is EE 2 on Qualcomm platforms; try 0..3
+ * and keep whichever bit sticks, because the EE number is a DT property we
+ * cannot read here (MMU off, no DT parsing at this stage).
  */
-static int spmi_v1_xfer(int write, uint8_t sid, uint16_t addr, uint32_t *val)
+static int g_spmi_ee = -1;
+
+static int spmi_claim_ee(void)
 {
-	uintptr_t ch = SPMI_V1_CH;
+	if (g_spmi_ee >= 0)
+		return g_spmi_ee;
 
-	/* Clear any stale completion before starting. */
-	REG32(ch + 0x08) = 0;
-	__asm__ volatile("dsb sy" ::: "memory");
+	uint32_t en = REG32(SPMI_CORE_BASE + 0x1000UL);
 
-	if (write)
-		REG32(ch + 0x10) = *val;
-
-	REG32(ch + 0x00) = ((write ? 14u : SPMI_OP_READ) << 27) |
-			   (((uint32_t)sid & 0xFu) << 20) |
-			   (((uint32_t)addr & 0xFFFFu) << 4) |
-			   0u;
-	__asm__ volatile("dsb sy" ::: "memory");
-
-	for (int i = 0; i < 100000; i++) {
-		uint32_t st = REG32(ch + 0x08);
-
-		if (!(st & 1u))
-			continue;
-		if (st & 0x6u)
-			return 0;
-		if (!write)
-			*val = REG32(ch + 0x18) & 0xFFu;
-		return 1;
+	for (int ee = 0; ee < 4; ee++) {
+		if (en & (1u << ee)) {
+			g_spmi_ee = ee;
+			return ee;
+		}
 	}
-	return 0;
+	/* None set: claim EE0 and verify it took. */
+	REG32(SPMI_CORE_BASE + 0x1000UL) = en | 1u;
+	__asm__ volatile("dsb sy" ::: "memory");
+	if (REG32(SPMI_CORE_BASE + 0x1000UL) & 1u) {
+		g_spmi_ee = 0;
+		return 0;
+	}
+	return -1;
 }
 
-static int spmi_v1_read(uint8_t sid, uint16_t addr, uint32_t *out)
-{
-	*out = 0;
-	return spmi_v1_xfer(0, sid, addr, out);
-}
-
+/* One byte write. 1 = DONE cleanly, 0 = timeout/FAIL/DENIED. */
 static int spmi_write_byte(uint8_t sid, uint16_t addr, uint8_t val)
 {
+	(void)spmi_claim_ee();
+
 	int apid = spmi_find_apid((uint16_t)(((uint16_t)sid << 8) | (addr >> 8)));
-	int code = g_spmi_code;
 
-	/*
-	 * Prefer the channel that brute force confirmed during the probe. The
-	 * table lookup alone never finds the PON peripheral: the word order in
-	 * this firmware does not follow the positions spmi-pmic-arb.c assumes.
-	 */
-	if (code < 0) {
-		if (apid < 0)
-			return 0;
-		code = apid;
-	}
+	if (apid < 0)
+		apid = g_spmi_code;	/* probe-confirmed fallback */
+	if (apid < 0)
+		return 0;
 
-	uintptr_t base = (code & 0x10000) ? SPMI_CHNLS_BASE : SPMI_CORE_BASE;
-	uintptr_t ch = base + 0x10000UL * (uint32_t)(code & 0xFFFF);
+	uintptr_t ch = SPMI_CHNLS_BASE + 0x10000UL * (uint32_t)apid;
 
-	REG32(ch + SPMI_ARB_WDATA0) = val;
-	REG32(ch + SPMI_ARB_CMD) = (SPMI_OP_WRITE << 27) |
-				   (((uint32_t)addr & 0xFFu) << 4);
+	/* Clear a stale completion, then stage the data. */
+	REG32(ch + SPMI_ARB_STATUS) = 0;
 	__asm__ volatile("dsb sy" ::: "memory");
 
-	for (int i = 0; i < 100000; i++) {
+	REG32(ch + SPMI_ARB_WDATA0) = val;
+	REG32(ch + 0x04) = 0;		/* no priority/irq bits: plain byte write */
+	__asm__ volatile("dsb sy" ::: "memory");
+
+	REG32(ch + SPMI_ARB_CMD) = (SPMI_OP_WRITE << 27) |
+				   (((uint32_t)addr & 0xFFu) << 4) |
+				   0u;		/* bc = 0 -> 1 byte */
+	__asm__ volatile("dsb sy" ::: "memory");
+
+	for (int i = 0; i < 200000; i++) {
 		uint32_t st = REG32(ch + SPMI_ARB_STATUS);
 
 		if (!(st & SPMI_ARB_STATUS_DONE))
@@ -391,6 +398,25 @@ static int spmi_write_byte(uint8_t sid, uint16_t addr, uint8_t val)
 		return 1;
 	}
 	return 0;
+}
+
+/* Diagnostic: report the raw state of the write path so the panel explains it. */
+void spmi_probe_report(void)
+{
+	uint32_t ver = REG32(SPMI_CORE_BASE + 0x5c4UL);
+	uint32_t en = REG32(SPMI_CORE_BASE + 0x1000UL);
+	int ppid_pon = 0x0808;
+	int apid = spmi_find_apid((uint16_t)ppid_pon);
+	int ee = g_spmi_ee;
+
+	con_hex2("SPMI", "ver=", ver, " en=", en);
+	con_hex2("SPMI", "ppid=0808 apid=", (uint32_t)(apid < 0 ? 0xdead : apid),
+		 " ee=", (uint32_t)(ee < 0 ? 0xdead : ee));
+	if (apid >= 0) {
+		uintptr_t ch = SPMI_CHNLS_BASE + 0x10000UL * (uint32_t)apid;
+		con_hex2("SPMI", "ch=sts ", REG32(ch + SPMI_ARB_STATUS),
+			 " cmd ", REG32(ch + SPMI_ARB_CMD));
+	}
 }
 
 /*
@@ -430,47 +456,7 @@ int pon_config_ps_hold_warm_reset(void)
 
 	uint8_t back = REG8(QPNP_PON_PS_HOLD_RST_CTL);
 	con_hex2("PONPS", "ctl=", back, "en=", REG8(QPNP_PON_PS_HOLD_RST_CTL2));
-	int ap = spmi_find_apid(0x0800);
-	con_hex2("PONAP", "apon=", (uint32_t)ap, "nz="
-		 , cnt_nz());
-	/*
-	 * The arbiter answers in its v1-compatible layout, not the v5 one.
-	 *
-	 * Reading core+0x08 gives 0x00000000 (STATUS, idle) and core+0x10 gives
-	 * 0x00001043 -- those are the per-EE channel's STATUS and WDATA0, the
-	 * same registers spmi-pmic-arb.c uses when it treats the arbiter as v1
-	 * (wr_base == rd_base == core). chnls (0x1e00000) stalls the bus, so the
-	 * v5 wr_base is unusable here.
-	 *
-	 * That also explains a long-standing illusion: reading core+0x800+0x10
-	 * and calling it PON_RT_STS was reading WDATA0 of the channel, which is
-	 * zero whenever no transaction is in flight. It looked like a live PMIC
-	 * read because zero is a plausible status value.
-	 *
-	 * v1 channel for EE 0 lives at core + 0x800, with
-	 *   CMD +0x00  CONFIG +0x04  STATUS +0x08  WDATA0 +0x10  RDATA0 +0x18
-	 * and the command word is
-	 *   (opc << 27) | ((sid & 0xf) << 20) | (addr << 4) | (bc & 0x7)
-	 */
-	con_hex2("Q1 st=", "", REG32(SPMI_V1_CH + 0x08), " cfg=",
-		 REG32(SPMI_V1_CH + 0x04));
-	con_hex2("Q2 cmd=", "", REG32(SPMI_V1_CH + 0x00), " rd=",
-		 REG32(SPMI_V1_CH + 0x18));
-
-	/* Read PON_RT_STS (sid 0, addr 0x0810) properly through the channel. */
-	int rok = spmi_v1_read(0, 0x0810, &g_v1_val);
-	con_hex2("Q3 rok=", "", (uint32_t)rok, " val=", g_v1_val);
-
-	/* Read the spare byte ABL uses for the restart reason. */
-	int rok2 = spmi_v1_read(0, 0x088F, &g_v1_val2);
-	con_hex2("Q4 rok2=", "", (uint32_t)rok2, " spare=", g_v1_val2);
-	con_hex2("Q5 done", "", 5u, "", 0);
-	ufslog_flush();
-	for (;;)
-		__asm__ volatile("wfi");
-	int wr = spmi_write_byte(0, 0x0800 | 0x8F, 0x12);
-	con_hex2("PONWR", "ok=", (uint32_t)wr, "rb="
-		 , REG8(QPNP_PON_SOFT_RB_SPARE));
+	spmi_probe_report();
 	return (int)(back & QPNP_PON_POWER_OFF_MASK);
 }
 
@@ -709,6 +695,27 @@ static void reset_now(void)
 	__asm__ volatile("dsb sy" ::: "memory");
 }
 
+/*
+ * PSCI CPU_ON: start `mpidr` at the physical entry `entry` with x0 = context.
+ *
+ * Same register discipline as psci_reset below: the SMCCC lets firmware
+ * clobber x1-x17, and every argument must be passed explicitly or the call is
+ * malformed and simply refused.
+ */
+static uint64_t psci_cpu_on(uint64_t mpidr, uint64_t entry, uint64_t context)
+{
+	register uint64_t x0 __asm__("x0") = 0xc4000003UL;	/* PSCI_CPU_ON (64-bit) */
+	register uint64_t x1 __asm__("x1") = mpidr;
+	register uint64_t x2 __asm__("x2") = entry;
+	register uint64_t x3 __asm__("x3") = context;
+	__asm__ volatile("smc #0"
+			 : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3)
+			 :
+			 : "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11",
+			   "x12", "x13", "x14", "x15", "x16", "x17", "memory");
+	return x0;
+}
+
 void autonomy_reboot_loop(unsigned seconds)
 {
 	uint64_t freq = 0;
@@ -754,4 +761,106 @@ void autonomy_reboot_loop(unsigned seconds)
 	con_str("WD", "no reset path: parked");
 	for (;;)
 		__asm__ volatile("wfi");
+}
+
+/* ---- core watchdog for the xnu handoff ---------------------------------- */
+
+/*
+ * Entry point handed to PSCI CPU_ON.
+ *
+ * Runs on a core the boot CPU started, with the same MMU-off, EL1 state the
+ * shim runs in. It must NOT touch the console after the handoff -- the boot
+ * CPU owns the framebuffer by then and xnu may be drawing into it -- and it
+ * must not return: xnu never expects this core and PSCI CPU_OFF here would
+ * need a call into firmware that could be refused.
+ *
+ * It only needs the generic timer, which is per-core and independent of
+ * anything xnu does to the boot CPU, so the deadline stays honest even if xnu
+ * stops every timer it knows about.
+ */
+static unsigned g_wdt_seconds = 30;
+
+extern void wdt_secondary_entry(void);
+
+/*
+ * Runs on the watchdog core, entered from wdt_secondary_entry with a stack.
+ *
+ * Deliberately does NOT use autonomy_reboot_loop(): that one prints to the
+ * panel and writes the persistent log, both of which this core must leave
+ * alone (xnu owns them by now, and the eMMC driver is not up on this core).
+ * Nothing here allocates, locks, or logs -- it reads the generic timer until
+ * the deadline passes and then resets.
+ */
+void wdt_secondary_main(void)
+{
+	uint64_t freq = 0, start = 0;
+
+	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+	__asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(start));
+
+	if (freq < 1000 || freq > 1000000000ULL)
+		freq = 0;
+
+	for (;;) {
+		uint64_t now;
+
+		__asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(now));
+		if (freq && now - start >= freq * (uint64_t)g_wdt_seconds)
+			break;
+		/*
+		 * Without a usable counter the deadline cannot be measured, so
+		 * fall back to a bounded spin: still better than never resetting,
+		 * which is the bug this core exists to fix.
+		 */
+		if (!freq) {
+			for (volatile uint64_t i = 0; i < 50000000ULL; i++)
+				__asm__ volatile("nop");
+			break;
+		}
+	}
+
+	reset_now();
+
+	for (;;)
+		__asm__ volatile("wfi");	/* reset_now did not take */
+}
+
+int watchdog_start_secondary(unsigned seconds)
+{
+	/*
+	 * Which cores to try, in order. ABL boots ginkgo on MPIDR 0x000, so
+	 * 0x001..0x003 (silver) and 0x100..0x103 (gold) are free here. Start
+	 * with silver: gold is the cluster xnu is about to reconfigure, and a
+	 * core inside it is more likely to be disturbed.
+	 */
+	static const uint64_t candidates[] = {
+		0x001, 0x002, 0x003,
+		0x100, 0x101, 0x102, 0x103,
+	};
+	uint64_t self = 0;
+
+	__asm__ volatile("mrs %0, mpidr_el1" : "=r"(self));
+	self &= 0xffffff;
+
+	g_wdt_seconds = seconds;
+
+	for (unsigned i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+		if (candidates[i] == self)
+			continue;
+		/*
+		 * Entry must be the ASM stub, not wdt_secondary_main: PSCI starts
+		 * the core with no stack. The context id picks the stack slot and
+		 * must stay under 8 (_sec_stacks holds 8 pages).
+		 */
+		int64_t r = (int64_t)psci_cpu_on(candidates[i],
+						 (uint64_t)(uintptr_t)wdt_secondary_entry,
+						 (uint64_t)i + 1);
+		if (r == 0) {
+			con_hex2("WD", "secondary armed mpidr=", (uint32_t)candidates[i],
+				 " s=", seconds);
+			return 1;
+		}
+	}
+	con_str("WD", "no core accepted the watchdog");
+	return 0;
 }

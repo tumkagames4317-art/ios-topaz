@@ -60,3 +60,30 @@ void autonomy_to_fastboot(void);
  * instead of sitting there silently.
  */
 void autonomy_reboot_loop(unsigned seconds);
+
+/*
+ * Start a core watchdog on a DIFFERENT CPU, then return.
+ *
+ * The boot CPU is about to be handed to xnu, which on ginkgo wedges and never
+ * comes back (measured: 150 s with no panel change and no reset). Every
+ * timeout that lives on the boot CPU dies with it: shim code is not running
+ * any more, so autonomy_reboot_loop() there cannot help. The APCS watchdog
+ * does not reset this SoC either. What does keep running is a core we start
+ * ourselves, because xnu is never told about it.
+ *
+ * After `seconds` the secondary writes the fastboot reason and resets the
+ * board, so a wedged xnu ends in fastboot like everything else.
+ *
+ * Returns 1 if a core accepted the handoff, 0 if none did (in which case
+ * nothing guards the handoff and the caller should know).
+ */
+int watchdog_start_secondary(unsigned seconds);
+
+/*
+ * Print the SPMI write path's live state: arbiter version, the EE ownership
+ * register, the APID resolved for the PMIC PON peripheral, and the channel's
+ * STATUS/CMD words. This exists because every earlier attempt reported only
+ * the RESULT of a write ("did not land") without showing whether the arbiter
+ * had even accepted the command.
+ */
+void spmi_probe_report(void);

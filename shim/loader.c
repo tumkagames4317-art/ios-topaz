@@ -35,6 +35,17 @@
 #endif
 
 /*
+ * How long the second core waits before forcing the board back to fastboot
+ * once xnu has been entered. This is the only recovery that survives a wedged
+ * xnu, so it has to be long enough for a real xnu to reach its own output and
+ * short enough that a test loop does not sit idle. Override with
+ * -DSWEET_WDT_SECONDS=<n>.
+ */
+#ifndef SWEET_WDT_SECONDS
+#define SWEET_WDT_SECONDS	45
+#endif
+
+/*
  * Last sector of the boot partition holds the trace record (see loader_boot).
  * boot is 64 MiB = 131072 sectors, so LBA 131071 is the final one and is never
  * part of the image we flash (which is header + kernel + ramdisk + dtb).
@@ -482,7 +493,34 @@ const char *loader_boot(uintptr_t dtb)
 	 */
 #if SWEET_XNU_HANDOFF
 	con_str("AUTO", "handoff to xnu enabled: bounded observation");
+	/*
+	 * Report the SPMI path BEFORE anything is attempted through it. Every
+	 * earlier attempt only ever showed the outcome of a write, never whether
+	 * the arbiter was even reachable, so a silent no-op and a gated clock
+	 * looked identical on the panel.
+	 */
+	spmi_probe_report();
 	wdt_selftest();
+	/*
+	 * Start a watchdog on a SECOND core before handing over.
+	 *
+	 * Everything else in this file stops mattering the moment the jump below
+	 * executes: xnu takes this core and, when it wedges (measured: still
+	 * nothing on the panel 150 s later), no code of ours ever runs again, so
+	 * no timeout of ours can fire.
+	 *
+	 * The APCS watchdog cannot cover it -- measured repeatedly: the block is
+	 * gated on SM6125 and never resets the board. PSCI resets need someone to
+	 * call them. That leaves a core we start ourselves: it never enters xnu,
+	 * so it keeps running our loop no matter what xnu does to the boot CPU.
+	 *
+	 * Pick a core that is NOT the one we are running on. ABL starts the boot
+	 * CPU at MPIDR 0x000 on ginkgo (silver Aff0 0); the gold cluster is
+	 * 0x100..0x103 and the rest of silver 0x001..0x003. Any of those is free
+	 * at this point.
+	 */
+	con_str("WD", "arming core watchdog before handoff");
+	watchdog_start_secondary(SWEET_WDT_SECONDS);
 	ufslog_flush();
 	((xnu_entry_t)entry_pa)(ba_pa);
 #endif

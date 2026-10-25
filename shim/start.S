@@ -56,6 +56,39 @@ secondary_entry:
 	b	4b
 
 /*
+ * PSCI CPU_ON target for the core watchdog. x0 = context id = a per-core
+ * index we choose; the stack is picked from it exactly as above.
+ *
+ * PSCI starts a secondary core with no stack, no valid SP and the MMU off,
+ * so a C function can never be the CPU_ON entry -- the compiler's prologue
+ * would push to whatever SP happened to be in the register. That is why this
+ * shim exists instead of pointing CPU_ON straight at wdt_secondary_main.
+ *
+ * The watchdog must not touch the framebuffer or the persistent log: by the
+ * time it fires, xnu owns the panel. It only reads the generic timer, which
+ * is per-core, and then resets the board.
+ */
+	.globl wdt_secondary_entry
+wdt_secondary_entry:
+	msr	daifset, #0xf
+	msr	spsel, #1
+	adr	x1, _sec_stacks
+	add	x1, x1, x0, lsl #12
+	add	x1, x1, #0x1000
+	mov	sp, x1
+	/*
+	 * Its own vectors: if this core takes a fault it must keep counting
+	 * towards the deadline rather than land in the shim's panic screen,
+	 * which by now belongs to xnu.
+	 */
+	adr	x1, wdt_vectors
+	msr	vbar_el1, x1
+	isb
+	bl	wdt_secondary_main
+5:	wfe
+	b	5b
+
+/*
  * Exception vectors. Each slot stashes x29/x30, loads its slot number
  * and jumps to the common path, which saves x0-x28 and calls
  * exc_handler(slot, regs). IRQs return; everything else ends in the
@@ -137,3 +170,24 @@ exc_common:
 shim_end_va:
 	adr	x0, _end
 	ret
+
+/*
+ * Vectors for the watchdog core.
+ *
+ * The shim's normal vectors call exc_handler(), which paints the panic screen
+ * and then parks. By the time this core is running, the panel belongs to xnu,
+ * so painting it would be wrong, and parking would lose the deadline -- which
+ * is the one thing this core exists for. Every synchronous exception simply
+ * resumes the countdown loop: the timer read itself cannot fault, and a
+ * spurious IRQ/FIQ/SERROR during the wait is irrelevant because the deadline
+ * is what eventually resets the board, not an interrupt.
+ */
+	.balign	0x800
+wdt_vectors:
+	.rept	16
+	b	wdt_resume
+	.endr
+
+wdt_resume:
+	/* Return to the instruction after whatever raised this. */
+	b	.
