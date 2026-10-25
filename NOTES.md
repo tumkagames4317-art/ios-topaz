@@ -1,4 +1,52 @@
-﻿## 17:55 MSK 2026-10-25 -- SPMI facts measured tonight (autonomy -> fastboot)
+﻿## 18:22 MSK 2026-10-25 -- the BCB route (misc partition), and its first test
+
+The PMIC route is dead (see the entry above), so the question became: how does
+Android itself tell ABL "go to fastboot"? Not through the PMIC at all.
+
+`system/core/init/reboot.cpp`, `HandlePowerctlMessage()`:
+
+    if (reboot_target == "bootloader") {
+        write_reboot_bootloader(&err);      // writes the BCB
+    }
+
+The BCB (boot control block, `struct bootloader_message`) lives in the `misc`
+partition. ABL reads it and acts on `command[]`. That is the mechanism brunch
+and every Android device use for `adb reboot bootloader`, so it is known to
+work on this hardware class.
+
+### Measured on ginkgo
+- `misc` = `/dev/block/mmcblk0p38`, 1 MiB, 2048 sectors.
+- The first 4096 bytes are all zero.
+- The ONLY non-zero bytes in the whole partition are at offset **4096**:
+  `62 6f 6f 74 2d 73 79 73 74 65 6d 00` = the string `"boot-system"`.
+- Nothing else anywhere in the 1 MiB is non-zero.
+
+So on this device the live BCB `command[]` sits at **offset 4096**, not 0.
+That is one 4096-byte block in, which matches a layout where the structure is
+per-block rather than packed at the start.
+
+### Test 1 (negative)
+Backed the whole partition up first (`work/backups/misc-before-bcb.bin`,
+md5 c8f0b5f6b055f7701a6a2819aa22e649), then wrote `"boot-bootloader\0"` at
+offset 4096 and ran `adb shell reboot` from recovery.
+
+Result: the phone came back up on the shim's red screen, i.e. it booted
+normally. ABL did **not** divert to fastboot, so `boot-bootloader` in that slot
+is either not the field ABL looks at, or it needs a companion field (status or
+a sequence counter) to be considered valid.
+
+### Next things to try, in order
+1. Write the full `struct bootloader_message` at offset 0 (command AND status,
+   zeroed) and leave the 4096 copy alone, to see which one ABL honours.
+2. Write to both offset 0 and 4096.
+3. Compare against what OTA/recovery writes: capture `misc` right after a real
+   `reboot recovery`, since that is a code path known to work on this phone.
+
+### Practical note
+`misc` is trivially restorable: `adb pull` the backup back over
+`/dev/block/mmcblk0p38` in recovery. It holds no user data.
+
+## 17:55 MSK 2026-10-25 -- SPMI facts measured tonight (autonomy -> fastboot)
 
 Written while the phone was off USB, so these are the readings collected
 during the session with `-DSWEET_DIAG=1..4` builds. All values are from the
