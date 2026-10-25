@@ -116,25 +116,34 @@ index ccbb188..777aca4 100644
  	// Set low reset vector before attempting any loads
  	adrp	x0, EXT(LowExceptionVectorBase)@page
  	add		x0, x0, EXT(LowExceptionVectorBase)@pageoff
-@@ -609,6 +628,23 @@ Lkernelcache_base_found:
+@@ -609,6 +628,32 @@ Lkernelcache_base_found:
  	lsr		x5,  x24, #(ARM_TT_L2_SHIFT)
  	create_bootstrap_mapping x14, x15, x5, x3, x2, x9, x10, x11, x12, x13
  
 +#if defined(SWEET)
 +	/*
-+	 * Splash framebuffer: one 32MB Normal-NC block in the EXISTING V=P
-+	 * L2 table. Both framebuffer and RAM use L1 index 0; another call to
-+	 * create_bootstrap_mapping would replace the RAM L2 table.
-+	 * SWEET uses 16K pages and all bring-up RAM is below 4GB, so the first
-+	 * V=P L2 page is bootstrap_pagetables + 2*PGBYTES.
++	 * Splash framebuffer mapping.
++	 *
++	 * The original code added an L2 block to "the existing V=P L2 table",
++	 * asserting that the framebuffer and RAM share L1 index 0. That is true
++	 * on topaz (fb 0x9c000000 and RAM 0xb0000000 are both L1 index 2) but
++	 * NOT on ginkgo: the framebuffer is 0x5c000000, whose L1 index is 1,
++	 * while ginkgo RAM starts at 0x80000000, L1 index 2. The entry was
++	 * therefore written into the RAM table, 0x5c000000 stayed unmapped, and
++	 * the first framebuffer store after the MMU came on raised a synchronous
++	 * abort -- xnu died silently with the screen still showing the shim.
++	 *
++	 * Fix: map the whole 1GB block that contains the framebuffer with one
++	 * L1 entry. The block base is 0x40000000 (L1 index 1), so it cannot
++	 * collide with the RAM entries, and no extra page table is needed.
++	 * Normal-NC (CACHE_ATTRINDX_WRITECOMB) is right for a scanout buffer.
 +	 */
-+	MOV64	x10, 0x5c000000
++	MOV64	x10, 0x40000000
 +	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
 +	orr		x11, x11, x10
-+	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
-+	lsr		x12, x12, #(ARM_TT_L2_SHIFT)
-+	add		x13, x25, #(2 * PGBYTES)
-+	str		x11, [x13, x12, lsl #TTE_SHIFT]
++	and		x12, x10, #(ARM_TT_L1_INDEX_MASK)
++	lsr		x12, x12, #(ARM_TT_L1_SHIFT)
++	str		x11, [x25, x12, lsl #TTE_SHIFT]
 +#endif
 +
  	/* Ensure TTEs are visible */

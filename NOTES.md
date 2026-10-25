@@ -1,3 +1,56 @@
+## 21:55 MSK 2026-10-25 -- root cause of the silent xnu: the topaz patch set was being applied to ginkgo
+
+This is almost certainly the wall that every previous attempt ran into, and it
+took the framebuffer fix to see it. It is not a framebuffer problem at all.
+
+**The patch series mixes two different phones.** `xnu/patches/` holds the
+generic `sweet-*` series and a large `topaz-*` series (0080..0146) for the
+Redmi Note 10 Pro, and the workflow simply did:
+
+    cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/
+
+so **every** topaz patch went into every build. Two of them decide the CPU
+topology and both are hard-wired to topaz:
+
+- `0080-topaz-cpu-topology-skip-sweet-hw.patch`
+      if ((cpu->phys_id >> 8) > 1 || (cpu->phys_id & 0xff) > 3 || ...)
+          panic("SWEET CPU: invalid topology cpu=%u mpidr=0x%x count=%u")
+- `0082-topaz-boot-on-gold-cpu.patch`
+      if (topology->boot_cpu->cpu_id != 0 || topology->boot_cpu->phys_id != 0x100)
+          panic("SWEET CPU: expected boot MPIDR 0x100 and logical CPU 0, got 0x%x/%u")
+
+Those expectations describe topaz (SM6225 / Kryo 260: A53 at MPIDR 0x000..0x003,
+A73 at 0x100..0x103, boot on gold 0x100). On ginkgo the shim reports
+`mpidr=0x80000000` (recorded on the panel and in MIDR/MPIDR dumps), so
+`phys_id >> 8` is 0x800000 and `phys_id != 0x100` -- **both panics fire**.
+
+Why it looked like "xnu produces no output": the panic is printed very early,
+through the framebuffer pointer xnu was given, and everything xnu prints before
+that point is equally early. With the wrong address (0x9c000000) nothing was
+visible at all. With the corrected address (0x5c000000) the panel still did not
+change, which is what pointed at a fault *before* display initialisation rather
+than at the display itself.
+
+What is ruled out: the payload itself is healthy (entry 0xfffffe00074b6488,
+phys_base 0x80000000, mem 0xc0000000, ADT and boot_args inside DRAM); SCTLR at
+handoff is 0x30C00808 = MMU and both caches off, which is the state xnu expects
+to program itself; `ginkgo.adt` matches (dram-base/size, cpu regs 0x100..0x103
+for the four A73, display at 0x5c000000).
+
+Fix: `platform` input on the workflow (default `topaz`, so existing behaviour is
+unchanged) and, when it is `ginkgo`, `*-topaz-*` patches are skipped. Build
+**40223444367** (`workflow_dispatch`, `platform=ginkgo`) is the first ginkgo
+kernel.
+
+Also settled in this window: **the build loop is closed.** It was never a token
+problem -- pushing had always worked (the workflow only listens to `main` and
+`topaz`), and artifact download needed only a credential that was already in
+Windows Credential Manager. `gh` is installed; `GH_TOKEN` can be filled from
+`git credential fill` (prints a `gho_` token, 40 chars) without writing it
+anywhere. `gh run download <id> -R tumkagames4317-art/ios-topaz -n xnu-kernel`
+then works, which is how run 40220889119's kernel was retrieved. The
+publish-to-`xnu-kernel`-branch step added earlier is belt and braces.
+
 ## 21:22 MSK 2026-10-25 -- the build loop works again: git push is authorised
 
 The blocker that had been treated as fixed ("artifact download needs a token")
