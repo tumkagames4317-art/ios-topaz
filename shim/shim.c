@@ -24,6 +24,15 @@
 #define SWEET_AUTONOMY_PROBE	0
 #endif
 
+/*
+ * Mirrors loader.c's switch. When the boot ends in fastboot instead of
+ * handing over to xnu, there is nobody reading the panel, so the pauses that
+ * exist only to make the screen readable are skipped.
+ */
+#ifndef SWEET_XNU_HANDOFF
+#define SWEET_XNU_HANDOFF	0
+#endif
+
 #define IMEM_RESTART_REASON	0x0c12565cUL	/* qcom,msm-imem@c125000 restart_reason@65c */
 #define RESTART_BOOTLOADER	0x77665500U
 #define PSHOLD			0x0440b000UL
@@ -372,7 +381,13 @@ static void __attribute__((noreturn)) gold_main(uint64_t dtb)
 		gold_cpufreq_max();
 		uint64_t gt = speed_ticks();
 		con_hex2("SPEED", "silver=", (uint32_t)silver_ticks, "gold=", (uint32_t)gt);
-		delay_ms(1000);
+		/*
+		 * This second was for a human reading the panel. In the autonomous
+		 * path nobody is watching, and it is a full second added to every
+		 * boot that must end in fastboot, so it is skipped there.
+		 */
+		if (SWEET_XNU_HANDOFF)
+			delay_ms(1000);
 		con_skip();
 #if SWEET_AUTONOMY_PROBE
 		/*
@@ -629,17 +644,34 @@ void shim_main(uint64_t dtb)
 		int64_t r = smc(PSCI_CPU_ON, 0x100, (uintptr_t)secondary_entry, 4);
 		if (r == 0) {
 			/*
-			 * Gold accepted the handoff. Park here, but not for ever: if
+			 * Gold accepted the handoff. Wait here, but not for ever: if
 			 * gold dies before it reaches its own panic path, nobody would
 			 * ever set a restart reason, and the platform watchdog would
 			 * reset the board into a normal boot -- the "Redmi, half a
-			 * second of shim, reboot" loop. Give gold a generous window to
+			 * second of shim, reboot" loop. Give gold a bounded window to
 			 * become the one running the boot, then take the reset into our
 			 * own hands so the phone still lands in fastboot.
+			 *
+			 * The wait is a fixed wall-clock budget, not a iteration count.
+			 * A `volatile` counter is not a clock: its duration depends on
+			 * the pipeline and on where the image landed, so the same
+			 * constant here can mean 20 s or 200 s. This core has already
+			 * done its only job (it started gold), so the budget only needs
+			 * to be long enough for gold to print its first line.
 			 */
-			for (volatile uint64_t spin = 0; spin < 2000000000ULL; spin++)
-				if ((spin & 0xfffff) == 0)
-					__asm__ volatile("yield");
+			uint64_t freq;
+			__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+			uint64_t start;
+			__asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(start));
+			uint64_t budget = freq * 5u;	/* 5 seconds */
+
+			while (1) {
+				uint64_t now;
+				__asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(now));
+				if (now - start > budget)
+					break;
+				__asm__ volatile("yield");
+			}
 			con_str("SILVER", "gold never took over: -> fastboot");
 			autonomy_to_fastboot();
 			for (;;)	/* unreachable on success */

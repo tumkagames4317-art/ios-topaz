@@ -1,3 +1,28 @@
+## >>> HANDOFF 2026-10-25 14:35 (ginkgo): every wait on the fastboot path is now wall-clock <<<
+
+The autonomy path is only worth anything if nothing before it can stall, so
+each wait on the way to `autonomy_to_fastboot()` was audited and bounded.
+
+**Silver's handoff wait** (`shim_main`, after `PSCI_CPU_ON` succeeded) used a
+`volatile` counter to 2 000 000 000. That is not a clock: its duration depends
+on the pipeline and on where the image happens to be in memory, so the same
+constant could mean 20 s or 200 s. It is now a real 5-second budget read from
+`cntfrq_el0`/`cntpct_el0` with `yield` in the loop -- long enough for gold to
+print its first line, short enough that a dead gold still resets the phone
+promptly.
+
+**The one-second screen pause** (`delay_ms(1000)` after `SPEED`) existed purely
+for a human reading the panel. It is now compiled out when
+`SWEET_XNU_HANDOFF` is 0, i.e. in exactly the autonomous configuration.
+
+Combined with the eMMC timeout fix above, the worst case from shim entry to the
+reset is now **~5 s (silver path) / ~1.5 s (gold path)** regardless of whether
+the card, the PMIC or xnu respond at all.
+
+Image: `build/emmc11/ginkgo-emmc11.img`, md5 `76c8ae66b0184f05ae4ae1435f258f4d`.
+
+---
+
 ## >>> HANDOFF 2026-10-25 14:32 (ginkgo): eMMC driver must never outlast the reset <<<
 
 A fifth defect found by reading the driver rather than by running it, and the
