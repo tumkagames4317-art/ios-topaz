@@ -1,3 +1,54 @@
+## >>> HANDOFF 2026-10-25 14:38 (ginkgo): two images armed, probe first <<<
+
+The phone has been off USB since ~14:16, so nothing below has run yet. Two
+images are built and a self-restarting watcher
+(`work/tools/autoloop.ps1`, job `pwsh-c6ee3d88af724fd2`) fires on the first
+`fastboot devices` hit.
+
+**Step 1 -- prove the mechanism.**
+`build/probeA/ginkgo-probeA.img`, md5 `b832c73baca305827dc3763c8fcafd05`.
+Built with `-DSWEET_AUTONOMY_PROBE=1`, so `gold_main` prints `PROBE gold:
+autonomy probe -> fastboot` and calls `autonomy_to_fastboot()` **before**
+`loader_boot`, before the MMU, before xnu. Nothing else can fail first.
+
+How to read the result:
+
+* **Phone appears in fastboot within ~10 s** -> IMEM + PSCI work from EL1 and
+  the whole approach is sound. Move to step 2 and the only remaining question
+  is whether the eMMC log works.
+* **Phone hangs on the red screen, no USB** -> the mechanism itself is wrong.
+  No amount of loader work will fix it, and the next thing to try is the PMIC
+  restart reason alone, or a bare `psci SYSTEM_RESET` with the IMEM write
+  removed, to find out which half is broken.
+
+**Step 2 -- the real thing.**
+`build/emmc11/ginkgo-emmc11.img`, md5 `76c8ae66b0184f05ae4ae1435f258f4d`.
+Full boot with the eMMC log, bounded waits, and every exit routed to fastboot.
+
+If step 1 succeeds, step 2's panel should read, in order:
+
+```
+EMMC base=.. caps=..
+EMMC capbase_mhz=.. div=255
+OCR ..
+EMMC rca=.. state=4
+EMMC lba0[510]=55 lba0[511]=aa
+EMMC card ready, 512-byte PIO
+EMMC userdata_lba=.. ent=..
+GATE emmc=1 log=1
+```
+
+If `userdata_lba` appears, the log is live for the first time on this device,
+and every future failure can be read out instead of photographed:
+
+```
+adb shell "dd if=/dev/block/by-name/userdata bs=4096 skip=11641087 count=1025 \
+           of=/sdcard/ufslog.bin"
+adb pull /sdcard/ufslog.bin
+```
+
+---
+
 ## >>> HANDOFF 2026-10-25 14:36 (ginkgo): audit of every path that must end in fastboot <<<
 
 The autonomy mechanism is only as good as its weakest exit, so the whole
