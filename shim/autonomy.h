@@ -44,3 +44,19 @@ int pon_set_restart_reason(uint32_t reason);
  * PSCI SYSTEM_RESET with PS_HOLD as the fallback. Does not return on success.
  */
 void autonomy_to_fastboot(void);
+
+/*
+ * Reboot the phone every `seconds` seconds, regardless of what the rest of the
+ * shim is doing. Returns only if the elapsed time could not be measured.
+ *
+ * The APCS watchdog at 0x0f017000 does not produce a reset on SM6125 (measured:
+ * armed, waited 105 s, board kept running), so this is a polled deadline on
+ * CNTPCT_EL0 instead of a hardware watchdog. It is called from the one place in
+ * the boot that cannot itself wedge, and it never gives up: when the deadline
+ * passes it rewrites the IMEM reason and drops both PSCI and PS_HOLD.
+ *
+ * This is deliberately a *forced* reboot, not an "if stuck" reboot: the point
+ * is that a wedge anywhere later in the boot still ends with the board cycling
+ * instead of sitting there silently.
+ */
+void autonomy_reboot_loop(unsigned seconds);

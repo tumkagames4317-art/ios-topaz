@@ -33,6 +33,17 @@
 #define SWEET_XNU_HANDOFF	0
 #endif
 
+/*
+ * Keep-alive reboot period in seconds. 0 disables it, which is what every
+ * normal build wants; a non-zero value makes the shim reset the board once that
+ * many seconds have passed, whatever the rest of the boot is doing.
+ *
+ * Set from the build script as -DSWEET_REBOOT_EVERY_SEC=60.
+ */
+#ifndef SWEET_REBOOT_EVERY_SEC
+#define SWEET_REBOOT_EVERY_SEC	0
+#endif
+
 #define IMEM_RESTART_REASON	0x0c12565cUL	/* qcom,msm-imem@c125000 restart_reason@65c */
 #define RESTART_BOOTLOADER	0x77665500U
 #define PSHOLD			0x0440b000UL
@@ -703,6 +714,22 @@ void shim_main(uint64_t dtb)
 	ufslog_str("BOOT", "shim reached the log init");
 	if (!pmic_init())
 		con_str("PMIC", "no keys: park only");
+
+#if SWEET_REBOOT_EVERY_SEC
+	/*
+	 * Forced keep-alive reboot, armed as early as the board can be trusted:
+	 * the log is up, so whatever happens after this point is written down,
+	 * and the deadline runs no matter how the rest of the boot behaves.
+	 *
+	 * The APCS watchdog does not reset this SoC (measured), so this is a
+	 * polled CNTPCT deadline in autonomy.c. It replaces the boot from here
+	 * on: the reset fires while loader_boot is still running.
+	 */
+	con_hex2("WD", "armed s=", (uint32_t)SWEET_REBOOT_EVERY_SEC, " tick=0", 0);
+	ufslog_str("WD", "keep-alive reboot armed");
+	ufslog_flush();
+	autonomy_reboot_loop(SWEET_REBOOT_EVERY_SEC);
+#endif
 
 #if SWEET_AUTONOMY_PROBE
 	/*

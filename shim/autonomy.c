@@ -675,3 +675,83 @@ void autonomy_to_fastboot(void)
 	for (;;)
 		__asm__ volatile("wfi");
 }
+
+/*
+ * A reset that needs no help from the PMIC.
+ *
+ * autonomy_to_fastboot() above tries to ask ABL for fastboot and parks if the
+ * IMEM store did not take. That is right when the goal is to *reach* fastboot,
+ * but it is the wrong shape for a plain keep-alive cycle: a park is exactly the
+ * silent dead end this is meant to remove.
+ *
+ * So this path writes the reason as a best effort, ignores whether it stuck,
+ * and then uses every reset primitive in turn. PS_HOLD alone is enough -- it is
+ * proven to power-cycle the board (the panel flickers and ABL comes back), and
+ * it needs nothing initialised.
+ */
+static void reset_now(void)
+{
+	/* Best effort only: an unwritten reason must not stop the reset. */
+	(void)pon_set_restart_reason(PON_RESTART_REASON_BOOTLOADER);
+	imem_set_reason(IMEM_REASON_BOOTLOADER);
+
+	psci_reset(PSCI_SYSTEM_RESET);
+	psci_reset(PSCI_SYSTEM_RESET2);
+
+	REG32(PSHOLD_BASE) = 0;
+	__asm__ volatile("dsb sy" ::: "memory");
+
+	/* PS_HOLD is a latch on the PMIC: give it time to act before retrying. */
+	for (volatile uint64_t i = 0; i < 20000000ULL; i++)
+		__asm__ volatile("nop");
+
+	REG32(PSHOLD_BASE) = 0;
+	__asm__ volatile("dsb sy" ::: "memory");
+}
+
+void autonomy_reboot_loop(unsigned seconds)
+{
+	uint64_t freq = 0;
+	uint64_t start = 0;
+
+	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+	__asm__ volatile("isb");
+	__asm__ volatile("mrs %0, cntpct_el0" : "=r"(start));
+
+	/*
+	 * A zero or absurd frequency would make the deadline meaningless. Rather
+	 * than guess at a cycle count and reboot almost immediately, leave the
+	 * caller in control and report the problem on the panel.
+	 */
+	if (freq < 1000 || freq > 1000000000ULL) {
+		con_hex2("WD", "cntfrq=", (uint32_t)freq, " skip", 0);
+		return;
+	}
+
+	uint64_t period = freq * (uint64_t)seconds;
+
+	for (;;) {
+		uint64_t now;
+
+		__asm__ volatile("isb");
+		__asm__ volatile("mrs %0, cntpct_el0" : "=r"(now));
+		if (now - start >= period)
+			break;
+	}
+
+	/*
+	 * Print before resetting: this is the only proof, once the log is
+	 * readable again, that the deadline actually expired rather than the
+	 * board dying of something else.
+	 */
+	con_hex2("WD", "timeout s=", seconds, " rebooting", 0);
+	ufslog_str("WD", "minute timeout: forcing reboot");
+	ufslog_flush();
+
+	reset_now();
+
+	/* Nothing above returned. Park loudly rather than silently. */
+	con_str("WD", "no reset path: parked");
+	for (;;)
+		__asm__ volatile("wfi");
+}
