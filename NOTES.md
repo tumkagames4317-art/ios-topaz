@@ -1,3 +1,177 @@
+### 00:20 MSK 2026-10-26 -- the console dump proves ginkgo clears all eight stages
+
+Reading `work/build/qrG4/fb.raw` line by line, every one of the eight
+`arm_init` stage bands is on screen, each followed by the marker text xnu
+prints next to it:
+
+    y=  4  Google Inc. SWEET EARLY 1
+    y= 36  Google Inc. SWEET EARLY 2
+    y= 68  Google Inc. SWEET EARLY 3
+    y=100  Google Inc. SWEET EARLY 4
+    y=132  Google Inc. SWEET EARLY 5
+    y=164  Google Inc. SWEET EARLY 6
+    y=196  Google Inc. SWEET EARLY 7
+    y=260  Google Inc. SWEET EARLY 8
+    y=298  stage-8 digit glyphs
+
+Stages are disabled past 8 and before `arm_vm_init`, so **ginkgo now gets
+through `arm_vm_init` and the whole early VM bring-up** -- exactly where the
+topaz board also stops. That was the goal for tonight.
+
+### Where it stops now
+
+    PC = _halt_all_cpus + 0x34          <- kernel halted itself
+    ELR = _DebuggerTrapWithState        <- reached via _panic
+
+So the eight-stage path completes and the kernel then takes an **assert
+panic**, well past the fixture it used to die in. No panic text reached the
+framebuffer (only one text row exists below y=300), so the message string has
+to come from somewhere else -- see the next action. The `GOOS`-looking glyphs
+at y=298 are the stage-8 digit band, not words.
+
+### Why topaz looked "healthy" and ginkgo "broken" earlier tonight
+
+It was backwards. In the fixed harness **topaz draws nothing at all**
+(0 non-black pixels) while ginkgo paints eight banner lines. The old
+"topaz healthy" verdict came from the broken-`boot_args` runs, where topaz
+died before touching the framebuffer. Do not re-use that table.
+
+### Next action
+
+Get the panic string. Options, cheapest first:
+1. Extend the QMP `pmemsave` to dump the whole 3 GiB and grep for the
+   assert buffer, or
+2. read `ba->CommandLine` for `keepsyms=1 debug=0x...` and check boot-arg
+   plumbing reached the kernel, then
+3. add a temporary second framebuffer text line in the panic path.
+## 23:55 MSK 2026-10-25 -- BREAKTHROUGH: ginkgo xnu reaches arm_init and draws its console on screen
+
+The port has never been this far. In QEMU, with the corrected harness, the
+ginkgo kernel boots through the MMU, enters `arm_init`, and paints the xnu
+console on the splash framebuffer. Screen dump (`work/build/qrG4/fb.raw`,
+decoded with `work/tools/fbshow.py`):
+
+    Google Inc. SWEET ...          <- banner, first line
+    ... SWEET EARLY 1 ...          <- xnu's own stage-1 marker
+
+`SWEET EARLY 1` is defined in NOTES as "entered `arm_init` with the MMU on".
+It had never appeared before. There are 10 text lines plus the stage bands
+(0xff20ff00, 0xff40ff00, ... = stages 1..8 colours, 1536 px each).
+
+### What actually unblocked it: the fuzzball was my QEMU harness, not the kernel
+
+`qemu-sweet.py` and my first `qrun.py` wrote `boot_args` at the wrong offsets.
+The real layout (checked at compile time by `shim/loader.c` against
+`pexpert/pexpert/arm64/boot.h`) is:
+
+    Synchronization 0x000  Revision u16, Version u16
+    virtBase        0x008  physBase 0x010  memSize 0x018  topOfKernelData 0x020
+    Video           0x028  (boot_video: 6 x u64 = 48 bytes)
+    machineType     0x058
+    deviceTreeP     0x060  deviceTreeLength 0x068
+    CommandLine     0x06C  (608 bytes)
+    bootFlags       0x2CC  memSizeActual 0x2D4
+
+My harness had `deviceTreeP` at 0x28 (where Video belongs) and `CommandLine`
+at 0x38. xnu then read the command-line text as a pointer and died with
+`Data Abort, FAR 0x72706b5f656c6261` -- which is ASCII "able_kpr", part of
+`-enable_kprintf_spam`. That single mistake produced every misleading result
+earlier tonight, including the false lead that patch 0010's L1 block was to
+blame (it never reached the fault; `regs.txt` showed the L1 value simply
+because it was the last thing written before the harness-induced fault).
+
+**Lesson: read `regs.txt` and the FAR payload as ASCII before believing a
+kernel-side story.**
+
+### Current status of the two boards in the same harness
+
+| kernel | result |
+|---|---|
+| topaz `out-4022` | reaches `arm_init`; Undefined Instruction in a panic path at `0x7339b14` |
+| ginkgo `out-g3`  | reaches `arm_init`; panic trap at `0x73249dc` (`_DebuggerTrapWithState`) |
+
+Both now die in a **panic**, not in the MMU -- and both nail the same wall, so
+whatever comes next is shared-board work rather than ginkgo-specific.
+
+### Tools added outside the repo (do not commit device data)
+
+- `work/tools/qrun.py` -- the working harness. TCP QMP (no `AF_UNIX` on
+  Windows), per-segment `-device loader` staging (a single 3 GiB `ram.bin`
+  makes QMP time out), correct `boot_args`, dumps `regs.txt` + `fb.raw`.
+- `work/tools/fbshow.py` -- prints the framebuffer as ASCII art; this is how
+  the console is read, since ginkgo has no serial port.
+- `work/tools/fbtext.py` -- iso_font OCR attempt; the glyph table offset and
+  scale still need to be pinned down (`iso_font` symbol sits 35 bytes into the
+  table, and the console draws 8x8 glyphs at 2x).
+- `work/tools/mpidr.py`, `work/tools/scan_sysreg.py` -- small probes.
+
+### Next concrete action
+
+Read the rest of the console (`fbshow.py` over y=0..600) to get the panic
+message text; the string will name the failing subsystem directly. Start with
+line 3 onward, skipping the banner.
+## 23:10 MSK 2026-10-25 -- QEMU reproduces the silent death; the L1 framebuffer patch was corrupting the tables
+
+**QEMU now works as an offline debugger for this port** (installed via winget,
+`C:\Program Files\qemu`). Two Windows-only fixes were needed in
+`tools/qemu-sweet.py`, plus a new helper `work/tools/qrun.py` outside the repo:
+
+- `FB_BASE` is now `SWEET_FB_BASE` env (default still 0x9c000000); ginkgo needs 0x5c000000.
+- `QEMU_BIN` env points at the binary, because a child process started from a
+  script does not inherit the installer's directory on PATH.
+- Windows python has **no `AF_UNIX`**, so the QMP socket hangs forever. The
+  script only appears to "hang" for this reason. `work/tools/qrun.py` drives the
+  same launch over **TCP** QMP and dumps `regs.txt`/`fb.raw` reliably.
+- `qrun.py` stages a `ram.bin` of the full DRAM span. For ginkgo that is 3 GiB
+  (`mem_size=0xc0000000`) and QEMU takes too long to absorb it, so QMP times
+  out; building the ADT with `MIDBASE=0x80000000 MIDSIZE=0x20000000
+  python tools/mkadt.py OUT --qemu --midmem` gives a 512 MiB payload that boots
+  the harness fine.
+
+Method: `MIDBASE`/`MIDSIZE` + `--qemu --midmem` makes a QEMU-flavoured ADT with
+the phone's DRAM numbers, `mkpayload.py` wraps kernel+ADT, `qrun.py` runs it.
+
+### Result matrix (same QEMU, same host)
+
+| kernel | ADT | outcome |
+|---|---|---|
+| topaz `out-4022` | topaz | healthy, IRQ exceptions only |
+| ginkgo `out-g2` | topaz | `Prefetch Abort`, FAR tracks phys_base |
+| ginkgo `out-g2` | ginkgo | `Prefetch Abort`, FAR 0x8148e43c |
+
+So **the ADT is not the variable; the ginkgo kernel binary is.** Hardware and
+QEMU agree: the panel showed the stage-0 band and never stage 1, and QEMU faults
+in the same place. The abort is the `ISB` immediately after `MSR SCTLR_EL1`:
+
+    0x748e438  MSR SCTLR_EL1, x0   x0 = 0x3454593d (valid: M/C/I set, no WXN)
+    0x748e43c  ISB                ESR 0x86000005 (translation fault, level 3)
+
+The SCTLR value is fine, so the fault is the page table: the ISB is fetched
+through TTBR1 and the last-level entry covering 0xfffffe000748e43c is invalid.
+
+### The cause: patch 0010's L1 block
+
+`regs.txt` from the failing run, compared with the healthy topaz run, is
+decisive -- the last values written before the fault are the framebuffer
+address and its PTE:
+
+    topaz (ok)   X10=0x5c000000  X11=0x006000005c000605
+    ginkgo (bad) X10=0x40000000  X11=0x0060000040000605
+
+That is the `MOV64 x10, 0x40000000` of the L1-block variant committed in
+`c6a7a8d`. Writing a 1 GB L1 block into `bootstrap_pagetables` at `x25` damages
+the table start.s is still building, so the TTBR1 root ends up without a valid
+leaf for the kernel's own text. Reverted in `5fc6d37`.
+
+The previous L2 version of the same hunk is **not** proven good either: it also
+faults at the identical instruction. It was never independently tested, because
+the only kernel that used it (`out-g2`) is the one whose build included the L1
+change. A rebuild with the revert is running as CI run `40229413202`; that
+kernel is the first honest test of the L2 hypothesis and must be run through
+`qrun.py` before anything is flashed.
+
+**Do not flash until the QEMU harness shows no Prefetch Abort.** QEMU costs a
+minute; a flash costs a phone reboot the user has to perform by hand.
 ## 21:55 MSK 2026-10-25 -- root cause of the silent xnu: the topaz patch set was being applied to ginkgo
 
 This is almost certainly the wall that every previous attempt ran into, and it
