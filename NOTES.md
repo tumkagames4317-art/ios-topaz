@@ -1,4 +1,93 @@
-﻿## 18:22 MSK 2026-10-25 -- the BCB route (misc partition), and its first test
+## 20:30 MSK 2026-10-25 -- SOLVED: autonomous fastboot via the AVB footer
+
+**Result: a boot image without an AVB footer cannot be booted by ABL, so ABL
+drops to fastboot by itself. Measured on cold start (power button, no PC):
++3 s and +4 s. Four consecutive `fastboot reboot` cycles: 2.1-2.7 s each.**
+
+This is the mechanism the whole project was missing, and the earlier SPMI/PMIC
+work was not needed for it.
+
+### The finding
+
+Compare the last 64 bytes of the partition:
+
+    stock-boot.img     -> 'AVBf'   (AVB footer present)
+    stock-recovery.img -> 'AVBf'
+    ANY image we build -> 00 00 00 00
+
+ABL validates the AVB struct before it runs anything. Our images carry no
+footer, so it refuses them and falls back to fastboot. That refusal IS the
+autonomous fastboot we wanted.
+
+Proved by controlled substitution, not by inference: the same XNU payload,
+
+- flashed as-is (no footer) -> fastboot every boot
+- with the stock AVB region grafted on -> `fastboot boot` reports
+  `Booting OKAY [0.191s]` and the red shim appears on the panel
+
+### Working two-image scheme
+
+| image | where | effect |
+|---|---|---|
+| `ginkgo-anchor.img` (md5 1152CED28153D13C804B654D2048B71C) | flashed to `boot` | ABL refuses -> fastboot, 2-4 s |
+| `t-xnu.img` (md5 4E19E41F1340BB1FB4266FB22A625535) | `fastboot boot` only | ABL accepts -> red shim / XNU |
+
+`fastboot boot` writes nothing, so `boot` stays the anchor and every reboot
+lands back in fastboot: a boot menu driven from the PC.
+
+Saved copies of every image, tool and backup: `work/fastboot-scheme/`
+(README.md there documents the full AVB layout field by field).
+
+### AVB layout of the stock boot partition
+
+    offset 0             boot image body (kernel + ramdisk + dtb)
+    offset 21 463 040    vbmeta block, 768 bytes
+    last 64 bytes        footer 'AVBf'
+
+Footer, big-endian: magic, version 1.0, original_image_size,
+vbmeta_offset, vbmeta_size.
+
+vbmeta header has **auth_block_size = 0, algorithm_type = NONE, 0 public
+keys, 0 descriptors in the header, flags = 0**. There is no signature at all.
+The whole payload is one hashtree descriptor in the aux block:
+
+    +0    parent_image_size   u64
+    +8    salt                32 B fixed, "sha256" + zeros
+    +40..+52 u32: 4, 64 (digest len), 32 (hash block), 0 (flags)
+    +116  name                "boot"  -- NO length prefix
+    +120  root_digest         64 B
+    body is exactly 184 bytes; aux padded with zeros to 512
+
+Because there is nothing signed, grafting the stock AVB onto a hand-built
+image is legitimate: the format is valid and the unlocked ABL has nothing to
+verify.
+
+### What was disproved tonight (do not retry)
+
+- `boot-bootloader` in `misc` -- ignored. ABL does not read the BCB to choose
+  fastboot. `boot-recovery` in `misc` DOES work, so the BCB is honoured for
+  recovery only.
+- An **empty vbmeta** (flags=3, verification disabled) makes things WORSE:
+  ABL stops checking, tries to boot, and displays "The system has been
+  destroyed" instead of dropping to fastboot. The AVB check is the mechanism,
+  not an obstacle.
+- A deliberately corrupt kernel in `boot` hangs on the Redmi logo; it does not
+  reach fastboot.
+- The first bootloop was NOT caused by the broken gzip in the kernel slot.
+  `mkimage.py` really does write the ramdisk into the middle of the kernel slot
+  when the kernel is bigger than the stock one, but after fixing that the
+  behaviour was identical. That diagnosis was wrong and had to be withdrawn.
+
+### Still open
+
+- `work/tools/avbfooter.py` builds a structurally correct footer but cannot
+  reproduce `root_digest`: it is not sha512 of the image, nor salted sha512 in
+  either order. It is almost certainly a Merkle root over 4096-byte blocks.
+  The working route is to copy the stock AVB region verbatim, which limits the
+  body to 21 463 040 bytes.
+- Not measured what ABL reports internally for the refusal.
+
+## 18:22 MSK 2026-10-25 -- the BCB route (misc partition), and its first test
 
 The PMIC route is dead (see the entry above), so the question became: how does
 Android itself tell ABL "go to fastboot"? Not through the PMIC at all.
