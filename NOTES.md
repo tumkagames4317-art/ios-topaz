@@ -1,3 +1,116 @@
+## 20:35 MSK 2026-10-25 -- FOUND IT: xnu prints to the wrong framebuffer
+
+The test image ran, shim handed over, and the panel stopped at
+`AUTO handoff to xnu enabled` with **no blue panic**. That combination rules out
+"xnu crashes before it can speak": the shim's exception vectors are still
+installed, so any EL1 exception would have painted the blue dump. No dump
+means no exception reached the vectors.
+
+The reason is not silence, it is a wrong address.
+
+`0010-sweet-early-framebuffer-debug.patch` hardcodes the debug console base:
+
+    #define EARLY_FB ((volatile uint32_t *)(uintptr_t)0x9c000000)
+
+and `start.s` in the same patch draws a stage-0 band at
+`0x9c000000 + 2368 * 4320`. That arithmetic -- 0x9c000000 + 0x9c1800 =
+**0x9c9c1800** -- is exactly the address I decoded out of `_start` earlier and
+mistook for a boot-log buffer. It is the marker band, and it gets drawn at
+0x9c000000.
+
+**ginkgo's splash region is at 0x5c000000, not 0x9c000000.** Proof from the
+device tree itself (`build/ginkgo.dtb`): the reserved-memory node is literally
+named `cont_splash_region@5c000000`. The shim has used 0x5c000000 all along
+(`console.h`), which is why the red shim screen works.
+
+0x9c000000 is the Redmi Note 10 Pro address -- `sweet_early.c` still carries the
+comment "Redmi Note 10 Pro bootstrap console". On ginkgo it lands in ordinary
+DRAM, so every write succeeds, nothing faults, and nothing appears. xnu has been
+talking the whole time into memory no one maps to the panel. Any panic text went
+to the same dead address, which is why even the UFS-root `panic("IOFindBSDRoot:
+SWEET UFS root %s unavailable")` was invisible.
+
+### Fix applied
+
+Replaced `0x9c000000` -> `0x5c000000` in the six places that reference it:
+
+| patch | place |
+|---|---|
+| 0010 | `start.s` stage-0 band base |
+| 0010 | `start.s` bootstrap L2 block mapping |
+| 0010 | `sweet_early.c` `EARLY_FB` define |
+| 0012 | `arm_vm_init.c` final L2 block mapping |
+| 0012 | `0012`'s own `-#define EARLY_FB` context line |
+| 0012 | `sweet_early.c` `early_fb` runtime pointer |
+
+The `.bak-9c` copies of both patches are kept beside them. `diff` against the
+backups shows only those six lines changed, so the hunk headers still line up.
+
+### Next
+
+Kernel must be rebuilt from these patches (GitHub Actions, needs a token to
+fetch the artifact) and booted. Expected: the stage-0 white band appears at the
+top of the panel, then `sweet_early_mark(1..7)` lines, and if the UFS root is
+still missing, a visible xnu panic naming the reason -- which is the real
+milestone, because from there every later failure becomes readable.
+
+Note the UFS question is separate and still open: `rd=ufsroot0` asks for a UFS
+controller ginkgo does not have (it is eMMC). Seeing that panic on the panel
+will confirm the diagnosis rather than end it.
+
+## 20:20 MSK 2026-10-25 -- XNU entry disassembled; build fixed; test image ready
+
+### Fixed: the shim did not link with SWEET_XNU_HANDOFF=1
+
+`loader.c` calls `wdt_selftest()` but nothing defined it -- only the prototype in
+`autonomy.h` survived an earlier refactor, so any build with the handoff enabled
+failed at link time with `undefined symbol: wdt_selftest`. Implemented it in
+`pmic.c` (it owns the APCS_WDT registers) and declared it in `pmic.h`, which is
+the header `loader.c` already includes. It programs a very long countdown --
+a bite during xnu start-up would be indistinguishable from an xnu crash -- and
+reports 1 live / 0 gated / -1 block absent. This is also the check that
+documents, on the panel, that the APCS watchdog does not reset this SoC.
+
+### What xnu's entry point actually does (decoded instruction by instruction)
+
+Payload entry `0xfffffe00074b6488` (PA `0x814b6488`, matches the panel) is a
+five-instruction veneer: `br x0`, `b .`, `b +0x1c64`, then nops. So xnu takes
+`x0` = boot_args in PA, as the shim passes it.
+
+The real `_start` at `0xfffffe00074b80ec` (`entry+0x1c64`):
+
+    msr daifclr, #2        unmask IRQ/FIQ
+    dsb sy
+    mov x20, x0            keep boot_args
+    <fill>                 writes 0xffffffff into DRAM at 0x9c9c1800,
+                           stride 0x10e0 (4320) x 32 -- a boot log buffer,
+                           inside the 3 GiB the shim hands over
+    msr ttbr1_el1, x0      xnu builds its OWN page tables
+    msr tcr_el1, x0
+    msr mair_el1, x0
+    msr sctlr_el1, xzr     MMU off
+    msr sctlr_el1, x0      MMU on, xnu's configuration
+
+**This matters for the port:** xnu reprograms TCR/SCTLR/TTBR1 itself, so the
+shim's MMU-off state is not what xnu inherits -- there is no need to match
+Apple's exact pre-handoff MMU state. The stride `0x10e0` matching our
+framebuffer stride is the boot-log buffer, not the panel.
+
+### Ready to test (phone was not connected when this was written)
+
+`work/build/xnuh/ginkgo-xnuh.img`, md5 `0AA7FD8DBC31D00A69EF95399593EEE7`:
+shim built with `-DSWEET_XNU_HANDOFF=1`, plus the stock AVB region grafted on so
+ABL accepts it for `fastboot boot`.
+
+Expected panel: the usual MIDR/PHYS/SEGS/ADT/BOOTARG/JUMP/SCTLR lines, then
+`AUTO handoff to xnu enabled`, then either a blue PANIC dump (the shim's vectors
+are still installed) or the screen simply freezing on `XNU jumping`.
+
+The distinction is the actual experiment: a blue dump means xnu took an
+exception and the register block names the fault; a frozen red screen means no
+exception ever reached EL1 -- xnu is either spinning, waiting on something, or
+writing its output somewhere that is not this panel.
+
 ## 20:30 MSK 2026-10-25 -- SOLVED: autonomous fastboot via the AVB footer
 
 **Result: a boot image without an AVB footer cannot be booted by ABL, so ABL

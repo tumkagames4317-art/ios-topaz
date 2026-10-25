@@ -72,6 +72,54 @@ void watchdog_disarm(void)
 	__asm__ volatile("dsb sy" ::: "memory");
 }
 
+/*
+ * Arm the watchdog briefly and report whether the writes latch.
+ *
+ * loader.c calls this immediately before handing over to xnu, to answer one
+ * question on the panel: can this block reset the board at all? The answer
+ * measured on ginkgo is no -- the block is gated after ABL and the EN bit does
+ * not stick -- but the check stays because it is cheap and because "the
+ * watchdog does not work here" has to stay an observation rather than a
+ * remembered guess.
+ *
+ * Return values:
+ *   1  = EN read back set and BITE_TIME took the value: the block is live
+ *   0  = the block decoded but EN did not stick: gated, no reset from here
+ *  -1  = the block does not decode at all (reads all ones)
+ *
+ * The caller only prints the result, it does not branch on it.
+ */
+int wdt_selftest(void)
+{
+	uint32_t en_before, bite_before, en_after, bite_after;
+
+	en_before = REG32(APCS_WDT0_EN);
+	bite_before = REG32(APCS_WDT0_BITE_TIME);
+
+	/* A block that does not decode reads back all ones on most Qualcomm SoCs. */
+	if (en_before == 0xffffffffu)
+		return -1;
+
+	/*
+	 * Program a long countdown rather than a short one: this runs right
+	 * before the handoff, and a bite that fires during xnu's own start-up
+	 * would be indistinguishable from an xnu crash. 0x7ffffff seconds worth
+	 * of ticks is effectively "never".
+	 */
+	watchdog_arm(0x3ffffffu, 0x7ffffffu);
+
+	en_after = REG32(APCS_WDT0_EN);
+	bite_after = REG32(APCS_WDT0_BITE_TIME);
+
+	watchdog_disarm();
+
+	if ((en_before & 1u) == 0u && (en_after & 1u) == 0u)
+		return 0;	/* the enable bit never took */
+	if (bite_after != 0x7ffffffu)
+		return 0;	/* the counter register is not writable either */
+	return (en_after & 1u) ? 1 : 0;
+}
+
 static void spin_ms(uint32_t ms)
 {
 	uint64_t f, start, now;

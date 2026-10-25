@@ -25,3 +25,5 @@ void reboot_now(uint64_t imem_reason);
 void watchdog_arm(uint32_t bark_ticks, uint32_t bite_ticks);
 /* Stop it again, e.g. if a later stage sets up its own. */
 void watchdog_disarm(void);
+/* Arm briefly and report whether the writes latch: 1 live, 0 gated, -1 no block. */
+int wdt_selftest(void);
