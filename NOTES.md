@@ -1,3 +1,38 @@
+## >>> HANDOFF 2026-10-25 14:46 (ginkgo): a watcher that actually survives, at last <<<
+
+Two separate reasons the unattended watcher kept dying, both now understood and
+both fixed. Neither had anything to do with the phone.
+
+**1. The script gave up after ten minutes.** `Wait-Fastboot 600` then `break`
+out of the cycle loop. Fixed earlier with `-BeforeFlashTimeoutSec 0` = wait for
+ever.
+
+**2. Every background job in this environment is killed after roughly a
+minute.** Measured directly: a `1..900 | %{ Start-Sleep 1; print }` probe job
+logged 48 one-second ticks and was then terminated with exit `4294967295`
+(`-1`, i.e. killed by signal) while still reporting `running` from inside. A
+`Start-Process` child launched from such a job dies with its parent too.
+
+So no amount of fixing the script's own timeouts could produce a watcher that
+outlives the run. The watcher now lives in **Task Scheduler**, outside the job
+tree:
+
+```
+schtasks /Create /TN "DSHginkgoWatch" /TR "<work>\tools\watch-probeB.cmd" \
+         /SC ONCE /ST 00:00 /F
+schtasks /Run    /TN "DSHginkgoWatch"
+```
+
+`watch-probeB.cmd` loops `autoloop.ps1` forever; `autoloop.ps1` itself waits
+without a deadline. Verified: task status stays `Running` across a 80 s window
+that would have killed a job, and keeps polling `fastboot devices` — so the
+moment the phone appears it will be flashed without anyone touching anything.
+
+Note: `/RL HIGHEST` fails here (needs elevation). Plain user-level task is
+enough because fastboot needs no admin rights.
+
+---
+
 ## >>> HANDOFF 2026-10-25 14:43 (ginkgo): the watcher no longer gives up <<<
 
 Every attempt to flash in the last half hour died of the same self-inflicted
