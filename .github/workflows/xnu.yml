@@ -46,6 +46,10 @@ jobs:
     # (Xcode 16's iig emits IORPC.kernelContent, which this xnu lacks)
     runs-on: macos-14
     timeout-minutes: 120
+    # The publish step pushes the built kernel to a branch, which the default
+    # read-only GITHUB_TOKEN cannot do.
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
