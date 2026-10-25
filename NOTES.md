@@ -1,3 +1,38 @@
+## >>> HANDOFF 2026-10-25 14:36 (ginkgo): audit of every path that must end in fastboot <<<
+
+The autonomy mechanism is only as good as its weakest exit, so the whole
+control flow was walked and checked. Every way out of the shim now reaches
+`autonomy_to_fastboot()`:
+
+| exit | where | reaches fastboot? |
+|---|---|---|
+| exception at any EL1 slot | `exc_handler` -> `HALT panic: auto-fastboot now` | yes |
+| loader failure after payload copy | `shim_main` after `loader_boot` returns | yes, unconditionally |
+| loader success, handoff disabled | `loader_boot` tail | yes, unconditionally |
+| silver: gold never took over | 5 s wall-clock budget | yes |
+| silver: PSCI_CPU_ON refused | falls through to `reset(40)` | no -- see below |
+| gold: anything else | `gold_main` -> `loader_boot` | yes |
+
+Two structural facts that make this sound rather than hopeful:
+
+* **`vbar_el1` is set in `start.S` within the first few instructions**, so an
+  exception from essentially the first instruction lands in `exc_handler` and
+  not in an unhandled trap (which would just hang until the platform watchdog).
+* **`loader_boot` has no unbounded wait in it** -- no `delay_ms` with a large
+  argument, no `for(;;)` -- so it cannot swallow the exit the way the eMMC
+  CMD1 loop nearly did.
+
+Known gap, deliberately left as is: if `PSCI_CPU_ON` is *refused* on silver,
+control falls to `reset(40)`, which resets without setting a restart reason.
+That path means PSCI is broken entirely, in which case `autonomy_to_fastboot()`
+could not reset either, so routing it there would only park the phone. It is a
+one-line change if the log ever shows that branch running.
+
+Also checked and cleared: `pmic_init()` does a single PON read and cannot block;
+`pmic_wait_key()` is only reachable from the unreachable fallback park.
+
+---
+
 ## >>> HANDOFF 2026-10-25 14:35 (ginkgo): every wait on the fastboot path is now wall-clock <<<
 
 The autonomy path is only worth anything if nothing before it can stall, so
