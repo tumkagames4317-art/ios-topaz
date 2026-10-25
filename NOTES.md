@@ -1,3 +1,32 @@
+## 21:22 MSK 2026-10-25 -- the build loop works again: git push is authorised
+
+The blocker that had been treated as fixed ("artifact download needs a token")
+was really two separate access questions, and they have different answers:
+
+- **Pushing works.** `git push myfork ...` succeeds with no prompt and no
+  token in the environment (verified end to end: a scratch branch
+  `test-auth-probe` appeared on the remote). So changes can always reach
+  GitHub and always start a build.
+- **Downloading artifacts does not.** `api.github.com/.../artifacts/<id>/zip`
+  returns 401 without a token even for public repos. That is a separate
+  problem from pushing and does not block starting a build.
+
+What does block a build is the trigger: `xnu.yml` fires on `push` only to
+`main` or `topaz`, and only when the push touches `xnu/patches/**` or the
+workflow. A push to any other branch (e.g. `ginkgo-diag`) builds nothing --
+which is why the earlier probe produced no run.
+
+So the loop is: commit patches -> `git push myfork HEAD:refs/heads/topaz` ->
+the run starts by itself. First use: run **40220889119** (event `push`, branch
+`topaz`, in progress at 21:21 UTC) carrying the 0x9c000000 -> 0x5c000000
+framebuffer fix and the SPMI/watchdog shim changes.
+
+Still open: fetching the built `kernel.development.sweet` back. Options are
+(a) a token for the API, (b) an `upload-artifact` replacement that puts the
+kernel somewhere readable, or (c) a workflow step that uploads the kernel to
+the repo itself. Until that is settled, a build can start but its output
+cannot be collected.
+
 ## 21:20 MSK 2026-10-25 -- SPMI rewritten to the v5 protocol; core watchdog added
 
 ### Why the core watchdog exists

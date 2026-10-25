@@ -153,3 +153,31 @@ jobs:
           name: xnu-kernel
           path: out/
           if-no-files-found: warn
+
+      # Artifacts need an authenticated API call to download, which the
+      # development machine does not have. Publishing the kernel into a branch
+      # makes it reachable with a plain GET of the raw URL, so the build/boot
+      # loop closes without any token.
+      - name: Publish kernel to the xnu-kernel branch
+        if: always()
+        run: |
+          if [ -z "$(ls out/kernel.* 2>/dev/null)" ]; then
+            echo "no kernel built; nothing to publish"
+            exit 0
+          fi
+          cd "$GITHUB_WORKSPACE"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          mkdir -p xnu-kernel
+          cp -R out/kernel.* xnu-kernel/ 2>/dev/null || true
+          (cd xnu-kernel && shasum -a 256 kernel.* > SHA256SUMS) || true
+          {
+            printf 'run %s\n' "$GITHUB_RUN_ID"
+            printf 'ref %s\n' "$GITHUB_REF"
+            printf 'sha %s\n' "$GITHUB_SHA"
+          } > xnu-kernel/BUILD.txt
+          git checkout -B xnu-kernel
+          git add -f xnu-kernel
+          git commit -m "kernel from run $GITHUB_RUN_ID" || echo "nothing changed"
+          git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${GITHUB_REPOSITORY}.git" \
+            HEAD:refs/heads/xnu-kernel
