@@ -1,3 +1,30 @@
+## >>> HANDOFF 2026-10-25 14:32 (ginkgo): eMMC driver must never outlast the reset <<<
+
+A fifth defect found by reading the driver rather than by running it, and the
+one that would most directly have defeated the actual goal:
+
+**the eMMC bring-up could wedge the boot for 33 minutes.**
+
+`card_init()` repeated CMD1 up to 1000 times, each `cmd()` carries its own 2 s
+timeout, and the CMD1 poll adds its own delay -- so a card that never answers
+would sit there for over half an hour. That is before `autonomy_to_fastboot()`
+is ever reached, on a boot whose entire purpose is to land in fastboot within
+seconds.
+
+Fixed by making the budget wall-clock and short:
+
+* `SDHCI_TIMEOUT_MS` is now **100 ms** (was 2000). A real card answers a
+  single-block command in microseconds; 100 ms is already generous.
+* CMD1 polling is capped at **500 ms total** instead of a 1000-iteration count.
+
+Worst case from shim entry to the PSCI reset is now **under ~1.5 s**, whether
+the card works or not. This is the property the autonomy path needs: nothing
+the log does may be able to delay the reset.
+
+Image: `build/emmc10/ginkgo-emmc10.img`, md5 `c69606313673a487b3761c193d51573e`.
+
+---
+
 ## >>> HANDOFF 2026-10-25 14:30 (ginkgo): image packaging cleared, eMMC driver built <<<
 
 Two things were proven this half hour, and one blocker was re-confirmed.

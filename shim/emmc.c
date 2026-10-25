@@ -110,7 +110,14 @@
 #define SRES_DAT		0x04
 
 #define BLOCK_SIZE		512u
-#define SDHCI_TIMEOUT_MS	2000u
+/*
+ * Per-operation timeout. Deliberately short: this driver runs *before* the
+ * autonomy path that resets the phone into fastboot, so every millisecond it
+ * spends waiting on hardware that is not going to answer delays the only
+ * outcome the user asked for. A real card answers a single-block command in
+ * microseconds; 100 ms is already generous.
+ */
+#define SDHCI_TIMEOUT_MS	100u
 
 static inline uint32_t rd32(uint32_t off) { return *(volatile uint32_t *)(SDHCI_BASE + off); }
 static inline void wr32(uint32_t off, uint32_t v) { *(volatile uint32_t *)(SDHCI_BASE + off) = v; }
@@ -392,13 +399,23 @@ static int card_init(void)
 
 	/*
 	 * CMD1 (SEND_OP_COND) is eMMC's init command. It must be repeated until
-	 * the card sets the "power up complete" bit (OCR[31]); once it returns
-	 * 1.65-1.95 V as available (OCR[7]), it has finished initialising.
+	 * the card sets the "power up complete" bit (OCR[31]).
+	 *
+	 * The retry budget is wall-clock, not a loop count. An earlier version
+	 * looped 1000 times and each `cmd()` carries its own 2 s timeout, so a card
+	 * that never answers would have wedged the boot for over half an hour --
+	 * before the autonomy path is ever reached. Since the whole point of this
+	 * boot is to end in fastboot within seconds, the budget is capped at 500 ms:
+	 * a card that has not finished initialising by then is not going to, and a
+	 * failure here must return quickly enough that the caller can still reset.
 	 */
+	uint64_t deadline = cntpct() + (cntfrq() / 1000) * 500u;
 	int ok = 0;
-	for (int i = 0; i < 1000; i++) {
+	for (;;) {
 		ok = cmd(1, 0x40ff8000u, 1, resp);	/* sector mode | 3.3 V */
 		if (ok && (resp[0] & (1u << 31)))
+			break;
+		if (cntpct() > deadline)
 			break;
 		spin_ms(1);
 	}
