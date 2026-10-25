@@ -1,3 +1,50 @@
+## >>> HANDOFF 2026-10-25 14:30 (ginkgo): image packaging cleared, eMMC driver built <<<
+
+Two things were proven this half hour, and one blocker was re-confirmed.
+
+**1. The boot image packaging is not the fault.** `mkimage.py` was compared line
+by line against the author's original working `images/mkfull.sh` and is a
+faithful port. The image `build/emmc9/ginkgo-emmc9.img` was then checked
+internally:
+
+```
+header kernel_size = 6068315 (0x5C985B)
+ramdisk at 0x5CB000 -> 1f 8b        (gzip)
+dtb     at 0x754000 -> d0 0d fe ed  (FDT)
+gzip of the kernel slot decompresses to 17421104 bytes
+```
+
+So the kernel slot, the ramdisk and the DTB are all where the header says they
+are, and the gzip payload is intact. Note that `dtb_addr` = `0x1f00000` in the
+header is a *load address*, not a file offset -- the DTB really lives at file
+offset `0x753000` in the stock image and `0x754000` in this one (it moves by two
+pages because the new compressed kernel is 5915 bytes larger). Anyone comparing
+these two must compare against the header-computed offset, not the load address.
+
+**2. The standard "enter fastboot" path works.** With the phone in LineageOS
+recovery, `adb shell reboot bootloader` returned the device to `fastboot
+devices` in **under a second**. So IMEM/ABL honour the bootloader restart
+reason on this phone; the mechanism `autonomy.c` relies on is sound at the
+bootloader level. What has never been shown is whether the *shim* can set that
+reason and reset.
+
+**3. Re-confirmed blocker.** The phone was disconnected for this whole window,
+so `emmc.c` is still **unproven on hardware**. A watcher
+(`work/tools/autoloop.ps1`) is armed on `build/emmc9/ginkgo-emmc9.img` (md5
+`ff35c4d96fc34f9746956c7bc96c8c1a`) and will flash it the moment the device
+appears in fastboot.
+
+### Correction to an earlier conclusion
+
+Earlier notes said the stock image `01-current` "bootloops" when re-flashed.
+That was wrong: when the user looked at the panel it was sitting on the shim's
+own red screen and finished with `xnu jumping`. The loop observed from the PC
+was the *absence of USB enumeration*, not a reboot loop -- the stock shim parks
+by design and never returns to fastboot. Do not read "no fastboot device for N
+seconds" as evidence of a reset cycle.
+
+---
+
 ## >>> HANDOFF 2026-10-25 14:25 (ginkgo): eMMC driver replaces the UFS log path <<<
 
 `shim/emmc.c` is new: a minimal SDHCI-v5 PIO driver for `sdhci@4744000` that
