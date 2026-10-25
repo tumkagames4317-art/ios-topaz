@@ -15,6 +15,9 @@ on:
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
+      platform:
+        description: topaz (Redmi Note 10 Pro) or ginkgo (Redmi Note 8; skips topaz-only patches)
+        default: topaz
   push:
     branches: [main, topaz]
     paths:
@@ -58,8 +61,28 @@ jobs:
           git init -q dxb
           git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
           git -C dxb checkout -q FETCH_HEAD
-          # 12.5-14.3 use the top-level patches dir; ours go next to blacktop's
-          cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/
+          # 12.5-14.3 use the top-level patches dir; ours go next to blacktop's.
+          #
+          # The series mixes two boards: SWEET patches target the generic
+          # sweet machine, `topaz-*` patches target the Redmi Note 10 Pro
+          # (SM6225, Kryo 260, A73 at MPIDR 0x100). Applying the topaz set to
+          # ginkgo (SM6125, boot CPU at MPIDR 0x80000000) makes SweetCPU panic
+          # on its topology checks, which is invisible because the panic is
+          # printed before the framebuffer pointer xnu was given is usable.
+          # Select the platform here so each board builds only its own set.
+          PLATFORM="${{ inputs.platform || 'topaz' }}"
+          echo "platform: $PLATFORM"
+          if [ "$PLATFORM" = "ginkgo" ]; then
+            for p in xnu/patches/*.patch; do
+              case "$(basename "$p")" in
+                *-topaz-*) echo "skip $(basename "$p")"; continue ;;
+              esac
+              cp "$p" dxb/patches/
+            done
+          else
+            cp xnu/patches/*.patch dxb/patches/
+          fi
+          cp xnu/patches/*.sh dxb/patches/ 2>/dev/null || true
           # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64.
           # topaz: Cortex-A53/A73 (ARMv8.0), so the same -mcpu as the kernel
           # (clang's apple-m1 default emits LSE atomics and LDAPR)
