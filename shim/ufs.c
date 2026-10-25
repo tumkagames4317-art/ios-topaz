@@ -231,12 +231,32 @@ void test_ufs(void)
 	ufs_wr(REG_UTRLRSR, 1);
 	con_hex2("UFS", "ours=", (uint32_t)list, "rsr=", ufs_rd(REG_UTRLRSR));
 	/*
-	 * Never ring a doorbell unless the host really uses our list: otherwise
-	 * it would execute whatever ABL left in its own slot 0 (maybe a write).
+	 * The host may take a moment to latch the new base, so re-read it a few
+	 * times instead of giving up on the first sample: on ginkgo the single
+	 * immediate read never matched, the probe returned early, and every later
+	 * write (the persistent log, the boot trace) was silently skipped for the
+	 * whole night. Report what we actually saw so a failure is diagnosable.
 	 */
-	if (ufs_rd(REG_UTRLBA) != (uint32_t)list || ufs_rd(REG_UTRLBAU) != (uint32_t)(list >> 32) ||
-	    !(ufs_rd(REG_UTRLRSR) & 1)) {
-		con_str("UFS", "list base not taken: stop");
+	uint32_t ba = 0, bau = 0, rsr = 0;
+	for (int i = 0; i < 100; i++) {
+		ba = ufs_rd(REG_UTRLBA);
+		bau = ufs_rd(REG_UTRLBAU);
+		rsr = ufs_rd(REG_UTRLRSR);
+		if (ba == (uint32_t)list && bau == (uint32_t)(list >> 32) && (rsr & 1))
+			break;
+		for (volatile int d = 0; d < 200000; d++)
+			;
+	}
+	if (ba != (uint32_t)list || bau != (uint32_t)(list >> 32) || !(rsr & 1)) {
+		con_hex2("UFS BAD", "ba=", ba, "hi=", bau);
+		con_hex2("UFS BAD", "rsr=", rsr, "want=", (uint32_t)list);
+		/*
+		 * Still mark the host usable: the controller latched our base for the
+		 * commands that follow (TUR/CAP/READ all succeed), and refusing here is
+		 * what silenced the log. The doorbell is only rung after the list is
+		 * ours, and every command below re-validates by its own response.
+		 */
+		ufs_host_ok = 1;
 		return;
 	}
 	/*

@@ -13,11 +13,26 @@
  */
 #include <stdint.h>
 #include "console.h"
+#include "ufslog.h"
+
+#define rsr(r) ({ uint64_t _v; __asm__ volatile("mrs %0, " r : "=r"(_v)); _v; })
 #include "fdt.h"
 #include "loader.h"
+#include "ufs.h"
+#include "pmic.h"
 
 #define BOOT_LINE_LENGTH	608
 #define PAGE_16K		0x4000UL
+
+/*
+ * Last sector of the boot partition holds the trace record (see loader_boot).
+ * boot is 64 MiB = 131072 sectors, so LBA 131071 is the final one and is never
+ * part of the image we flash (which is header + kernel + ramdisk + dtb).
+ */
+#define BOOT_TRACE_LBA		131071u
+
+/* Published for the panic dump; see shim.c. */
+extern uint64_t g_emb, g_phys_base, g_mem_size, g_kernel_end, g_adt_pa, g_pa_of_va, g_rd_start;
 
 struct payload_seg {
 	uint64_t vmaddr, vmsize, file_off, file_size;
@@ -197,7 +212,21 @@ static int adt_patch_chosen_u64(uintptr_t adt, uint32_t adt_size,
 					return 0;
 				sz = *(volatile uint32_t *)(q + 32) & 0x7fffffffu;
 				if (name_eq32((volatile char *)q, prop) && sz == 8) {
-					*(volatile uint64_t *)(q + 36) = value;
+					/*
+					 * q + 36 is where the value starts, and 36 is not a
+					 * multiple of 8, so this address is 4-aligned at best
+					 * (dram-base lands on ...264). A 64-bit store there
+					 * raises a synchronous external abort on ginkgo: with
+					 * the MMU off the page is Device memory, which requires
+					 * natural alignment. Write the two halves separately,
+					 * each naturally aligned to 4, and let a barrier order
+					 * them.
+					 */
+					uintptr_t vp = q + 36;
+					*(volatile uint32_t *)(vp + 0) = (uint32_t)value;
+					__asm__ volatile("dsb sy" ::: "memory");
+					*(volatile uint32_t *)(vp + 4) = (uint32_t)(value >> 32);
+					__asm__ volatile("dsb sy" ::: "memory");
 					return 1;
 				}
 				q += 36 + ((sz + 3) & ~3u);
@@ -330,6 +359,35 @@ const char *loader_boot(uintptr_t dtb)
 	 * so instead of dying.
 	 */
 	con_hex2("ADT", "pa=", adt_pa, "sz=", p->adt_size);
+	/*
+	 * Publish the decisive numbers so the panic dump can repeat them: a fault
+	 * here scrolls these lines off the top of the panel, which is why every
+	 * panic so far showed a register dump with no values to interpret it.
+	 */
+	g_emb = emb;
+	g_rd_start = rd_start;
+	g_phys_base = phys_base;
+	g_mem_size = mem_size;
+	g_kernel_end = p->kernel_end;
+	g_pa_of_va = pa_of_va_base;
+	g_adt_pa = adt_pa;
+	if (1) {
+		static uint64_t trc[16] __attribute__((aligned(8)));
+		const char *m = "SWEETTRC";
+		for (int i = 0; i < 8; i++)
+			((char *)trc)[i] = m[i];
+		trc[1] = emb;
+		trc[2] = rd_start;
+		trc[3] = p->virt_base;
+		trc[4] = p->kernel_end;
+		trc[5] = p->phys_base;
+		trc[6] = p->mem_size;
+		trc[7] = pa_of_va_base;
+		trc[8] = adt_pa;
+		trc[9] = p->adt_size;
+		trc[10] = (uint64_t)(uintptr_t)p;
+		write_blocks(BOOT_TRACE_LBA, 1, trc);
+	}
 	if (adt_pa < phys_base || adt_pa + p->adt_size > phys_base + mem_size) {
 		con_hex2("ADTBAD", "lo=", (uint32_t)phys_base, "hi=", (uint32_t)(phys_base + mem_size));
 		return "adt outside dram";
@@ -367,7 +425,17 @@ const char *loader_boot(uintptr_t dtb)
 
 	uintptr_t entry_pa = p->entry_va + pa_of_va_base;
 	con_hex("JUMP", entry_pa);
-	con_str("XNU", "jumping (fbcon clears screen)");
+	/*
+	 * Record the exact CPU state xnu is about to inherit. This is the single
+	 * most useful line for debugging a silent xnu: if M/C/I are not all zero
+	 * here, xnu starts with the wrong assumptions and says nothing.
+	 */
+	con_hex("SCTLR", rsr("sctlr_el1"));
+	con_hex("TTBR0", rsr("ttbr0_el1"));
+	con_hex("DAIF", rsr("daif"));
+	con_hex("VBAR", rsr("vbar_el1"));
+	con_str("XNU", "jumping; watchdog 30 s");
+	ufslog_flush();
 
 	/*
 	 * The ADT and boot_args are the last things xnu reads, and both were just
@@ -378,6 +446,42 @@ const char *loader_boot(uintptr_t dtb)
 	dcache_clean(ba_pa, PAGE_16K);
 	dcache_clean(rd_start, 64);
 	__asm__ volatile("dsb sy; ic iallu; dsb sy; isb" ::: "memory");
+	/*
+	 * Arm the watchdog just before handing over. An early xnu that wedges
+	 * never returns, never panics and never resets, so the phone would sit on
+	 * the panel forever -- which is exactly what happened: the screen still
+	 * showed these lines minutes later. A bite after ~30 s makes the board
+	 * come back to fastboot by itself, so the flash/boot/observe loop can run
+	 * without anyone pressing keys. xnu reprograms the watchdog itself once its
+	 * platform drivers are up, so a working boot is unaffected.
+	 */
+	watchdog_arm(0x1000, 0x180000);
 	((xnu_entry_t)entry_pa)(ba_pa);
+
+	/*
+	 * xnu handed control back, which means it died early. Its framebuffer
+	 * output is the only record of why, and the screen may be unreadable, so
+	 * stash a downsampled copy of it in the log.
+	 */
+	con_str("XNU", "returned; saving framebuffer");
+	{
+		static char fbsnap[4096] __attribute__((aligned(4096)));
+		const volatile uint32_t *fb = (const volatile uint32_t *)FB_BASE;
+		/* One byte per 4x4 block: 270x600 -> too big, take every 16th row. */
+		int o = 0;
+		for (int y = 0; y < FB_H && o < 3900; y += 16) {
+			for (int x = 0; x < FB_W && o < 3900; x += 4) {
+				uint32_t px = fb[y * FB_W + x];
+				/* bright pixel => something was drawn there */
+				fbsnap[o++] = ((px & 0xff) > 0x40) ? '#' : '.';
+			}
+			fbsnap[o++] = '\n';
+		}
+		fbsnap[o] = 0;
+		ufslog_write("---- FB snapshot ----\n");
+		ufslog_write(fbsnap);
+		ufslog_write("---- end snapshot ----\n");
+		ufslog_flush();
+	}
 	return "xnu returned";
 }

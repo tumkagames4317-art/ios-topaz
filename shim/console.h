@@ -15,6 +15,10 @@
 extern volatile uint32_t *con_fb;
 
 void con_clear(uint32_t bg);
+/* set the background colour without erasing what is already drawn */
+void con_fill(uint32_t bg);
+/* move the cursor back to the first row so new text starts at the top */
+void con_home(void);
 void con_skip(void);
 void con_str(const char *label, const char *s);
 void con_hex(const char *label, uint64_t v);

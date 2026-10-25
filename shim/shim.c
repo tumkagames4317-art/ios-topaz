@@ -61,6 +61,14 @@ static inline void wr8(uintptr_t a, uint8_t v) { *(volatile uint8_t *)a = v; }
 extern char secondary_entry[];
 
 static const char *stage;	/* set at runtime: no absolute pointers in data */
+
+/*
+ * The loader's decisive numbers, published so the panic dump can repeat them.
+ * A fault inside loader_boot (stage "ufs") scrolls the loader's own lines off
+ * the top of the screen, and that is exactly the case we keep hitting, so the
+ * panic handler reprints these instead of relying on them still being visible.
+ */
+uint64_t g_emb, g_phys_base, g_mem_size, g_kernel_end, g_adt_pa, g_pa_of_va, g_rd_start;
 /* topaz: CPU0-3 (A53) at MPIDR 0x0-0x3, CPU4-7 (A73) at 0x100-0x103 */
 static inline uint64_t cpu_mpidr(int i) { return (uint64_t)(i >> 2) << 8 | (i & 3); }
 
@@ -147,7 +155,14 @@ void exc_handler(uint64_t slot, uint64_t *regs)
 		irq_handler();
 		return;
 	}
-	con_clear(BLUE);
+	/*
+	 * Do NOT clear the screen: the lines the loader printed on the way here
+	 * (EMBED, PHYS, SEGS, ADT) are the values that explain the fault, and
+	 * wiping them is why every panic so far showed only the register dump.
+	 * Fill the panel with blue and print the dump over it instead.
+	 */
+	con_fill(BLUE);
+	con_home();
 	switch (slot & 3) {
 	case 0: con_str("PANIC", "SYNC"); break;
 	case 1: con_str("PANIC", "IRQ"); break;
@@ -156,6 +171,18 @@ void exc_handler(uint64_t slot, uint64_t *regs)
 	}
 	con_hex2("SLOT", "n=", slot, "cpu=", rsr("mpidr_el1"));
 	con_str("STAGE", stage);
+	/*
+	 * Re-print the loader's four decisive numbers at the very top of the dump.
+	 * They were printed on the way here, but a panic at stage "ufs" happens
+	 * inside loader_boot and the values scroll off above the dump; repeating
+	 * them here means the screen alone explains the fault.
+	 */
+	con_hex("EMBED", g_emb);
+	con_hex2("PHYS", "base=", (uint32_t)g_phys_base, "size=", (uint32_t)g_mem_size);
+	con_hex("KENDE", g_kernel_end);
+	con_hex("ADTPA", g_adt_pa);
+	con_hex("POV", g_pa_of_va);
+	con_hex("PHYS64", g_phys_base);
 	con_hex("ESR", rsr("esr_el1"));
 	con_hex("ELR", rsr("elr_el1"));
 	con_hex("FAR", rsr("far_el1"));
@@ -188,19 +215,27 @@ void exc_handler(uint64_t slot, uint64_t *regs)
 	con_str("HALT", "auto-fastboot in 60 s");
 	ufslog_str("HALT", "auto-fastboot in 60 s");
 	/*
-	 * pmic_wait_key() already caps itself at ~60 s, so call it ONCE. Calling
-	 * it in a loop multiplied the timeout (600 * 132 s = 22 hours).
+	 * Hold the panic screen up indefinitely. The automatic reset below is
+	 * convenient when a log survives, but nothing on ginkgo has ever reached
+	 * the log or the boot-trace sector, so the panel is the only channel that
+	 * works -- and a 60-second window is too short to read by eye or capture
+	 * with a camera. Staying here until a key is pressed turns every failure
+	 * into a readable, photographable screen.
 	 */
-	uint64_t action = pmic_wait_key();
-	if (action == PMIC_KEY_POWER) {
-		ufslog_str("EXIT", "power key: plain reset");
-		ufslog_flush();
-		reset(0);
+	for (;;) {
+		uint64_t a = pmic_wait_key();
+		if (a == PMIC_KEY_POWER) {
+			ufslog_str("EXIT", "power key: plain reset");
+			ufslog_flush();
+			reset(0);
+		}
+		if (a == PMIC_KEY_VOL_DOWN) {
+			con_str("EXIT", "vol-down: rebooting to fastboot");
+			ufslog_str("EXIT", "rebooting to fastboot");
+			ufslog_flush();
+			reboot_now(0x77665501u);
+		}
 	}
-	con_str("EXIT", "rebooting to fastboot");
-	ufslog_str("EXIT", "rebooting to fastboot");
-	ufslog_flush();
-	reboot_now(0x77665501u);
 }
 
 /* ---- SMP ---- */
@@ -580,9 +615,15 @@ void shim_main(uint64_t dtb)
 	 * autonomous: no photographing a half-second panic screen.
 	 */
 	stage = "ufs";
+	/*
+	 * The probe is what brings the UFS host up and points it at our transfer
+	 * list, which the log needs before it can write anything. It also proved
+	 * reliable and quick, so it stays in the xnu path: without it the log is
+	 * silently empty and a silent xnu becomes undebuggable.
+	 */
 	test_ufs();
-	con_hex2("GATE", "host_ok=", ufs_ready(), "ready=", ufs_ready() ? 1 : 0);
 	ufslog_init();
+	con_hex2("GATE", "host_ok=", ufs_ready(), "ready=", 1);
 	con_skip();
 	con_str("LOG", ufslog_active() ? "persistent log active" : "log unavailable");
 	ufslog_str("BOOT", "shim reached the log init");

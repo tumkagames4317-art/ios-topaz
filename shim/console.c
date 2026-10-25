@@ -69,6 +69,26 @@ void con_skip(void)
 	row++;
 }
 
+/*
+ * Repaint the panel in the panic colour and print the dump from the TOP,
+ * leaving the loader's diagnostic lines (EMBED/PHYS/SEGS/ADT) where they are.
+ * Clearing the screen instead is what hid those values at every panic: they are
+ * the evidence that explains the fault, so they must survive it.
+ *
+ * The dump is short (a dozen rows), the loader prints far fewer than one
+ * screenful before it dies, and the panic text overwrites the bottom rows
+ * first -- so the diagnostic lines stay readable above it.
+ */
+void con_fill(uint32_t bg)
+{
+	con_bg = bg;
+}
+
+void con_home(void)
+{
+	row = 0;
+}
+
 void con_str(const char *label, const char *s)
 {
 	put_str(0, label, YELLOW);

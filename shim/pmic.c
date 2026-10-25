@@ -40,6 +40,27 @@
 
 static int pmic_ok;
 
+/*
+ * Arm the APCS watchdog. The bark interrupts but does not reset, so it is only
+ * useful as a warning; the bite is what reboots the board. Both are written
+ * before enabling so the counters start from a known value.
+ */
+void watchdog_arm(uint32_t bark_ticks, uint32_t bite_ticks)
+{
+	REG32(APCS_WDT0_EN) = 0;
+	REG32(APCS_WDT0_BARK_TIME) = bark_ticks;
+	REG32(APCS_WDT0_BITE_TIME) = bite_ticks;
+	__asm__ volatile("dsb sy" ::: "memory");
+	REG32(APCS_WDT0_EN) = 1;
+	__asm__ volatile("dsb sy" ::: "memory");
+}
+
+void watchdog_disarm(void)
+{
+	REG32(APCS_WDT0_EN) = 0;
+	__asm__ volatile("dsb sy" ::: "memory");
+}
+
 static void spin_ms(uint32_t ms)
 {
 	uint64_t f, start, now;

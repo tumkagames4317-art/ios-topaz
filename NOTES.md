@@ -314,6 +314,75 @@ xnu.
 
 ## Agent handoff / active work (2026-10-15, latest) — sweet, superseded for topaz agents
 
+### >>> GINKGO PORT 2026-10-25 08:05 — shim now reaches XNU (read first) <<<
+
+Redmi Note 8 (ginkgo, SM6125 trinket) port, tree `ginkgo-diag`. **The shim gets
+all the way to `XNU jumping` with no panic.** This is the furthest it has ever
+got; everything before it is verified on hardware, everything after it is not.
+
+Boot sequence now seen on the panel (image `ginkgo-work/ginkgo-JUMP.img`,
+md5 `b64236dbcc521e7dfb366fcd223bf260`):
+
+```
+MIDR   el1=51AF8014 mpidr=80000000     <- gold A73, 16K granule present
+PHYS   base=80000000 size=C0000000
+SEGS   n=0000000A end=82568000
+ADT    pa=82568000 sz=00002534
+ADT    dram patched                    <- was the panic, now passes
+BOOTARG pa=8256C000 top=82570000
+JUMP   00000000814B6488
+SCTLR  0000000000C00808
+XNU    jumping (fbcon clears screen)
+```
+
+**The bug that cost the whole night: an unaligned 64-bit store.** An Apple ADT
+property is `char name[32]; u32 size; u8 value[]`, so the value starts at `+36`
+-- 4-aligned but never 8-aligned (`dram-base`'s value sits at ADT+0x264). With
+the MMU off every page is Device memory, where a 64-bit store must be naturally
+aligned; `*(volatile uint64_t *)(q + 36) = v` in `adt_patch_chosen_u64` raised
+a **synchronous external abort** (`ESR 0x96000061`, `DFSC 0x21`, `WnR 1`). The
+address was valid the whole time (`FAR 0x82568264` is inside DRAM): the abort is
+the bus rejecting the transfer, not a missing page. Fixed by writing the two
+halves as 32-bit stores with `dsb sy` between them (`loader.c`).
+
+Misdiagnoses worth remembering, because they cost hours:
+- The panic screen's register dump was **misread** as `FAR 0xB2568264` /
+  `ELR 0x83A60`; the real values are `FAR 0x82568264` and `ELR 0x83A60` (offset
+  `0x3A60`, the `str`). Everything downstream of that misreading -- "phys_base
+  is topaz's 0xB0000000", "the payload is stale", "ADT is outside DRAM" -- was
+  wrong. `con_clear()` in the panic handler also wiped the loader's own
+  diagnostic lines, which is why the values that would have caught it were
+  never visible; the handler now recolours and reprints them.
+- `pmic_wait_key()` caps itself, so the old 60 s auto-fastboot always fired and
+  the screen vanished before it could be read. The park loop now waits
+  indefinitely: Power = plain reset, Volume-Down = fastboot.
+
+**UFS is still dead, so nothing reaches the persistent log.**
+`test_ufs()` returns early because the host never latches our transfer list
+(`hce=0`, `hcs=0x8008`, `utrlba=0`): the controller is not enabled by ABL on
+ginkgo the way it is on sweet, so `ufs_wr(REG_UTRLBA, ...)` is ignored. The
+boot-partition trace sector (`BOOT_TRACE_LBA 131071`) never receives a record
+for the same reason. Until this is fixed the panel is the only channel.
+
+**Next: xnu starts but never draws.** After `JUMP` the panel keeps the shim's
+lines forever -- xnu does not reach fbcon. Its entry (`0xfffffe00074b6488 ->
+0xfffffe00074b80ec`) is a real `arm64_start`: `msr daifclr #2`, fill
+`0x93800000` (derived from `boot_args_pa`), read `virtBase/physBase/memSize/
+bootFlags`, `msr sctlr_el1, xzr`, build page tables, `msr cntfrq_el0`, `tlbi`,
+`mrs midr_el1`, then `bl` into C. `virtBase` matches the Mach-O (`__TEXT
+0xfffffe0007004000` rounded down to 32 MiB = `0xfffffe0006000000`). Candidates,
+in order: (1) xnu walks `mem_size` = 3 GiB from `0x80000000` but the real window
+has holes (`/proc/iomem`: `0x45700000-0x45cfffff`, `0x45e00000-0x45f3ffff`,
+`0x4b000000-0x48efffff` and others are absent), so it may fault while probing;
+(2) a topaz address baked into early xnu code (UART/GPIO) that aborts silently.
+`ginkgo-work/ginkgo-wdt.img` (md5 `c083f1e0cfe508e72a7534c7fa25ebc5`) arms the
+APCS watchdog for ~30 s before the jump, so a wedged xnu resets to fastboot by
+itself instead of hanging forever -- needed to run the loop unattended.
+
+Build/flash recipe and the rest of the night's findings are in
+`ginkgo-work/REPORT.md`, `ginkgo-work/INSTRUCTIONS.md` and
+`ginkgo-work/FINAL.md`. Always check `DTB_SZ [285805]` after `mkfull.sh`.
+
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
 
 **LIVE LOG over USB (0077, boot 0077s): no more recovery round-trips.** Boot an image with `sweetusb=2`, run `tools/sweet-usbnet.sh logs/live-NAME.txt` on the PC: it waits for the phone's CDC-ECM interface, sets 192.168.7.1/24 (sudo) and prints/saves the kernel console the phone streams every 100 ms as UDP to 192.168.7.1:5140 (starts with the last 64 KiB). `ping 192.168.7.2` checks the link. Current image: `shim/out/shim-boot-0077s.img` (kernel 0077, ADT sweet-0069hi, cpus=6, sweetfb_noconsole=1, sweetfb_hz=30, sweetusb=2). The recovery pull (`tools/sweet-log-pull.sh`) is still the way after a panic/hang before USB comes up.
