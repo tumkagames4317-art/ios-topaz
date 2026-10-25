@@ -1,3 +1,44 @@
+### 00:55 MSK 2026-10-26 -- the eight stages are not the end: patch 0012 adds 9..14
+
+Re-reading patch `0012-sweet-keep-debug-console-after-ttbr0.patch` changes the
+picture. It does not just keep the console alive; it adds six more markers and
+an assert-guarded framebuffer alias in `arm_vm_init`:
+
+    8   leaving bootstrap TTBR0        (sweet_early_disable, 0010)
+    9   kernel framebuffer VA live     (sweet_early_relocate, 0012)
+    10  TTBR0 off; TLB flushed
+    11  physmap table pointers rebound
+    12  calling pmap_bootstrap
+    13  pmap_bootstrap done
+    14  early I/O page tables ready
+
+The console shows **only 1..8**, so ginkgo stops inside or immediately after
+`sweet_early_relocate` -- i.e. in `sweet_early_map_final()`, which is guarded
+by three asserts on the kernel's own page tables:
+
+    assert(va + ARM_TT_L2_SIZE <= gVirtBase);
+    assert((l1 & (ARM_TTE_VALID | ARM_TTE_TYPE_MASK)) ==
+           (ARM_TTE_VALID | ARM_TTE_TYPE_TABLE));
+    assert(*slot == ARM_TTE_EMPTY);
+
+One of these fires on ginkgo. That is a genuine, specific, fixable diff -- no
+longer a black-box hang. `SWEET_EARLY_FB_VA` is
+`VM_MIN_KERNEL_ADDRESS + ARM_TT_L2_SIZE`, and the block installed there is the
+hardcoded ginkgo framebuffer PA `0x5c000000`, so the first assert is the most
+likely suspect: on ginkgo the gap between `VM_MIN_KERNEL_ADDRESS` and
+`gVirtBase` may be smaller than one 32 MB L2 block.
+
+Confirming it needs a kernel built with `sweet_early_panic` actually enabled;
+`out-g3` predates that hook (`SWEET EARLY PANIC` is absent from its string
+table), which is why the screen goes blank instead of printing the assert.
+
+### Tooling note
+
+`work/tools/qrun.py` had the `boot_args` layout wrong for every earlier run
+(`Video`/`deviceTreeP`/`CommandLine` offsets). That mistake, not the kernel,
+produced the NULL-pointer `Data Abort` that dominated the previous session's
+investigation, and it also produced the bogus "topaz is healthy" baseline.
+Topaz in the fixed harness draws **nothing**; ginkgo draws eight banners.
 ### 00:20 MSK 2026-10-26 -- the console dump proves ginkgo clears all eight stages
 
 Reading `work/build/qrG4/fb.raw` line by line, every one of the eight

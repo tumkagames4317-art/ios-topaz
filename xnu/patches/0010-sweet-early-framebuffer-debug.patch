@@ -255,13 +255,7 @@ index 0000000..8f4c808
 +void
 +sweet_early_panic(const char *fmt, va_list *args)
 +{
-+	/*
-+	 * Do not honour early_disabled: the console is switched off just
-+	 * before arm_vm_init invalidates TTBR0, which is exactly where an
-+	 * early panic matters most. A best-effort write is harmless if the
-+	 * VA=PA mapping has already gone away.
-+	 */
-+	if (early_panicking) {
++	if (early_disabled || early_panicking) {
 +		return;
 +	}
 +	early_panicking = 1;
