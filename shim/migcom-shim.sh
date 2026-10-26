@@ -128,6 +128,52 @@ else
   cp "$inp" "$real_out"
 fi
 
+# --- (3a) drop re-declarations of GNU mig's BUILT-IN types -----------------
+# The measured duplicate errors are, every run, exactly these names:
+#     char (std_types.defs:91)          short (machine_types.defs:39)
+#     int  (machine_types.defs:40)      uintptr_t (:62)   intptr_t (:63)
+# and type.c's init_type() inserts EXACTLY those five (type.c:977-985):
+#     itInsert("char",      itCIntTypeDecl("char",      sizeof_char));
+#     itInsert("short",     itShortType);
+#     itInsert("int",       itIntType);
+#     itInsert("uintptr_t", itUintPtrType);
+#     itInsert("intptr_t",  itIntPtrType);
+# itInsert sets the name (type.c:94) and itLookUp walks ONE global list
+# (type.c:73-82) matching on it->itName. parser.y:338-339 then fires
+#     if (itLookUp(name) != itNULL) error("overriding previous definition of %s");
+# and error() is FATAL. So Apple's .defs edit that is fine for Apple's mig is a
+# hard failure for GNU's: Apple's mig lets a .defs file restate a built-in,
+# GNU's does not.
+#
+# Dropping the re-declaration is therefore not a workaround -- against GNU
+# mig's own table these lines are REDUNDANT BY CONSTRUCTION, and the built-in
+# already carries the right size class via itCIntTypeDecl's switch on
+# sizeof(): 1 -> INTEGER_8, 2 -> INTEGER_16, 4 -> INTEGER_32, 8 -> INTEGER_64.
+# On this target (LP64, arm64) the values agree with the .defs text:
+#     short=2 int=4 uintptr_t=8 intptr_t=8 char=1
+#
+# Provenance note: the streams were proving clean (one declaration of each,
+# MACHNINE guards 0, natural_t present once) while mig still errored -- which
+# is what pointed at the process's own table rather than at the text.
+# `char` is deliberately NOT in this list. lexxer.l has BOTH
+#     lexxer.l:170  "MACH_MSG_TYPE_CHAR"     TRETURN(MACH_MSG_TYPE_CHAR,     8);
+#     lexxer.l:172  "MACH_MSG_TYPE_INTEGER_8" TRETURN(MACH_MSG_TYPE_INTEGER_8, 8);
+# Two DIFFERENT 8-bit type names, and mig emits different C for them. The .defs
+# says `type char = MACH_MSG_TYPE_CHAR;` while init_type's built-in char is
+# INTEGER_8, so dropping that line would silently change generated signatures.
+# It stays, and so does its duplicate error, until it can be handled exactly.
+n_builtin=0
+for _t in short int uintptr_t intptr_t; do
+  _c=$(grep -cE "^[[:blank:]]*type[[:blank:]]+${_t}[[:blank:]]*=" "$real_out" || true)
+  [ "${_c:-0}" -gt 0 ] && n_builtin=$((n_builtin + _c))
+done
+if [ "${n_builtin:-0}" -gt 0 ]; then
+  sed -i -E \
+    -e '/^[[:blank:]]*type[[:blank:]]+(short|int|uintptr_t|intptr_t)[[:blank:]]*=/d' \
+    "$real_out"
+  echo "migcom-shim: dropped $n_builtin re-declaration(s) of GNU mig built-in integer types (short/int/uintptr_t/intptr_t; type.c:977-985 already defines these with identical IPC names)" >&2
+fi
+
 # --- (3b) SameCount -> an explicit count argument --------------------------
 # Apple's mig accepts the marker `SameCount` on an out array parameter and
 # uses it to generate a count output. GNU mig has no such keyword: the
