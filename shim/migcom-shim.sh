@@ -22,8 +22,24 @@
 #        type double = MACH_MSG_TYPE_REAL_64;
 #    GNU migcom's built-in table (every MACH_MSG_TYPE_* string in the
 #    binary: 23 entries) has MACH_MSG_TYPE_REAL and NO _REAL_32/_REAL_64.
-#    Apple split REAL into 32/64; Hurd never did. Those two tokens are
-#    rewritten to MACH_MSG_TYPE_REAL on the way in.
+#    Apple split REAL into 32/64; Hurd never did.
+#
+#    The rewrite targets MACH_MSG_TYPE_INTEGER_32 / _INTEGER_64, NOT
+#    MACH_MSG_TYPE_REAL. From Debian mig's lexxer.l:77-84, TRETURN's second
+#    argument is the byte width:
+#        <Normal>"MACH_MSG_TYPE_REAL"      TRETURN(MACH_MSG_TYPE_REAL,0);
+#        <Normal>"MACH_MSG_TYPE_INTEGER_8" TRETURN(MACH_MSG_TYPE_INTEGER_8,8);
+#    REAL's width is literally 0. A type with itSize 0 yields itTypeSize 0
+#    (type.c:169), which trips type.c:195 `sizeof(%s) == 0`. Mapping to REAL
+#    would therefore make every float/double a ZERO-WIDTH field in generated
+#    RPC stubs -- it would compile and then be wrong. INTEGER_32/_64 carry
+#    4/8 bytes, which is exactly what C float/double occupy.
+#
+#    Honest scope: no routine in this xnu passes float/double today (grep
+#    for `: float;` / `: double;` across all 55 .defs finds nothing), so
+#    this removes a latent trap rather than unblocking anything. It is here
+#    because the earlier mapping to MACH_MSG_TYPE_REAL was actively wrong,
+#    and wrong-but-silent is the worst outcome for a code generator.
 #
 # 4. SUBSYSTEM ORDERING. GNU mig resolves `type` declarations against the
 #    subsystem's basic-type table, which only exists once the `subsystem`
@@ -68,11 +84,13 @@ trap 'rm -f "$inp" "$real_out" "$hoisted"' EXIT
 
 cat > "$inp"
 
-# --- (3) MACH_MSG_TYPE_REAL_32/_64 -> MACH_MSG_TYPE_REAL -------------------
+# --- (3) MACH_MSG_TYPE_REAL_32/_64 -> MACH_MSG_TYPE_INTEGER_32/_64 ---------
 n_real=$(grep -cE 'MACH_MSG_TYPE_REAL_(32|64)([^0-9_]|$)' "$inp" || true)
 if [ "${n_real:-0}" -gt 0 ]; then
-  sed -E 's/MACH_MSG_TYPE_REAL_(32|64)([^0-9_]|$)/MACH_MSG_TYPE_REAL\2/g' "$inp" > "$real_out"
-  echo "migcom-shim: rewrote $n_real MACH_MSG_TYPE_REAL_{32,64} -> MACH_MSG_TYPE_REAL" >&2
+  sed -E -e 's/MACH_MSG_TYPE_REAL_32([^0-9_]|$)/MACH_MSG_TYPE_INTEGER_32\1/g' \
+         -e 's/MACH_MSG_TYPE_REAL_64([^0-9_]|$)/MACH_MSG_TYPE_INTEGER_64\1/g' \
+         "$inp" > "$real_out"
+  echo "migcom-shim: rewrote $n_real MACH_MSG_TYPE_REAL_{32,64} -> INTEGER_{32,64} (widths 4/8 bytes)" >&2
 else
   cp "$inp" "$real_out"
 fi
