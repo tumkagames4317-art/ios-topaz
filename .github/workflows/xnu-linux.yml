@@ -2439,13 +2439,26 @@ jobs:
             echo 'args=()'
             echo 'while [ $# -gt 0 ]; do'
             echo '  case "$1" in'
-            echo '    -arch) shift 2 ;;'
+            # -arch is deliberately NOT stripped: the Darwin wrapper keeps it
+            # and clang honours it once --target=aarch64-apple-darwin is set.
+            # Stripping it would discard the architecture the build asked for.
+            echo '    -arch) args+=("$1" "$2"); shift 2 ;;'
             echo '    -mmacosx-version-min=*|-miphoneos-version-min=*|-mios-version-min=*) shift ;;'
             echo '    -mkernel|-msoft-float|-mno-soft-float) shift ;;'
             echo '    *) args+=("$1"); shift ;;'
             echo '  esac'
             echo 'done'
-            echo 'exec /usr/bin/clang "${args[@]}"'
+            # DELEGATE to the Darwin-target wrapper that xcrun -find clang
+            # answers with, instead of pinning a host clang. Dropping -arch and
+            # then running plain /usr/bin/clang would silently build x86_64
+            # Linux objects again -- the exact failure this shim exists to fix.
+            # The wrapper itself handles -arch (clang accepts it once a Darwin
+            # --target is set); this shim only removes what clang rejects even
+            # with that target.
+            echo 'if [ -x /usr/local/bin/xtool-clang ]; then'
+            echo '  exec /usr/local/bin/xtool-clang "${args[@]}"'
+            echo 'fi'
+            echo 'exec /usr/bin/clang --target=aarch64-apple-darwin "${args[@]}"'
           } > "$cc_shim"
           chmod +x "$cc_shim"
           # Two-sided proof: Darwin flags must be gone AND a real compile must
@@ -3495,13 +3508,26 @@ jobs:
             echo 'args=()'
             echo 'while [ $# -gt 0 ]; do'
             echo '  case "$1" in'
-            echo '    -arch) shift 2 ;;'
+            # -arch is deliberately NOT stripped: the Darwin wrapper keeps it
+            # and clang honours it once --target=aarch64-apple-darwin is set.
+            # Stripping it would discard the architecture the build asked for.
+            echo '    -arch) args+=("$1" "$2"); shift 2 ;;'
             echo '    -mmacosx-version-min=*|-miphoneos-version-min=*|-mios-version-min=*) shift ;;'
             echo '    -mkernel|-msoft-float|-mno-soft-float) shift ;;'
             echo '    *) args+=("$1"); shift ;;'
             echo '  esac'
             echo 'done'
-            echo 'exec /usr/bin/clang "${args[@]}"'
+            # DELEGATE to the Darwin-target wrapper that xcrun -find clang
+            # answers with, instead of pinning a host clang. Dropping -arch and
+            # then running plain /usr/bin/clang would silently build x86_64
+            # Linux objects again -- the exact failure this shim exists to fix.
+            # The wrapper itself handles -arch (clang accepts it once a Darwin
+            # --target is set); this shim only removes what clang rejects even
+            # with that target.
+            echo 'if [ -x /usr/local/bin/xtool-clang ]; then'
+            echo '  exec /usr/local/bin/xtool-clang "${args[@]}"'
+            echo 'fi'
+            echo 'exec /usr/bin/clang --target=aarch64-apple-darwin "${args[@]}"'
           } > "$CC_SHIM"
           chmod +x "$CC_SHIM"
           export CC_SHIM
