@@ -151,6 +151,23 @@ diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
  	early_disabled = 1;
  	__asm__ volatile("dsb sy" ::: "memory");
  }
+@@ -100,7 +114,13 @@
+ }
+ 
+ void
+ sweet_early_panic(const char *fmt, va_list *args)
+ {
+-	if (early_disabled || early_panicking) {
++	/*
++	 * Deliberately ignore early_disabled. arm_vm_init switches the console
++	 * off immediately before TTBR0 is invalidated, which is exactly where
++	 * an early panic matters most; a best-effort write is harmless once the
++	 * mapping has gone away.
++	 */
++	if (early_panicking) {
+ 		return;
+ 	}
+ 
 diff --git a/osfmk/arm64/sweet_early.h b/osfmk/arm64/sweet_early.h
 --- a/osfmk/arm64/sweet_early.h
 +++ b/osfmk/arm64/sweet_early.h
