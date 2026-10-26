@@ -1295,18 +1295,41 @@ jobs:
           # mach/message.h, mach/port.h, mach/std_types.h and friends. So the
           # stdbool.h macro clash has to be handled instead of avoided.
           #
-          # mig is pre-standard-C and uses `bool` as a formal parameter NAME:
-          #     strdefs.h:89: extern char *strbool( boolean_t bool );
+          # mig is pre-standard-C and uses `bool` as a formal parameter NAME
+          # in exactly two places (verified against the upstream sources):
+          #     strdefs.h:89:  extern char *strbool( boolean_t bool );
+          #     string.c:103:  strbool(boolean_t bool)     and `if (bool)` at 105
           # xnu's EXTERNAL_HEADERS/stdbool.h does `#define bool _Bool`, so the
           # parameter becomes `_Bool` and clang reports
           #     strdefs.h:89:33: error: cannot combine with previous
           #     'type-name' declaration specifier
-          # Run 40375312365 died on that at MIGCOM COMPILE FAILED: error.c.
+          # -> MIGCOM COMPILE FAILED: error.c in runs 40375312365 and
+          # 40376235064.
           #
-          # Fix by renaming the one identifier, not by #undef-ing the macro:
-          # `bool` is never used as a type in mig, so there is nothing to
-          # un-macro, and #undef would make behaviour depend on include order.
-          INC="$INC -Dstrbool=strbool_renamed"
+          # The offending token is the PARAMETER NAME, not the function name.
+          # Run 40376235064 tried
+          #     -Dstrbool=strbool_renamed
+          # and failed identically, because that renames the function and
+          # leaves the parameter `bool` in place. `-Dbool=bool_` is not an
+          # option either: it would also rewrite every genuine use of the
+          # type. So rename only the parameter, textually, and verify.
+          for src in strdefs.h string.c; do
+            [ -f "$src" ] || { echo "::error::mig source $src missing"; exit 1; }
+            cp "$src" "$src.orig"
+          done
+          sed -i 's/char \*strbool( boolean_t bool )/char *strbool( boolean_t bool_flag )/' strdefs.h
+          sed -i 's/strbool(boolean_t bool)[[:space:]]*$/strbool(boolean_t bool_flag)/' string.c
+          sed -i 's/if (bool)$/if (bool_flag)/' string.c
+          echo "=== strdefs.h:89 after rename ==="
+          sed -n '89p' strdefs.h
+          echo "=== string.c strbool body after rename ==="
+          sed -n '100,110p' string.c
+          # Fail loudly if any parameter still carries the name `bool`.
+          if grep -nE 'boolean_t[[:space:]]+bool[[:space:]]*[,)]' strdefs.h string.c; then
+            echo "::error::a parameter named 'bool' survived the rename"
+            exit 1
+          fi
+          echo "mig bool-parameter rename: applied and verified"
           if [ ! -f /usr/local/include/compat.h ]; then
             echo "::error::compat.h missing; Stage 1b must run before Stage 5"
             exit 1
