@@ -226,17 +226,37 @@ echo "migcom-shim: hoisted subsystem statement to top of input" >&2
 #                 uint32_t;`) and matches message.h:857
 #                 `typedef natural_t mach_msg_type_number_t;`.
 #
-# So the injected line is `type mach_msg_type_number_t = uint32_t;`.
+# So the injected line must use a PRIMITIVE that migcom knows from its own
+# lexer -- not an alias some .defs declares. THREE attempts, all measured:
+#   natural_t  -- declared in machine_types.defs:81; undefined if the
+#                 injection precedes that include (include-order trap)
+#   uint32_t   -- declared in std_types.defs:75. Reasoning above was right
+#                 about includes being present, but WRONG about position:
+#                 the subsystem hoist puts this injection ABOVE every
+#                 std_types.defs declaration, so run 40397975034 failed
+#                     "(unknown)", line 4: type 'uint32_t' not defined
+#   MACH_MSG_TYPE_INTEGER_32 -- lexer token (lexxer.l:168) compiled into
+#                 migcom itself; needs no declaration anywhere. 32 bits,
+#                 matching message.h:857 typedef natural_t
+#                 mach_msg_type_number_t and machine_types.defs:81
+#                 `type natural_t = uint32_t;`. CORRECT.
+#
+# The lesson: at the top of the file nothing is declared yet, so only
+# lexer-level primitives are safe. "The include is present" is not the same
+# as "the declaration is above me".
+#
+# So the injected line is:
+#   type mach_msg_type_number_t = MACH_MSG_TYPE_INTEGER_32;
 if ! grep -qE '^[[:blank:]]*type[[:blank:]]+mach_msg_type_number_t' "$hoisted"; then
   # Insert right after the semicolon that terminates `subsystem ...;`.
   # grab is set when the subsystem line is seen, and the insert happens on
   # the FIRST subsequent line containing ';' -- which is that terminator.
   awk '
     !grab && /^[ \t]*subsystem([ \t]|$)/ { grab = 1; print; next }
-    grab && !done && /;/ { print; print "type mach_msg_type_number_t = uint32_t;"; done = 1; next }
+    grab && !done && /;/ { print; print "type mach_msg_type_number_t = MACH_MSG_TYPE_INTEGER_32;"; done = 1; next }
     { print }
   ' "$hoisted" > "$final" && cp "$final" "$hoisted"
-  echo "migcom-shim: injected type mach_msg_type_number_t = uint32_t (Apple built-in, absent from all .defs)" >&2
+  echo "migcom-shim: injected type mach_msg_type_number_t = MACH_MSG_TYPE_INTEGER_32 (Apple built-in; primitive, no .defs needed)" >&2
 fi
 
 exec "$real" "${args[@]}" < "$hoisted"
