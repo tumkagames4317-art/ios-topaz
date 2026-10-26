@@ -224,8 +224,11 @@ jobs:
           # Ubuntu has no libdispatch, so supply a header that satisfies the
           # include and nothing more. If either file ever calls dispatch_*,
           # the compile fails loudly instead of silently misbehaving.
-          mkdir -p /usr/local/include/dispatch
-          cat > /usr/local/include/dispatch/dispatch.h <<'DISPEOF'
+          # /usr/local/include is root-owned on the runner, so this needs sudo
+          # (run 40372127788: "mkdir: cannot create directory
+          # '/usr/local/include/dispatch': Permission denied").
+          sudo mkdir -p /usr/local/include/dispatch
+          sudo tee /usr/local/include/dispatch/dispatch.h >/dev/null <<'DISPEOF'
           #ifndef _LINUX_HOST_DISPATCH_STUB_H
           #define _LINUX_HOST_DISPATCH_STUB_H
           /* Host stand-in for Apple's libdispatch. cctools' ld64 includes this
