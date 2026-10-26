@@ -2312,31 +2312,6 @@ jobs:
           echo "  host cc: $(/usr/bin/cc --version 2>&1 | head -1)"
           echo "  host uname: $(uname -m)"
 
-          # --- DUPLICATE-TYPE INVESTIGATION -----------------------------------
-          # migcom exits 1 with six "overriding previous definition" errors,
-          # all in machine_types.defs, and those are FATAL (parser.y:339).
-          # The file declares each of uintptr_t/intptr_t/register_t/
-          # vm_address_t/vm_offset_t/vm_size_t exactly twice -- once per arm of
-          # an `#if defined(__LP64__)` -- so the two arms are BOTH reaching
-          # migcom even though the probe above proves cpp takes only the LP64
-          # arm. Something downstream duplicates the stream. Do not guess at
-          # which: count it in the preprocessed text itself.
-          DUPDEF="$RUNNER_TEMP/dupdef"
-          rm -rf "$DUPDEF"; mkdir -p "$DUPDEF"
-          { echo "#line 1 \"lockd_mach.defs\""; cat "$LOCKD_DEFS"; } > "$DUPDEF/lockd_mach.c"
-          "$SHIM" -E -arch arm64 -D__MACH30__ -DMACH_KERNEL_PRIVATE -DKERNEL_USER=1 \
-            $KSW $GINCS "$DUPDEF/lockd_mach.c" > "$DUPDEF/pp.c" 2>"$DUPDEF/pp.err" || true
-          echo "  preprocessed lockd_mach.defs: $(wc -l < "$DUPDEF/pp.c" 2>/dev/null || echo 0) lines"
-          echo "  --- each target type, with COUNT and every line number ---"
-          for t in uintptr_t intptr_t register_t vm_address_t vm_offset_t vm_size_t short int int64 char; do
-            n=$(grep -cE "^[[:space:]]*type[[:space:]]+${t}[[:space:]]*=" "$DUPDEF/pp.c" 2>/dev/null || echo 0)
-            locs=$(grep -nE "^[[:space:]]*type[[:space:]]+${t}[[:space:]]*=" "$DUPDEF/pp.c" 2>/dev/null | cut -d: -f1 | tr "\n" "," || true)
-            printf "    %-16s x%s  at lines: %s\n" "$t" "$n" "${locs:-none}"
-          done
-          echo "  --- pp.err (first 10) ---"
-          head -10 "$DUPDEF/pp.err" 2>/dev/null || echo "    (empty)"
-          echo "  ::notice::duplicate-type investigation dumped above"
-
           echo "=== INSTALL: Debian mig-x86-64-gnu ==="
           MIGPKG="$RUNNER_TEMP/migpkg"; rm -rf "$MIGPKG"; mkdir -p "$MIGPKG"
           MIG_DEB_URL="http://deb.debian.org/debian/pool/main/m/mig/mig-x86-64-gnu_1.8+git20231217-8_amd64.deb"
