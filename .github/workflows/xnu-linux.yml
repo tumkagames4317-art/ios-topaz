@@ -805,20 +805,33 @@ jobs:
           #     `fcopyfile' / `getprogname'
           # for installfile and replacecontents. Use the real GNU tools and
           # prove the index is non-empty before installing.
-          GNU_AR=$(command -v x86_64-linux-gnu-ar || command -v gcc-ar || \
-                   echo /usr/bin/ar)
-          GNU_RANLIB=$(command -v x86_64-linux-gnu-ranlib || \
-                       echo /usr/bin/ranlib)
+          # The diagnosis above is right, but the cure was not:
+          # `command -v x86_64-linux-gnu-ar` happily matches cctools' own
+          # prefixed Mach-O ar, because Stage 1 puts "$RUNNER_TEMP/cross/bin"
+          # first on PATH. Run 40376299545 still logged
+          #   /home/runner/work/_temp/cross/bin/x86_64-linux-gnu-ranlib:
+          #   archive library: hostshim/libbsdcompat.a the table of contents
+          #   is empty
+          # and every SETUP link then failed with
+          #   undefined reference to `getprogname'
+          # Resolve by ABSOLUTE PATH from /usr/bin, never through PATH.
+          GNU_AR=/usr/bin/ar
+          GNU_RANLIB=/usr/bin/ranlib
+          GNU_NM=/usr/bin/nm
+          for c in "$GNU_AR" "$GNU_RANLIB" "$GNU_NM"; do
+            [ -x "$c" ] || { echo "::error::missing GNU binutils: $c"; exit 1; }
+          done
+          "$GNU_AR" --version | head -1
           echo "bsdcompat archive tools: $GNU_AR / $GNU_RANLIB"
           rm -f hostshim/libbsdcompat.a
-          "$GNU_AR" rcs hostshim/libbsdcompat.a hostshim/bsdcompat.o
+          "$GNU_AR" rcsD hostshim/libbsdcompat.a hostshim/bsdcompat.o
           "$GNU_RANLIB" hostshim/libbsdcompat.a
           echo '--- libbsdcompat.a global symbols (must be non-empty) ---'
-          nm -g --defined-only hostshim/libbsdcompat.a || true
-          if ! nm -g --defined-only hostshim/libbsdcompat.a \
+          "$GNU_NM" -g --defined-only hostshim/libbsdcompat.a || true
+          if ! "$GNU_NM" -g --defined-only hostshim/libbsdcompat.a \
                  | grep -qE 'T (getprogname|setmode|getmode|fcopyfile)'; then
             echo "::error::libbsdcompat.a defines none of getprogname/setmode/getmode/fcopyfile"
-            nm -g hostshim/libbsdcompat.a || true
+            "$GNU_NM" -g hostshim/libbsdcompat.a || true
             exit 1
           fi
           # /usr/local/{include,lib} are writable on the GitHub ubuntu image,
