@@ -75,7 +75,20 @@
 #ifndef _XNU_CONST_STRING_COMPAT_H_
 #define _XNU_CONST_STRING_COMPAT_H_
 
-#include <stdint.h>
+/*
+ * NO #include HERE. This file is force-included before every kernel header,
+ * so at this point the kernel's type machinery does not exist yet. An
+ * `#include <stdint.h>` pulls in EXTERNAL_HEADERS/stdint.h, whose
+ *
+ *     typedef u_int8_t uint8_t;
+ *
+ * has no u_int8_t in scope at force-include time, and that alone produced 980
+ * 'unexpected token in argument list' errors across 54 sites in run
+ * 40417845237 -- a regression introduced by this file and fixed here.
+ *
+ * `unsigned char` is the same type as uint8_t on every target this kernel
+ * builds for, and needs no header at all.
+ */
 
 /* c_string[N] bases: const binds to the characters, not the pointer. */
 typedef const char *const_UNDKey;
@@ -95,6 +108,6 @@ typedef const char *const_vfs_path_t;
  * NOT a string. Base is `array [] of uint8_t`, so the element type is
  * uint8_t and there is no NUL terminator.
  */
-typedef const uint8_t *const_gssd_byte_buffer;
+typedef const unsigned char *const_gssd_byte_buffer;
 
 #endif /* _XNU_CONST_STRING_COMPAT_H_ */
