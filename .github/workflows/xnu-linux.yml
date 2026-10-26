@@ -101,7 +101,12 @@ env:
   # 40370458060 failed with "static declaration of 'bcmp' follows
   # non-static declaration" from foreign/strings.h. Stage 1c instead builds
   # this directory, symlinking only the subdirectories Mach-O needs.
-  CCTOOLS_FOREIGN_INCLUDE: "${{ runner.temp }}/machinc"
+  # runner.temp only exists inside a step, so a workflow-level env cannot use
+  # it: GitHub rejected the whole file with
+  #     Unrecognized named-value: 'runner'
+  # at this line, which blocked dispatch entirely. $RUNNER_TEMP always points
+  # at this path on the Ubuntu runner anyway.
+  CCTOOLS_FOREIGN_INCLUDE: "/home/runner/work/_temp/machinc"
   LIBRARY_PATH: "/usr/local/lib"
   LD_LIBRARY_PATH: "/usr/local/lib"
 
@@ -607,15 +612,41 @@ jobs:
               echo "WARNING: $FOREIGN/$d missing"
             fi
           done
-          # Availability.h/TargetConditionals.h are pulled in by swap.h too;
+          # Availability.h/AvailabilityMacros.h are pulled in by swap.h too;
           # they are plain macro headers with no libc content.
-          for h in Availability.h AvailabilityMacros.h TargetConditionals.h; do
+          for h in Availability.h AvailabilityMacros.h; do
             [ -f "$FOREIGN/$h" ] && ln -s "$FOREIGN/$h" "$CCTOOLS_FOREIGN_INCLUDE/$h"
           done
-          if [ -f "$GITHUB_WORKSPACE/cctools-port/cctools/include/TargetConditionals.h" ]; then
-            ln -sf "$GITHUB_WORKSPACE/cctools-port/cctools/include/TargetConditionals.h" \
-              "$CCTOOLS_FOREIGN_INCLUDE/TargetConditionals.h"
-          fi
+          # TargetConditionals.h is an SDK header with no open-source copy in
+          # cctools. swap.h only needs the platform predicates, and every one
+          # of them must say "not Apple" here, so describe the real host.
+          cat > "$CCTOOLS_FOREIGN_INCLUDE/TargetConditionals.h" <<'TCEOF'
+          #ifndef __TARGETCONDITIONALS__
+          #define __TARGETCONDITIONALS__
+          /* Minimal stand-in for the SDK header, for host tools built on
+           * Linux. Nothing here is a Mac, which is what the callers want:
+           * these tools only byte-swap Mach-O fields on the host. */
+          #define TARGET_OS_MAC               0
+          #define TARGET_OS_OSX               0
+          #define TARGET_OS_IPHONE            0
+          #define TARGET_OS_IOS               0
+          #define TARGET_OS_TV                0
+          #define TARGET_OS_WATCH             0
+          #define TARGET_OS_BRIDGE            0
+          #define TARGET_OS_SIMULATOR         0
+          #define TARGET_OS_EMBEDDED          0
+          #define TARGET_OS_LINUX             1
+          #define TARGET_OS_UNIX              1
+          #define TARGET_CPU_X86_64           1
+          #define TARGET_CPU_PPC              0
+          #define TARGET_CPU_PPC64            0
+          #define TARGET_CPU_ARM              0
+          #define TARGET_CPU_ARM64            0
+          #define TARGET_RT_LITTLE_ENDIAN     1
+          #define TARGET_RT_BIG_ENDIAN        0
+          #define TARGET_RT_64_BIT            1
+          #endif /* __TARGETCONDITIONALS__ */
+          TCEOF
           ls -la "$CCTOOLS_FOREIGN_INCLUDE"
           echo '--- probes ---'
           /usr/bin/xcrun --sdk macosx -show-sdk-path
