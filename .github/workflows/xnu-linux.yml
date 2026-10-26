@@ -238,6 +238,91 @@ jobs:
           #endif
           DISPEOF
           echo "dispatch stub installed: $(ls -la /usr/local/include/dispatch/dispatch.h)"
+          # order.cpp and code_dedup.cpp are the only two files that call
+          # dispatch_apply(), and they do it while mutating locals that live
+          # *outside* the block:
+          #
+          #     dispatch_apply(_state.sections.size(), DISPATCH_APPLY_AUTO,
+          #                    ^(size_t index) { ... sect ... });   // order.cpp
+          #     dispatch_apply(state.sections.size(), DISPATCH_APPLY_AUTO,
+          #                    ^(size_t index) { ... pos ... fit ... });  // code_dedup
+          #
+          # With real Apple libdispatch that is a legal parallel-for. With the
+          # empty stub above, `^{...}` degrades to a plain C++ block literal,
+          # and C++ forbids mutating an enclosing local from inside one -- run
+          # 40372391857 produced 18 such errors and ld64 never linked:
+          #     code_dedup.cpp:356:30: error: reference to local variable 'pos'
+          #         declared in enclosing block literal
+          #     order.cpp:701:24: error: reference to local variable 'sect'
+          #         declared in enclosing block literal
+          #
+          # The passes cannot simply be dropped: ld.cpp:1631-1632 calls both
+          # unconditionally, branch_island and compact_unwind document that
+          # they must run. So serialise the two dispatch_apply calls into
+          # plain loops instead. Same work, same order, no parallelism.
+          for src in ld64/src/ld/passes/order.cpp ld64/src/ld/passes/code_dedup.cpp; do
+            [ -f "$src" ] || { echo "MISSING PASS SOURCE: $src"; exit 1; }
+            cp "$src" "$src.orig"
+            python3 - "$src" <<'SERIALPY'
+          import re, sys, pathlib
+          p = pathlib.Path(sys.argv[1])
+          s = p.read_text()
+          # 1) dispatch_apply(EXPR, DISPATCH_APPLY_AUTO, ^(size_t index) {
+          #      ->  for (size_t index = 0; index < (size_t)(EXPR); ++index) {
+          open_pat = re.compile(
+              r'dispatch_apply\(\s*(?P<n>[^,]+?)\s*,\s*DISPATCH_APPLY_AUTO\s*,\s*'
+              r'\^\(\s*size_t\s+index\s*\)\s*\{')
+          m = open_pat.search(s)
+          if not m:
+              sys.exit('no dispatch_apply(...) block literal found in %s' % (p,))
+
+          body_start = m.end()          # just past the block's opening brace
+          for_loop = ('for (size_t index = 0; index < (size_t)(%s); ++index) {'
+                      % m.group('n').strip())
+
+          # 2) Find the MATCHING close brace by counting depth. Rewriting only
+          #    the opening token leaves the block's "});" behind, which does
+          #    not compile -- verified against the real files before writing
+          #    this: order.cpp closes at its line 704, code_dedup at 369.
+          depth = 1
+          i = body_start
+          while i < len(s) and depth:
+              if s[i] == '{':
+                  depth += 1
+              elif s[i] == '}':
+                  depth -= 1
+              i += 1
+          if depth:
+              sys.exit('unbalanced braces after dispatch_apply in %s' % (p,))
+          close_pos = i - 1            # index of the matching '}'
+
+          # 3) dispatch_apply(...)'s terminator is "})" then ";". For a for
+          #    loop that becomes a single "}".
+          if s[close_pos:close_pos + 2] != '})':
+              sys.exit('unexpected close token %r in %s'
+                       % (s[close_pos:close_pos + 3], p))
+          rest = s[close_pos + 2:]
+          semi = re.match(r'\s*;', rest)
+          if not semi:
+              sys.exit('no terminating ; after block close in %s' % (p,))
+
+          new = (s[:m.start()] + for_loop
+                 + s[body_start:close_pos]
+                 + '}' + rest[semi.end():])
+          p.write_text(new)
+          print('serialised dispatch_apply in %s' % (p,))
+          SERIALPY
+            echo "=== $src after rewrite ==="
+            grep -n 'for (size_t index = 0' "$src" || echo "REWRITE NOT VISIBLE IN $src"
+            grep -c 'dispatch_apply' "$src" || true
+          done
+          for src in ld64/src/ld/passes/order.cpp ld64/src/ld/passes/code_dedup.cpp; do
+            if grep -q 'dispatch_apply' "$src"; then
+              echo "STILL CONTAINS dispatch_apply: $src"
+              grep -n 'dispatch_apply' "$src"
+              exit 1
+            fi
+          done
           # --with-libdispatch=no is the documented opt-out; the rewrite above is
           # the belt to that braces.
           set +e
@@ -257,10 +342,34 @@ jobs:
           fi
           echo "=== did configure create a Makefile? ==="
           ls -la Makefile 2>&1 | head -3
-          make -j"$(nproc)" > /tmp/make.log 2>&1 || { echo "MAKE FAILED"; tail -60 /tmp/make.log; }
+          # These used to be `|| { echo "..."; tail ...; }`, which swallows the
+          # failure: run 40372391857 reported `ld64: MISSING` and still went
+          # green because nothing propagated a non-zero status. Print the
+          # diagnostics, then FAIL.
+          set +e
+          make -j"$(nproc)" > /tmp/make.log 2>&1
+          make_rc=$?
+          set -e
+          echo "make exit status: $make_rc"
           tail -25 /tmp/make.log
-          make install > /tmp/inst.log 2>&1 || { echo "MAKE INSTALL FAILED"; tail -30 /tmp/inst.log; }
+          if [ "$make_rc" != 0 ]; then
+            echo "=== MAKE FAILED; last 60 lines ==="
+            tail -60 /tmp/make.log
+            echo "=== first 20 compile errors ==="
+            grep -nE 'error:' /tmp/make.log | head -20 || echo "(no 'error:' lines)"
+            echo "=== first failing translation units ==="
+            grep -nE '^\s*[A-Za-z0-9_./-]+\.(cpp|c|h):[0-9]+:[0-9]+: error:' /tmp/make.log | head -10 || true
+          fi
+          set +e
+          make install > /tmp/inst.log 2>&1
+          inst_rc=$?
+          set -e
+          echo "make install exit status: $inst_rc"
           tail -10 /tmp/inst.log
+          if [ "$inst_rc" != 0 ]; then
+            echo "=== MAKE INSTALL FAILED; last 30 lines ==="
+            tail -30 /tmp/inst.log
+          fi
           ls -la "$RUNNER_TEMP/cross/bin" || true
           echo "=== did we get what the build actually needs? ==="
           test -x "$RUNNER_TEMP/cross/bin/ld64" && echo "ld64: OK" || echo "ld64: MISSING"
@@ -268,6 +377,16 @@ jobs:
           test -d include/mach-o                && echo "include/mach-o: OK" || echo "include/mach-o: MISSING"
           ls -d include/* 2>/dev/null | head -20 || true
           echo "$RUNNER_TEMP/cross/bin" >> "$GITHUB_PATH"
+          # The verdict IS the exit status. Everything downstream cannot work
+          # without ld64/nm, so reporting MISSING and returning success is
+          # exactly the lie that cost several runs.
+          if [ "$make_rc" != 0 ] || [ "$inst_rc" != 0 ] \
+             || [ ! -x "$RUNNER_TEMP/cross/bin/ld64" ] \
+             || [ ! -x "$RUNNER_TEMP/cross/bin/nm" ]; then
+            echo "::error::Stage 1 did not produce ld64/nm (make=$make_rc install=$inst_rc)"
+            exit 1
+          fi
+          echo "Stage 1 verdict: cctools OK (ld64 + nm present)"
 
       # ------------------------------------------- stage 1b: macOS host shims
       # The SETUP/ host tools (config, decomment, setsegname, installfile,
@@ -435,6 +554,43 @@ jobs:
           #ifndef _GNU_SOURCE
           #define _GNU_SOURCE 1
           #endif
+          /* ---- BSD scalar types ------------------------------------------
+           * u_int/u_char/u_short/u_long are BSD names. glibc does have them,
+           * but only under __USE_MISC (i.e. _DEFAULT_SOURCE/_BSD_SOURCE).
+           * migcom is built with -std=gnu89 and asks for neither, so run
+           * 40372741264 failed with 14 copies of
+           *     ./type.h:48:9: error: unknown type name 'u_int'
+           * and MIGCOM COMPILE FAILED: global.c.
+           *
+           * compat.h is force-included into every host TU, so defining the
+           * family here fixes all of them at once. This lives inside the
+           * !KERNEL guard: the kernel build brings its own BSD types and must
+           * not see host typedefs.
+           *
+           * Caution: when __USE_MISC IS active (it is, elsewhere in the
+           * build), glibc has already declared several of these, and a second
+           * typedef of the same name is a hard error. So each is gated on
+           * whether <sys/types.h> got to it. <sys/types.h> is included above,
+           * which is exactly why the _SYS_TYPES_H test below is meaningful.
+           */
+          #ifndef _HOST_BSD_SCALARS_DONE
+          #define _HOST_BSD_SCALARS_DONE 1
+          #if !defined(__USE_MISC) || !defined(_SYS_TYPES_H)
+          /* glibc did not supply the BSD family: declare it. */
+          typedef unsigned char       u_char;
+          typedef unsigned short      u_short;
+          typedef unsigned int        u_int;
+          typedef unsigned long       u_long;
+          #endif
+          /* These four are absent from glibc under every feature set. */
+          typedef unsigned char       u_int8_t;
+          typedef unsigned short      u_int16_t;
+          typedef unsigned int        u_int32_t;
+          typedef unsigned long long  u_int64_t;
+          typedef long long           quad_t;
+          typedef unsigned long long  u_quad_t;
+          typedef long                daddr_t;
+          #endif /* _HOST_BSD_SCALARS_DONE */
           /* getprogname() is a function on macOS; glibc exposes the same string
            * as a variable declared in <errno.h> behind _GNU_SOURCE. Referencing
            * the variable from an inline body is fragile (that is exactly how
@@ -627,13 +783,51 @@ jobs:
           rm -rf "$CCTOOLS_FOREIGN_INCLUDE"
           mkdir -p "$CCTOOLS_FOREIGN_INCLUDE"
           FOREIGN="$GITHUB_WORKSPACE/cctools-port/cctools/include/foreign"
-          for d in architecture libkern machine; do
+          # `sys` belongs in this list. cctools ships include/foreign/sys/_types.h
+          # (and sys/attr.h), and <libkern/_OSByteOrder.h> includes
+          # <sys/_types.h> unconditionally. Leaving `sys` out meant the lookup
+          # walked on to glibc's own <sys/...> space, found nothing called
+          # _types.h, and died with
+          #   libkern/_OSByteOrder.h:40:10: fatal error: 'sys/_types.h'
+          #   file not found
+          # in runs 40371757506 and 40372391857. The file was never missing;
+          # it was simply not on the path. Only `architecture`, `libkern` and
+          # `machine` are exposed from here: foreign/ also holds
+          # strings.h/stdio.h/stdlib.h/unistd.h/fcntl.h/libc.h, and shadowing
+          # glibc with those breaks every translation unit (40370458060).
+          #
+          # `sys` is deliberately NOT symlinked from foreign/: cctools'
+          # foreign/sys/_types.h opens with
+          #     #include_next <sys/_types.h>
+          # which expects Apple's real header underneath it. There is nothing
+          # to include_next on Linux, so a self-contained shim is written
+          # below instead.
+          # libkern is a real directory of per-entry symlinks, not one link to
+          # foreign/libkern: a later step writes its own _OSByteOrder.h into
+          # machinc/libkern, and via a directory symlink that write would land
+          # inside the cctools checkout and clobber the original.
+          for d in architecture machine; do
             if [ -d "$FOREIGN/$d" ]; then
               ln -s "$FOREIGN/$d" "$CCTOOLS_FOREIGN_INCLUDE/$d"
             else
               echo "WARNING: $FOREIGN/$d missing"
             fi
           done
+          mkdir -p "$CCTOOLS_FOREIGN_INCLUDE/libkern"
+          if [ -d "$FOREIGN/libkern" ]; then
+            for x in "$FOREIGN/libkern"/*; do
+              ln -s "$x" "$CCTOOLS_FOREIGN_INCLUDE/libkern/$(basename "$x")"
+            done
+          else
+            echo "WARNING: $FOREIGN/libkern missing"
+          fi
+          # cctools' own mach/machine.h does
+          #     #import <mach/machine/vm_types.h>
+          # and its copy of that header lives under foreign/mach, so the Mach
+          # headers have to be on the path too (no libc names in there):
+          #     cctools/include/mach/machine.h:83:9: fatal error:
+          #     'mach/machine/vm_types.h' file not found
+          [ -d "$FOREIGN/mach" ] && ln -s "$FOREIGN/mach" "$CCTOOLS_FOREIGN_INCLUDE/mach"
           # Availability.h/AvailabilityMacros.h are pulled in by swap.h too;
           # they are plain macro headers with no libc content.
           for h in Availability.h AvailabilityMacros.h; do
@@ -669,37 +863,96 @@ jobs:
           #define TARGET_RT_64_BIT            1
           #endif /* __TARGETCONDITIONALS__ */
           TCEOF
-          # libkern/_OSByteOrder.h includes <sys/_types.h> purely for the
-          # Apple spelling of the fixed-width types (__uint32_t and friends).
-          # glibc has <sys/types.h> but no <sys/_types.h>, and run 40371757506
-          # stopped at
-          #   machinc/libkern/_OSByteOrder.h:40:10: fatal error:
-          #   'sys/_types.h' file not found
-          # Only the typedefs that the cctools Mach-O headers use are needed,
-          # and real glibc <sys/types.h> is untouched: this file is reachable
-          # only through machinc, and machinc is only on the host-tool path.
-          mkdir -p "$CCTOOLS_FOREIGN_INCLUDE/sys"
-          cat > "$CCTOOLS_FOREIGN_INCLUDE/sys/_types.h" <<'SYSTEOF'
-          #ifndef _MACHINC_SYS__TYPES_H
-          #define _MACHINC_SYS__TYPES_H
+          # ---- libkern/_OSByteOrder.h: make it stop needing sys/_types.h ----
+          #
+          # cctools DOES ship include/foreign/sys/_types.h, but it opens with
+          #     #include_next <sys/_types.h>
+          # so it expects Apple's real header underneath and cannot work on
+          # Linux. That is why `sys` is not symlinked above.
+          #
+          # _OSByteOrder.h only wants the Apple spellings of the fixed-width
+          # types, so shadow it with a copy that pulls <stdint.h> and defines
+          # those spellings itself. Then no Darwin-only header is required on
+          # ANY include path, which is the real fix: the next Darwin-only
+          # include cannot reproduce this class of failure.
+          # The swap macros are byte-for-byte the cctools ones; only the type
+          # supply changed.
+          mkdir -p "$CCTOOLS_FOREIGN_INCLUDE/libkern"
+          cat > "$CCTOOLS_FOREIGN_INCLUDE/libkern/_OSByteOrder.h" <<'OSBOEOF'
+          /*
+           * Host stand-in for cctools' include/foreign/libkern/_OSByteOrder.h,
+           * for building xnu's SETUP/ host tools on Linux.
+           *
+           * Apple's original does `#include <sys/_types.h>` purely to obtain
+           * __uint16_t/__uint32_t/__uint64_t. That header is Darwin-only, so
+           * the original drags a Darwin include path requirement into every
+           * consumer. This copy is self-contained: <stdint.h> plus the four
+           * typedefs Apple's header would have supplied. Byte-order logic is
+           * unchanged.
+           */
+          #ifndef _HOST_LIBKERN__OSBYTEORDER_H
+          #define _HOST_LIBKERN__OSBYTEORDER_H
+
           #include <stdint.h>
-          #include <stddef.h>
-          typedef int8_t           __int8_t;
-          typedef int16_t          __int16_t;
-          typedef int32_t          __int32_t;
-          typedef int64_t          __int64_t;
-          typedef uint8_t          __uint8_t;
-          typedef uint16_t         __uint16_t;
-          typedef uint32_t         __uint32_t;
-          typedef uint64_t         __uint64_t;
-          typedef intptr_t         __darwin_intptr_t;
-          typedef unsigned long    __darwin_size_t;
-          typedef unsigned int     __darwin_useconds_t;
-          typedef int64_t          __darwin_off_t;
-          typedef long             __darwin_time_t;
-          typedef unsigned char    __darwin_uuid_t[16];
-          #endif /* _MACHINC_SYS__TYPES_H */
-          SYSTEOF
+
+          #ifndef __uint16_t
+          typedef uint16_t __uint16_t;
+          #endif
+          #ifndef __uint32_t
+          typedef uint32_t __uint32_t;
+          #endif
+          #ifndef __uint64_t
+          typedef uint64_t __uint64_t;
+          #endif
+
+          #define __DARWIN_OSSwapConstInt16(x) \
+              ((__uint16_t)((((__uint16_t)(x) & 0xff00) >> 8) | \
+                          (((__uint16_t)(x) & 0x00ff) << 8)))
+
+          #define __DARWIN_OSSwapConstInt32(x) \
+              ((__uint32_t)((((__uint32_t)(x) & 0xff000000) >> 24) | \
+                          (((__uint32_t)(x) & 0x00ff0000) >>  8) | \
+                          (((__uint32_t)(x) & 0x0000ff00) <<  8) | \
+                          (((__uint32_t)(x) & 0x000000ff) << 24)))
+
+          #define __DARWIN_OSSwapConstInt64(x) \
+              ((__uint64_t)((((__uint64_t)(x) & 0xff00000000000000ULL) >> 56) | \
+                          (((__uint64_t)(x) & 0x00ff000000000000ULL) >> 40) | \
+                          (((__uint64_t)(x) & 0x0000ff0000000000ULL) >> 24) | \
+                          (((__uint64_t)(x) & 0x000000ff00000000ULL) >>  8) | \
+                          (((__uint64_t)(x) & 0x00000000ff000000ULL) <<  8) | \
+                          (((__uint64_t)(x) & 0x0000000000ff0000ULL) << 24) | \
+                          (((__uint64_t)(x) & 0x000000000000ff00ULL) << 40) | \
+                          (((__uint64_t)(x) & 0x00000000000000ffULL) << 56)))
+
+          /* No <libkern/i386/_OSByteOrder.h> or <libkern/arm/OSByteOrder.h>
+           * subclass here: those pull in Apple arch headers. __builtin_bswap*
+           * is exactly what _OSSwapIntNN compiles to on clang. */
+          #define __DARWIN_OSSwapInt16(x) \
+              (__builtin_constant_p(x) ? __DARWIN_OSSwapConstInt16(x) \
+                                       : (__uint16_t)__builtin_bswap16((uint16_t)(x)))
+
+          #define __DARWIN_OSSwapInt32(x) \
+              (__builtin_constant_p(x) ? __DARWIN_OSSwapConstInt32(x) \
+                                       : (__uint32_t)__builtin_bswap32((uint32_t)(x)))
+
+          #define __DARWIN_OSSwapInt64(x) \
+              (__builtin_constant_p(x) ? __DARWIN_OSSwapConstInt64(x) \
+                                       : (__uint64_t)__builtin_bswap64((uint64_t)(x)))
+
+          #endif /* _HOST_LIBKERN__OSBYTEORDER_H */
+          OSBOEOF
+          echo "self-contained _OSByteOrder.h installed:"
+          grep -n 'sys/_types.h' "$CCTOOLS_FOREIGN_INCLUDE/libkern/_OSByteOrder.h" \
+            && { echo "::error::_OSByteOrder.h still references sys/_types.h"; exit 1; } \
+            || echo "  no sys/_types.h reference (good)"
+          # Prove it compiles with ONLY machinc on the path and no Darwin sys/
+          # of our own, which is the property we actually want.
+          printf '#include <libkern/_OSByteOrder.h>\nint main(void){return (int)__DARWIN_OSSwapInt32(1u)==0;}\n' \
+            > /tmp/osb.c
+          cc -I"$CCTOOLS_FOREIGN_INCLUDE" -c -o /tmp/osb.o /tmp/osb.c \
+            && echo "  _OSByteOrder.h self-containment probe: OK" \
+            || { echo "::error::_OSByteOrder.h is not self-contained"; exit 1; }
           ls -la "$CCTOOLS_FOREIGN_INCLUDE"
           echo '--- probes ---'
           /usr/bin/xcrun --sdk macosx -show-sdk-path
@@ -885,15 +1138,27 @@ jobs:
           bison -d -o out/parser.c parser.y
           flex -o out/lexxer.c lexxer.l
           INC="-Iout -I. -I../../dxb/xnu/osfmk -I../../dxb/xnu/EXTERNAL_HEADERS"
+          # migcom needs the BSD scalar types (u_int and friends) that glibc
+          # hides behind __USE_MISC. Stage 1b's compat.h defines them and is
+          # safe to force-include here: its host-tool half is gated on
+          # !KERNEL, and migcom defines no KERNEL. Without this the build dies
+          # with "unknown type name 'u_int'" out of type.h -- see the note on
+          # compat.h for the full trail.
+          if [ ! -f /usr/local/include/compat.h ]; then
+            echo "::error::compat.h missing; Stage 1b must run before Stage 5"
+            exit 1
+          fi
           for f in error.c global.c handler.c header.c mig.c routine.c \
                    server.c statement.c string.c type.c user.c utils.c \
                    out/parser.c out/lexxer.c; do
             echo "== $f"
-            clang -std=gnu89 -w -Dlinux -o "out/$(basename "${f%.c}").o" -c "$f" $INC \
+            clang -std=gnu89 -w -Dlinux -include /usr/local/include/compat.h \
+              -o "out/$(basename "${f%.c}").o" -c "$f" $INC \
               || { echo "MIGCOM COMPILE FAILED: $f"; exit 1; }
           done
           clang -o out/migcom out/*.o -lm
           ./out/migcom -version || true
+          test -x out/migcom || { echo "::error::migcom was not produced"; exit 1; }
           mkdir -p "$RUNNER_TEMP/cross/bin"
           cp out/migcom "$RUNNER_TEMP/cross/bin/migcom"
           # mig.sh is the driver xnu calls; point it at the migcom we built.
@@ -901,7 +1166,16 @@ jobs:
           chmod +x "$RUNNER_TEMP/cross/bin/mig"
           grep -n '^M=' "$RUNNER_TEMP/cross/bin/mig" || true
           echo "$RUNNER_TEMP/cross/bin" >> "$GITHUB_PATH"
-          "$RUNNER_TEMP/cross/bin/mig" -version || true
+          # Earlier runs died with a bare "exit code 1" and no visible cause
+          # because `|| true` hid both the failure and its message. Report
+          # the real verdict instead: migcom must exist and answer -version.
+          echo "=== mig verdict ==="
+          if "$RUNNER_TEMP/cross/bin/migcom" -version; then
+            echo "migcom: OK"
+          else
+            echo "::error::migcom built but failed its -version probe"
+            exit 1
+          fi
 
       # ------------------------------------- stage 5b: SETUP host tools
       # kextsymboltool / setsegname / installfile need Apple's compat.h
@@ -960,22 +1234,28 @@ jobs:
           MACHEOF
             echo "created minimal mach/ headers under $MACHD_INC"
           fi
-          CFLAGS="-isysroot / -g -O0 -I/usr/local/include -I$MACHD_INC -I$CCTOOLS_FOREIGN_INCLUDE -I$XROOT/EXTERNAL_HEADERS"
+          CFLAGS="-isysroot / -g -O0 -isystem $CCTOOLS_FOREIGN_INCLUDE -I/usr/local/include -I$MACHD_INC -I$XROOT/EXTERNAL_HEADERS"
           CFLAGS="$CFLAGS -include /usr/local/include/compat.h"
+          setup_failed=""
           for d in config kextsymboltool setsegname installfile replacecontents; do
             echo "== SETUP/$d"
             ok=1
             ( cd "$XROOT/SETUP/$d" && for f in *.c; do
                 clang $CFLAGS -c -o "$OBJROOT/SETUP/$d/${f%.c}.o" "$f" || exit 1
-              done ) || { ok=0; echo "COMPILE FAILED: SETUP/$d"; }
+              done ) || { ok=0; echo "COMPILE FAILED: SETUP/$d"; setup_failed="$setup_failed $d(compile)"; }
             if [ "$ok" = 1 ] && ls "$OBJROOT/SETUP/$d"/*.o >/dev/null 2>&1; then
               clang -o "$OBJROOT/SETUP/$d/$d" "$OBJROOT/SETUP/$d"/*.o \
-                -L/usr/local/lib -lbsdcompat || echo "LINK FAILED: SETUP/$d"
+                -L/usr/local/lib -lbsdcompat || { echo "LINK FAILED: SETUP/$d"; setup_failed="$setup_failed $d(link)"; }
               ls -la "$OBJROOT/SETUP/$d/" | head -20
             fi
           done
           echo '--- which tools got built ---'
           find "$OBJROOT/SETUP" -maxdepth 2 -type f -executable -exec ls -la {} \; || true
+          echo "Stage 5b verdict:${setup_failed:- all SETUP tools built}"
+          if [ -n "$setup_failed" ]; then
+            echo "::error::Stage 5b could not build:$setup_failed"
+            exit 1
+          fi
 
       # ------------------------------------------- stage 6: the real thing
       - name: "Stage 6: make installhdrs + install (this is the build)"
@@ -1005,8 +1285,17 @@ jobs:
             DSTROOT="$FAKEROOT" FAKEROOT_DIR="$FAKEROOT"
             OBJROOT="$OBJROOT" SYMROOT="$GITHUB_WORKSPACE/dxb/build/xnu.sym"
             CC=clang CXX=clang++
-            HOST_CC="clang -include /usr/local/include/compat.h -I$GITHUB_WORKSPACE/cctools-port/cctools/include -I$CCTOOLS_FOREIGN_INCLUDE"
-            HOST_CXX="clang++ -include /usr/local/include/compat.h -I$GITHUB_WORKSPACE/cctools-port/cctools/include -I$CCTOOLS_FOREIGN_INCLUDE"
+            # Order matters. $CCTOOLS_FOREIGN_INCLUDE (machinc) must come
+            # BEFORE cctools/include so that our self-contained
+            # libkern/_OSByteOrder.h shadows the Apple original that includes
+            # <sys/_types.h>. machinc is already on this path, so the earlier
+            # "mach/mach_init.h / sys/_types.h not found" failures were not a
+            # missing -I at all: Stage 1c simply never symlinked foreign/sys
+            # (and the original _OSByteOrder.h dragged that header in).
+            # Both are fixed at the source now; the ordering keeps the
+            # self-contained override authoritative.
+            HOST_CC="clang -isystem $CCTOOLS_FOREIGN_INCLUDE -include /usr/local/include/compat.h -I$GITHUB_WORKSPACE/cctools-port/cctools/include"
+            HOST_CXX="clang++ -isystem $CCTOOLS_FOREIGN_INCLUDE -include /usr/local/include/compat.h -I$GITHUB_WORKSPACE/cctools-port/cctools/include"
             HOST_LDFLAGS="-L/usr/local/lib -lbsdcompat"
             LDFLAGS="-L/usr/local/lib -lbsdcompat"
             HOST_BISON=bison HOST_FLEX=flex HOST_GM4=m4
@@ -1024,14 +1313,32 @@ jobs:
           )
 
           echo '===================== installhdrs ====================='
+          # `-k` keeps going so we see every independent failure, but the exit
+          # status is what decides the step. It used to be `|| true`, which is
+          # why a run could report MAKE FAILED and still go green.
+          set +e
           make installhdrs -k "${make_flags[@]}" \
-            2>&1 | tee "$GITHUB_WORKSPACE/hdrs.log" | tail -80 || true
+            2>&1 | tee "$GITHUB_WORKSPACE/hdrs.log" | tail -80
+          hdrs_rc=${PIPESTATUS[0]}
+          echo "installhdrs exit status: $hdrs_rc"
           echo '--- first error: lines (headers) ---'
           grep -nE 'error:' "$GITHUB_WORKSPACE/hdrs.log" | head -30 || true
 
           echo '===================== install ====================='
           make install -k "${make_flags[@]}" MAKEFLAGS=-k \
-            2>&1 | tee "$GITHUB_WORKSPACE/build.log" | tail -150 || true
+            2>&1 | tee "$GITHUB_WORKSPACE/build.log" | tail -150
+          build_rc=${PIPESTATUS[0]}
+          echo "install exit status: $build_rc"
+          set -e
+          echo '--- SETUP host tools actually present? ---'
+          find "$OBJROOT/SETUP" -maxdepth 2 -type f -executable | sort || true
+          echo '--- first real error, in order ---'
+          grep -nE 'fatal error:|error:' "$GITHUB_WORKSPACE/build.log" | head -10 || echo "(no error: lines)"
+          echo "Stage 6 verdict: installhdrs=$hdrs_rc install=$build_rc"
+          if [ "$build_rc" != 0 ] || [ "$hdrs_rc" != 0 ]; then
+            echo "::error::Stage 6 failed (installhdrs=$hdrs_rc install=$build_rc)"
+            exit 1
+          fi
 
       - name: Summarise the first genuine failure
         if: always()
@@ -1063,7 +1370,18 @@ jobs:
           mkdir -p out
           cp -R dxb/fakeroot/System/Library/Kernels/. out/ 2>/dev/null || true
           ls -la out
-          (cd out && sha256sum kernel.* > SHA256SUMS) || true
+          # `or true` here hid the fact that no kernel existed for several
+          # runs. Keep the step non-fatal (it runs under `always()` alongside
+          # failure diagnostics) but make the absence loud and explicit.
+          if ls out/kernel.* >/dev/null 2>&1; then
+            echo "KERNEL ARTIFACT: PRESENT"
+            ls -la out/kernel.*
+            (cd out && sha256sum kernel.* > SHA256SUMS) || true
+            cat out/SHA256SUMS 2>/dev/null || true
+          else
+            echo "KERNEL ARTIFACT: ABSENT -- the build produced no kernel.*"
+            echo "::warning::No kernel.* was produced by this run"
+          fi
 
       - uses: actions/upload-artifact@v4
         if: always()
