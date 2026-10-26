@@ -201,16 +201,38 @@ fi
 # The built-in list is exactly type.c:977-985, and these names are the ones
 # mig reports as "overriding previous definition". Anything else that collides
 # is a genuine .defs problem and must not be silently deleted here.
+# `int64` is in the list too, and it is NOT one of type.c:977-985's five. The
+# control in run 40409383956 is what established that it belongs:
+#
+#     CONTROL: int64 decls before=1 after=0
+#     CONTROL raw migcom exit: 0
+#     CONTROL overriding-definition lines: (none)
+#     CONTROL VERDICT: removing the int64 line FIXES it
+#
+# Reproduced against a captured stream containing exactly one
+# `type int64 = int64_t;`: migcom rejects it with
+#     ".../std_types.defs", line 84: overriding previous definition of int64
+# and accepts the same bytes with that one line removed. So the name is
+# reported as already-defined even though it is not in init_type's insert
+# list, not a lexer keyword, and appears once. The mechanism is not something
+# I could pin down by reading type.c/parser.y/lexxer.c, and I no longer need
+# to: the fix is exact either way, because dropping the line lets migcom run
+# and there is no other declaration of the name for anything to reference.
+#
+# `int64_t` is deliberately NOT matched: the pattern is anchored to the exact
+# name and requires `[[:blank:]]*=` immediately after it, so `type int64_t =`
+# is untouched. That distinction matters -- int64_t is a real, distinct type
+# that routines reference.
 n_builtin=0
-for _t in char short int uintptr_t intptr_t; do
+for _t in char short int uintptr_t intptr_t int64; do
   _c=$(grep -cE "^[[:blank:]]*type[[:blank:]]+${_t}[[:blank:]]*=" "$real_out" || true)
   [ "${_c:-0}" -gt 0 ] && n_builtin=$((n_builtin + _c))
 done
 if [ "${n_builtin:-0}" -gt 0 ]; then
   sed -i -E \
-    -e '/^[[:blank:]]*type[[:blank:]]+(char|short|int|uintptr_t|intptr_t)[[:blank:]]*=/d' \
+    -e '/^[[:blank:]]*type[[:blank:]]+(char|short|int|uintptr_t|intptr_t|int64)[[:blank:]]*=/d' \
     "$real_out"
-  echo "migcom-shim: dropped $n_builtin re-declaration(s) of GNU mig built-in integer types (char/short/int/uintptr_t/intptr_t; type.c:977-985 already registers each with the identical IPC name)" >&2
+  echo "migcom-shim: dropped $n_builtin pre-registered re-declaration(s) (char/short/int/uintptr_t/intptr_t from type.c:977-985, plus int64; migcom rejects each of these as an override)" >&2
 fi
 
 # --- (3b) SameCount -> an explicit count argument --------------------------
