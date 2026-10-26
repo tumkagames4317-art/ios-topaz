@@ -828,11 +828,18 @@ jobs:
           "$GNU_RANLIB" hostshim/libbsdcompat.a
           echo '--- libbsdcompat.a global symbols (must be non-empty) ---'
           "$GNU_NM" -g --defined-only hostshim/libbsdcompat.a || true
+          # Do NOT exit here. Run 40377082068 proved the cost: this check
+          # correctly detected the hollow archive, but because it sat BEFORE
+          # the installs, its `exit 1` also meant compat.h was never written
+          # and all five SETUP dirs died with
+          #     <built-in>:1:10: fatal error:
+          #       '/usr/local/include/compat.h' file not found
+          # One fault became two, and the second masked the first. Record the
+          # verdict in a variable, install both files regardless, then fail.
+          BSD_SHIM_OK=1
           if ! "$GNU_NM" -g --defined-only hostshim/libbsdcompat.a \
                  | grep -qE 'T (getprogname|setmode|getmode|fcopyfile)'; then
-            echo "::error::libbsdcompat.a defines none of getprogname/setmode/getmode/fcopyfile"
-            "$GNU_NM" -g hostshim/libbsdcompat.a || true
-            exit 1
+            BSD_SHIM_OK=0
           fi
           # /usr/local/{include,lib} are writable on the GitHub ubuntu image,
           # so an unconditional `sudo cp` fails there and the file never
@@ -844,6 +851,14 @@ jobs:
           install_shim hostshim/compat.h        /usr/local/include/compat.h
           install_shim hostshim/libbsdcompat.a  /usr/local/lib/libbsdcompat.a
           echo "compat: $(ls -la /usr/local/include/compat.h /usr/local/lib/libbsdcompat.a)"
+          if [ "$BSD_SHIM_OK" = 1 ]; then
+            echo "libbsdcompat.a: BSD shim symbols present (good)"
+          else
+            echo "::error::libbsdcompat.a defines none of getprogname/setmode/getmode/fcopyfile"
+            "$GNU_NM" -g hostshim/libbsdcompat.a || true
+            echo "compat.h WAS still installed, so later stages fail on the real cause"
+            exit 1
+          fi
           echo '--- installed archive global symbols ---'
           nm -g --defined-only /usr/local/lib/libbsdcompat.a || true
 
