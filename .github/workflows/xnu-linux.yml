@@ -1,0 +1,310 @@
+name: xnu-linux
+
+# Build kernel.development.sweet for platform=ginkgo on a Linux runner.
+#
+# Why this exists: xnu.yml runs on macos-14 and every dispatch since
+# 2026-10-26 08:49 UTC is granted a runner, then cancelled with `steps: []`
+# after exactly 15 minutes -- no step ever starts. That is the signature of
+# exhausted private-repo macOS minutes on this Free-plan account (2,000
+# included minutes, macOS billed at 10x), not a workflow bug.
+#
+# Two properties of xnu-8796.121.2 SWEET make a Linux host worth trying:
+#   * the KDK force-load in makedefs/MakeInc.def is guarded by
+#     `ifeq ($(CURRENT_MACHINE_CONFIG), T6000|T8101|VMAPPLE)` -- SWEET is not
+#     in that list, so the closed-source libSWEET.os.*.a is never needed;
+#   * osfmk/conf/files.arm64 only marks sources `nos_arm_pmap`/`nos_arm_asm`
+#     (i.e. sourced from the KDK) for those same configs, so every arm64
+#     pmap/locore/start.s object is compiled from open source here.
+#
+# This workflow is a probe as much as a build: each stage is `continue-on-error`
+# so one dispatch reports every impossible step at once instead of hiding the
+# second blocker behind the first.
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: ginkgo (skips topaz-only patches)
+        default: ginkgo
+      kernel_config:
+        description: RELEASE / DEVELOPMENT / DEBUG
+        default: DEVELOPMENT
+      machine_config:
+        description: xnu MACHINE_CONFIG
+        default: SWEET
+      deep:
+        description: also attempt the mig/migcom host tools and the ld64 link
+        default: "true"
+
+concurrency:
+  group: xnu-linux-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DXB_REPO: https://github.com/blacktop/darwin-xnu-build
+  DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
+  # ld64 956.6 knows every flag xnu-8796 passes to the linker:
+  # -image_base, -seg_page_size, -segment_order, -version_load_command,
+  # -function_starts, -add_split_seg_info, -new_linker.
+  CCTOOLS_REPO: https://github.com/tpoechtrager/cctools-port
+  CCTOOLS_BRANCH: 1030.6.3-ld64-956.6
+  MACOS_VERSION: "13.5"
+  KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
+  MACHINE_CONFIG: ${{ inputs.machine_config || 'SWEET' }}
+
+jobs:
+  linux-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Report host and toolchain
+        run: |
+          uname -a
+          cat /etc/os-release | head -3
+          nproc; free -g | head -2
+          clang --version || true
+
+      # ---------------------------------------------------------------- deps
+      - name: Install clang-15 and build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential llvm-15 clang-15 lld-15 \
+            libssl-dev libbz2-dev liblzma-dev zlib1g-dev libncurses-dev \
+            uuid-dev libcap-dev bison flex libblocksruntime-dev \
+            libedit-dev libelf-dev python3 jq cmake ninja-build ccache
+          sudo update-alternatives --install /usr/bin/clang    clang    /usr/bin/clang-15    100
+          sudo update-alternatives --install /usr/bin/clang++  clang++  /usr/bin/clang++-15  100
+          sudo update-alternatives --install /usr/bin/ld.lld   ld.lld   /usr/bin/ld.lld-15   100
+          clang --version
+          llvm-ar-15 --version | head -1
+
+      # -------------------------------------------------- stage 1: cctools
+      # Supplies lipo, nm, strip, otool, ar, ranlib AND ld64, which is what
+      # the kernel link needs (Mach-O, not ELF).
+      - name: "Stage 1: build cctools-port (ld64 + Mach-O binutils)"
+        id: cctools
+        continue-on-error: true
+        run: |
+          set -x
+          git clone -q --depth 1 -b "$CCTOOLS_BRANCH" "$CCTOOLS_REPO" cctools-port
+          cd cctools-port/cctools
+          # The "darwin" target writes a single ld64 that Linux cannot execute.
+          ./configure --prefix="$RUNNER_TEMP/cross" --target=x86_64-linux-gnu \
+                      --enable-static --disable-shared 2>&1 | tail -40
+          make -j"$(nproc)" 2>&1 | tail -60
+          make install 2>&1 | tail -20
+          ls -la "$RUNNER_TEMP/cross/bin" || true
+          echo "$RUNNER_TEMP/cross/bin" >> "$GITHUB_PATH"
+
+      # ------------------------------------------------- stage 2: dxb tree
+      - name: "Stage 2: fetch darwin-xnu-build and apply the ginkgo series"
+        id: dxb
+        continue-on-error: true
+        run: |
+          set -x
+          PLATFORM="${{ inputs.platform || 'ginkgo' }}"
+          git init -q dxb
+          git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
+          git -C dxb checkout -q FETCH_HEAD
+          if [ "$PLATFORM" = "ginkgo" ]; then
+            for p in xnu/patches/*.patch; do
+              case "$(basename "$p")" in
+                *-topaz-*) echo "skip $(basename "$p")"; continue ;;
+              esac
+              cp "$p" dxb/patches/
+            done
+          else
+            cp xnu/patches/*.patch dxb/patches/
+          fi
+          cp xnu/patches/*.sh dxb/patches/ 2>/dev/null || true
+          ls dxb/patches
+          # dxb/build.sh is written for macOS: it shells out to brew, xcrun,
+          # xcodebuild, hdiutil, sw_vers, codesign and `sed -i ''`. Rather than
+          # fight it, drive xnu's own makefile -- which is what it does anyway.
+          git -C dxb/xnu --version >/dev/null 2>&1 || true
+          ls dxb
+
+      # --------------------------------------------- stage 3: clone xnu src
+      - name: "Stage 3: clone xnu-8796.121.2 and apply our patches"
+        id: xnusrc
+        continue-on-error: true
+        run: |
+          set -x
+          cd dxb
+          RELEASE_URL='https://raw.githubusercontent.com/apple-oss-distributions/distribution-macOS/macos-135/release.json'
+          XNU_VERSION=$(curl -s "$RELEASE_URL" | jq -r '.projects[] | select(.project=="xnu") | .tag')
+          echo "xnu tag: $XNU_VERSION"
+          git clone -q --depth 1 --branch "$XNU_VERSION" \
+            https://github.com/apple-oss-distributions/xnu.git xnu
+          cd xnu
+          git describe --tags || true
+          shopt -s nullglob
+          bash_patches=$(ls ../patches/*.sh 2>/dev/null || true)
+          for s in $bash_patches; do
+            echo "== script $(basename "$s")"
+            bash "$s" || echo "SCRIPT FAILED: $s"
+          done
+          for p in ../patches/*.patch; do
+            if out=$(git apply --check "$p" 2>&1); then
+              echo "applied   $(basename "$p")"
+              git apply "$p"
+            else
+              echo "SKIPPED   $(basename "$p"): $out"
+            fi
+          done
+
+      # ----------------------------------- stage 4: do the flags analyse?
+      - name: "Stage 4: SWEET config sanity (no KDK, no nos_arm sources)"
+        id: config
+        continue-on-error: true
+        run: |
+          set -x
+          cd dxb/xnu
+          echo '--- MakeInc.def: does SWEET force-load a KDK archive?'
+          grep -n 'force_load' makedefs/MakeInc.def || true
+          echo '--- arm64 sources gated behind nos_arm_pmap / nos_arm_asm'
+          grep -n 'nos_arm' osfmk/conf/files.arm64 | head -20
+          echo '--- files.arm64 lines mentioning our sweet driver sources'
+          grep -rn 'sweet' osfmk/conf/ bsd/conf/ pexpert/conf/ 2>/dev/null | head -20 || true
+          echo '--- does xnu invoke $(MIG) with kernel -D flags?'
+          grep -n 'MIGKUFLAGS\|MIGKSFLAGS' osfmk/mach/Makefile
+          echo '--- does anything still look for xcrun/iig/ld_classic?'
+          grep -rn 'iig\|xcrun -find\|ld_classic' makedefs/ | head -20 || true
+
+      # ---------------------------------- stage 5: build the MIG host tools
+      # The makefile runs `$(MIG) ... -DMACH_KERNEL_PRIVATE -DKERNEL_SERVER=1`
+      # and also emits some headers via `-server /dev/null -user /dev/null
+      # -header $@` -- both need migcom to rewrite cpp evaluated expressions,
+      # so a static "strip -DMACH_KERNEL_PRIVATE from the generated files"
+      # hack is not equivalent. Build the real tool instead.
+      - name: "Stage 5: build mig + migcom from bootstrap_cmds on Linux"
+        id: mig
+        if: inputs.deep != 'false'
+        continue-on-error: true
+        run: |
+          set -x
+          git clone -q --depth 1 \
+            https://github.com/apple-oss-distributions/bootstrap_cmds.git bootstrap_cmds
+          cd bootstrap_cmds/migcom.tproj
+          mkdir -p out
+          # migcom is the only part that parses .defs; mig is a shell script.
+          bison -d -o out/parser.c parser.y
+          flex -o out/lexxer.c lexxer.l
+          # <mach/*.h> for the host tool: taken from the xnu sources we just
+          # cloned (osfmk/mach), which is where Apple's own tools get them.
+          INC="-Iout -I../migcom.tproj -I../../dxb/xnu/osfmk -I../../dxb/xnu/EXTERNAL_HEADERS"
+          clang -c $(for f in error.c global.c handler.c header.c mig.c routine.c \
+                        server.c statement.c string.c type.c user.c utils.c; do echo $f; done) \
+                -o /dev/null 2>&1 | head -5 || true
+          for f in error.c global.c handler.c header.c mig.c routine.c \
+                   server.c statement.c string.c type.c user.c utils.c \
+                   out/parser.c out/lexxer.c; do
+            echo "== $f"
+            clang -std=gnu89 -w -Dlinux -D__STDC__=0 -o "out/$(basename ${f%.c}).o" -c "$f" $INC \
+              || { echo "COMPILE FAILED: $f"; exit 1; }
+          done
+          clang -o out/migcom out/*.o -lm
+          ./out/migcom -version || true
+          mkdir -p "$RUNNER_TEMP/cross/bin"
+          cp out/migcom "$RUNNER_TEMP/cross/bin/migcom"
+          # mig.sh is the driver xnu calls; it needs migcom on PATH.
+          sed 's|^M=.*|M=$(dirname "$0")/migcom|' mig.sh > "$RUNNER_TEMP/cross/bin/mig" 2>/dev/null || \
+            cp mig.sh "$RUNNER_TEMP/cross/bin/mig"
+          chmod +x "$RUNNER_TEMP/cross/bin/mig"
+          echo "$RUNNER_TEMP/cross/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/cross/bin/mig" -version || true
+
+      # ------------------------------------------- stage 6: the real thing
+      - name: "Stage 6: make installhdrs + install (this is the build)"
+        id: build
+        if: inputs.deep != 'false'
+        continue-on-error: true
+        run: |
+          set -x
+          export PATH="$RUNNER_TEMP/cross/bin:$PATH"
+          XROOT="$GITHUB_WORKSPACE/dxb/xnu"
+          FAKEROOT="$GITHUB_WORKSPACE/dxb/fakeroot"
+          OBJROOT="$GITHUB_WORKSPACE/dxb/build/xnu.obj"
+          mkdir -p "$FAKEROOT" "$OBJROOT"
+          cd "$XROOT"
+          # Every host tool the macOS build gets from xcrun is redirected here.
+          make installhdrs -k \
+            SDKROOT=/ HOST_SDKROOT=/ \
+            TARGET_CONFIGS="$KERNEL_CONFIG ARM64 $MACHINE_CONFIG" \
+            ARCH_CONFIGS="ARM64" \
+            BUILD_WERROR=0 BUILD_LTO=0 VERBOSE=YES \
+            DSTROOT="$FAKEROOT" FAKEROOT_DIR="$FAKEROOT" \
+            OBJROOT="$OBJROOT" SYMROOT="$GITHUB_WORKSPACE/dxb/build/xnu.sym" \
+            CC=clang CXX=clang++ HOST_CC=clang \
+            MIG="$RUNNER_TEMP/cross/bin/mig" MIGCOM="$RUNNER_TEMP/cross/bin/migcom" \
+            LIPO=lipo STRIP=strip AR=ar RANLIB=ranlib NM=nm OTOOL=otool LIBTOOL=libtool \
+            DSYMUTIL=true NMEDIT=true UNIFDEF=unifdef GIT=git \
+            HOST_CODESIGN=true HOST_CODESIGN_ALLOCATE=true \
+            MEMORY_SIZE=17179869184 SYSCTL_HW_PHYSICALCPU=4 SYSCTL_HW_LOGICALCPU=4 \
+            KERNEL_BUILDS_IN_PARALLEL=1 RC_DARWIN_KERNEL_VERSION=22.6.0 \
+            TIGHTBEAMC=tightbeamc-not-supported \
+            2>&1 | tee "$GITHUB_WORKSPACE/hdrs.log" | tail -150 || true
+          echo "=== first compile failures (headers stage) ==="
+          grep -nE 'error:|Error [0-9]|No such file|not found' "$GITHUB_WORKSPACE/hdrs.log" | head -40 || true
+
+          make install -k \
+            SDKROOT=/ HOST_SDKROOT=/ \
+            TARGET_CONFIGS="$KERNEL_CONFIG ARM64 $MACHINE_CONFIG" \
+            ARCH_CONFIGS="ARM64" \
+            BUILD_WERROR=0 BUILD_LTO=0 VERBOSE=YES \
+            DSTROOT="$FAKEROOT" FAKEROOT_DIR="$FAKEROOT" \
+            OBJROOT="$OBJROOT" SYMROOT="$GITHUB_WORKSPACE/dxb/build/xnu.sym" \
+            CC=clang CXX=clang++ HOST_CC=clang \
+            MIG="$RUNNER_TEMP/cross/bin/mig" MIGCOM="$RUNNER_TEMP/cross/bin/migcom" \
+            LIPO=lipo STRIP=strip AR=ar RANLIB=ranlib NM=nm OTOOL=otool LIBTOOL=libtool \
+            DSYMUTIL=true NMEDIT=true UNIFDEF=unifdef GIT=git \
+            HOST_CODESIGN=true HOST_CODESIGN_ALLOCATE=true \
+            MEMORY_SIZE=17179869184 SYSCTL_HW_PHYSICALCPU=4 SYSCTL_HW_LOGICALCPU=4 \
+            KERNEL_BUILDS_IN_PARALLEL=1 RC_DARWIN_KERNEL_VERSION=22.6.0 \
+            TIGHTBEAMC=tightbeamc-not-supported \
+            MAKEFLAGS=-k \
+            2>&1 | tee "$GITHUB_WORKSPACE/build.log" | tail -200 || true
+
+      - name: Summarise the first genuine failure
+        if: always()
+        run: |
+          for f in hdrs.log build.log; do
+            [ -f "$f" ] || continue
+            echo "############ $f ############"
+            echo "--- first 40 error: lines ---"
+            grep -nE 'error:' "$f" | head -40 || echo "(no 'error:' lines)"
+            echo "--- first 20 'Error N' targets ---"
+            grep -nE '^\*\*\* |Error [0-9]+' "$f" | head -20 || true
+          done
+          echo "############ artifacts ############"
+          find fakeroot -name 'kernel.*' -exec ls -la {} \; 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: xnu-linux-logs
+          path: |
+            hdrs.log
+            build.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Collect kernel if one was produced
+        if: always()
+        run: |
+          mkdir -p out
+          cp -R dxb/fakeroot/System/Library/Kernels/. out/ 2>/dev/null || true
+          ls -la out
+          (cd out && sha256sum kernel.* > SHA256SUMS) || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: xnu-kernel-linux
+          path: out/
+          if-no-files-found: warn
