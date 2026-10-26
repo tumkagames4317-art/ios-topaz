@@ -2437,9 +2437,25 @@ jobs:
                 if [ "$(grep -c 'TOLERATED duplicate' "$MIGTOP/parser.c")" -lt 1 ]; then
                   echo "  ::warning::patch did not land in parser.c; keeping the Debian binary"
                 else
-                  if ( cd "$MIGTOP" && \
-                       { [ -x ./configure ] || ./configure >/dev/null 2>&1; } && \
-                       make -j"$(nproc)" migcom >/dev/null 2>&1 ); then
+                  # NEVER silence the build: a failed rebuild whose error is
+                  # discarded costs a whole run to diagnose. Keep the tail,
+                  # which is where the actual compiler error lives.
+                  #
+                  # Everything runs inside ONE subshell whose cwd is $MIGTOP.
+                  # configure is not necessarily +x in the tarball, so invoke
+                  # it as `sh ./configure`. The exit status is threaded out
+                  # explicitly because a `| tail` pipeline would otherwise
+                  # report tail's status, not make's.
+                  set +e
+                  ( cd "$MIGTOP" || exit 1
+                    [ -f Makefile ] || { echo "  running configure"; sh ./configure 2>&1 | tail -25; }
+                    make -j"$(nproc)" migcom 2>&1 | tail -45
+                    exit "${PIPESTATUS[0]}"
+                  )
+                  MIGMAKE_RC=$?
+                  set -e
+                  echo "  make migcom rc=$MIGMAKE_RC"
+                  if [ "$MIGMAKE_RC" -eq 0 ]; then
                     NEWMIG="$(find "$MIGTOP" -maxdepth 2 -type f -name migcom -perm -u+x | head -1)"
                     if [ -n "$NEWMIG" ]; then
                       cp "$NEWMIG" "$MIGPKG/usr/lib/mig/x86_64-gnu-migcom-patched"
