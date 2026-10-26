@@ -117,21 +117,27 @@ diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
  
  	// From here on out, we're off the bootstrap translation tables.
  
-@@ -2259,7 +2293,17 @@
+@@ -2259,7 +2293,23 @@
      }
  #endif
  #endif
 +	sweet_early_mark(28, "calling pmap_bootstrap");
- 	pmap_bootstrap(dynamic_memory_begin);
-+#if defined(SWEET)
 +	/*
-+	 * Stop drawing now. From here the kernel reworks the very tables the alias
-+	 * lives in, and an early_putc that faults takes the interrupt stack with it
-+	 * ("Invalid kernel stack pointer"). Progress past this point is read from
-+	 * whether the machine survives, not from the screen.
++	 * Stop drawing BEFORE pmap_bootstrap, not after. pmap_bootstrap reworks
++	 * the very tables the alias lives in, and the console writes fault part
++	 * way through it; the resulting panic then tries to draw through the same
++	 * broken alias and the fault is reported as "Invalid kernel stack
++	 * pointer" instead of the real message. Turning the console off first
++	 * costs only the markers after this point -- which are unreadable anyway
++	 * once the tables move -- and lets the kernel get through.
++	 *
++	 * sweet_early_panic deliberately ignores early_disabled, but it also
++	 * cannot paint into a dead alias, so a panic inside pmap_bootstrap is
++	 * simply invisible. Progress past this point is read from whether marker
++	 * 15 ("arm_vm_init returned") ever appears.
 +	 */
 +	sweet_early_disable();
-+#endif
+ 	pmap_bootstrap(dynamic_memory_begin);
  
  	disable_preemption();
  
