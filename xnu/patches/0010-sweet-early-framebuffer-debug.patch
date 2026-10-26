@@ -145,7 +145,7 @@ new file mode 100644
 index 0000000..8f4c808
 --- /dev/null
 +++ b/osfmk/arm64/sweet_early.c
-@@ -0,0 +1,137 @@
+@@ -0,0 +1,150 @@
 +/*
 + * Redmi Note 10 Pro bootstrap console. No allocation, locks, ADT parsing or
 + * per-CPU state: panic() can reach this before a current thread exists.
@@ -266,7 +266,20 @@ index 0000000..8f4c808
 +		return;
 +	}
 +	early_panicking = 1;
-+	sweet_early_string("\nSWEET EARLY PANIC: ");
++	/*
++	 * Paint a solid red block first. It needs no formatter, no stack beyond
++	 * this frame and no valid VA for anything but the frame buffer, so it
++	 * survives a panic caused by the VM layer itself. If the red block does
++	 * not appear, the panic happened before the frame buffer was reachable
++	 * at all and the message text is irrelevant.
++	 */
++	for (unsigned int y = 340; y < 420; y++) {
++		for (unsigned int x = 40; x < 1040; x++) {
++			EARLY_FB[y * EARLY_STRIDE + x] = 0xffff0000u;
++		}
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	sweet_early_string("PANIC ");
 +	va_list copy;
 +	va_copy(copy, *args);
 +	_doprnt(fmt, &copy, sweet_early_putc, 16);
