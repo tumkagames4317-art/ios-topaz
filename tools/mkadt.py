@@ -237,6 +237,13 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
     # (iPhone10,3). 'xiaomi,sweet' and qcom,kryo470 stay because the
     # SweetPlatformExpert and CPU IONameMatch still use them.
     return node('device-tree', [
+        # Fields the real d22ap.adt carries at the root. SecureDT* and the
+        # platform expert read several of these; an ADT that lacks them is not
+        # rejected outright, but downstream lookups behave differently.
+        ('device_type', cstr('bootrom')),
+        ('secure-root-prefix', cstr('md')),
+        ('platform-name', cstr('t8020')),
+        ('time-stamp', cstr('Sun Jan 4 19:01:48 PST 2026')),
         ph(),
         ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,ginkgo') + cstr('xiaomi,topaz') + cstr('xiaomi,sweet') + cstr('qcom,khaje') + cstr('qcom,trinket') + cstr('AppleARM')),
         ('model', cstr('iPhone10,3')),

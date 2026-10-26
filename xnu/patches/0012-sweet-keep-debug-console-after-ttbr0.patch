@@ -72,12 +72,19 @@ diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
  void
  arm_vm_init(uint64_t memory_size, boot_args * args)
  {
-@@ -2153,20 +2179,28 @@
+@@ -2153,20 +2179,35 @@
  
  	arm_set_user_tbi();
  
-+#if defined(SWEET)
-+	/* phystokv() must still refer to the bootstrap aperture here. */
++#if defined(SWEET) && 0
++	/*
++	 * Disabled for diagnosis. sweet_early_map_final() calls phystokv()
++	 * before arm_vm_physmap_init() has built the VA=PA aperture, so the
++	 * table pointer it derives is not trustworthy at this point and the
++	 * write it performs lands somewhere unknown. Everything below still
++	 * runs, the console just loses its alias -- which is what happened on
++	 * every build before this patch existed.
++	 */
 +	sweet_early_map_final();
 +#endif
  	arm_vm_physmap_init(args);
