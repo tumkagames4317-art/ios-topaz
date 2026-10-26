@@ -1792,7 +1792,7 @@ jobs:
                #    equivalent of write.c's call is (user=FALSE, is_def=FALSE).
                #    Give it the two extra parameters rather than deleting it.
                ('static void\nWriteIncludes(FILE *file)\n',
-                'static void\nWriteIncludes(FILE *file, boolean_t isuser, boolean_t is_def)\n'),
+                'void\nWriteIncludes(FILE *file, boolean_t isuser, boolean_t is_def)\n'),
                ('  WriteIncludes(file);\n',
                 '  WriteIncludes(file, FALSE, FALSE); /* server header prolog */\n'),
                # 5. IsKernel is read at handler.c:75 and defined nowhere.
@@ -1882,18 +1882,26 @@ jobs:
           # Stage 6 die 17-times with no explanation.
           IIGSRC="$RUNNER_TEMP/iig-tools"
           rm -rf "$IIGSRC"
+          # Do NOT discard the build output. Run 40386619650 failed here and
+          # the reason was invisible because both cmake calls were
+          # `>/dev/null 2>&1`; the log showed only the ::error:: line. Keep
+          # the full output in the artifact-uploaded log instead.
           if git clone -q --depth 1 https://github.com/PureDarwin/iig-tools.git "$IIGSRC"; then
-            if cmake -S "$IIGSRC" -B "$IIGSRC/build" \
-                 -DCMAKE_BUILD_TYPE=Release >/dev/null 2>&1 \
-               && cmake --build "$IIGSRC/build" -j"$(nproc)" >/dev/null 2>&1 \
-               && [ -x "$IIGSRC/build/iig" ]; then
-              cp "$IIGSRC/build/iig" "$RUNNER_TEMP/cross/bin/iig"
-              chmod +x "$RUNNER_TEMP/cross/bin/iig"
-              echo "iig: built from PureDarwin/iig-tools"
-            else
-              echo "::error::iig-tools failed to build; DriverKit headers cannot be generated"
+            echo "=== iig-tools configure ==="
+            cmake -S "$IIGSRC" -B "$IIGSRC/build" -DCMAKE_BUILD_TYPE=Release 2>&1 | tail -20
+            cfg_rc=${PIPESTATUS[0]}
+            echo "configure rc=$cfg_rc"
+            echo "=== iig-tools build ==="
+            cmake --build "$IIGSRC/build" -j"$(nproc)" 2>&1 | tail -40
+            bld_rc=${PIPESTATUS[0]}
+            echo "build rc=$bld_rc"
+            if [ "$cfg_rc" -ne 0 ] || [ "$bld_rc" -ne 0 ] || [ ! -x "$IIGSRC/build/iig" ]; then
+              echo "::error::iig-tools failed to build (configure=$cfg_rc build=$bld_rc binary=$([ -x "$IIGSRC/build/iig" ] && echo yes || echo no))"
               exit 1
             fi
+            cp "$IIGSRC/build/iig" "$RUNNER_TEMP/cross/bin/iig"
+            chmod +x "$RUNNER_TEMP/cross/bin/iig"
+            echo "iig: built from PureDarwin/iig-tools"
           else
             echo "::error::could not clone PureDarwin/iig-tools (iig is Apple-closed-source)"
             exit 1
