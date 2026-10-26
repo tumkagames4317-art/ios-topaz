@@ -55,8 +55,13 @@ on:
         default: "true"
 
 concurrency:
-  group: xnu-linux-${{ github.ref }}
-  cancel-in-progress: true
+  # Strictly per-run. Several people dispatch this workflow on the same
+  # branch, and a ref-keyed group with cancel-in-progress meant every new
+  # dispatch silently killed the run already in flight: 40370234240 was
+  # cancelled 59s in because two more runs landed on the same SHA. Runs
+  # are expensive here, so they are allowed to overlap instead.
+  group: xnu-linux-${{ github.run_id }}
+  cancel-in-progress: false
 
 env:
   DXB_REPO: https://github.com/blacktop/darwin-xnu-build
