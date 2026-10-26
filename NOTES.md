@@ -1,3 +1,132 @@
+## 02:15 MSK 2026-10-27 -- Stage 6 compiles XNU for real; 15,798 errors -> 215 sites
+
+### Working method -- READ THIS BEFORE THE TECHNICAL FINDINGS
+
+**Tonight every unread change cost a run, and every right answer came from
+reading an artifact rather than reasoning about it.**
+
+Every wrong turn was a proxy standing in for the thing itself: a thrown-away
+`make -f /dev/stdin` probe for `$(origin AS)` that could not fail, a line-count
+census, `head -3`, "the guard is typo'd", an assumed error share of 33%.
+Every right turn was a byte count or an execution: 234 declarations counted,
+a replay control going exit 1 -> 0, `-x` on the resolved exec path, distinct
+`file:line` sites with the source line read back, and a state file that records
+which branch fired.
+
+Two rules fall out of that, and they are worth more than anything below,
+because the technical findings will be obsolete when the build finishes:
+
+1. **Extract the artifact the runner actually installs and execute it.**
+   Reading the YAML caught none of the wrapper defects. Executing the installed
+   `cc-shim` caught all six.
+2. **A probe that cannot give a verdict is worse than no probe**, because it
+   manufactures rows that read like data. State, in advance, what each possible
+   outcome will mean -- or do not run it.
+
+### Where the build actually is
+
+    run 40416685987 (b2f02ef):  success
+    build.log                   249,479,758 B / 2,771,163 lines
+    distinct error sites        215   (was 15,798 lines / 501 messages)
+    mig syntax errors           0
+    wrapper faults (127 / no input files / wrong target)   0
+    ARM .s objects              23
+    CC / AS / C++ targets       583 / 23 / 79
+
+**Stage 6 compiles real XNU C and C++.** `installhdrs=0` for several runs now.
+`install=2` remains. `KERNEL ARTIFACT: ABSENT` -- no linked kernel yet.
+
+### What closed, and what it cost
+
+The Debian **migcom** rebuild was abandoned as unnecessary; the GNU mig shim was
+sufficient. Six defects, all in our wrapper layer, none in XNU, each of which
+presented as "the compiler is broken":
+
+| defect | symptom | cause |
+|---|---|---|
+| `CC=` origin | wrapper never used | `CC` passed on the make command line |
+| empty wrapper path | `exec --target=...` | chained `sed -i` failed cross-device, left `${CXX_BIN}` |
+| lost argv | `clang: error: no input files` x724 | heredoc written unquoted, so `$#`/`$1` expanded while *writing* the file |
+| wrong exec path | `Error 127` x100+ | `$(basename "$0")` on `/usr/local/bin/xtool-clang` is `xtool-clang`, not `clang` |
+| kalloc builtins | `use of unknown builtin` x3042 | `xnu-kalloc-compat.h` was correct but force-included via `${GITHUB_WORKSPACE:-$PWD}`, which is the **build dir** inside a make sub-shell |
+| `const_` typedefs | `unknown type name 'const_*'` x240 | GNU mig emits `const_<T>` and defines it only in its own private headers |
+
+The last one was found only because the edit asserted `count == 1` and got 2 --
+there were **two** `cc-shim` definitions (yaml:2506, :3595) writing the same
+path. **Keep that assertion style.**
+
+### Two deliberate, knowingly-degraded compromises
+
+Both are in `shim/`, both are force-included, both are stated here so nobody
+ships this further without deciding again. **A booted kernel with these in place
+is a bringup kernel, not a shippable one.**
+
+1. **`shim/xnu-kalloc-compat.h` -- kalloc type-signature system disabled.**
+   Apple clang has `__builtin_xnu_type_{summary,signature,types_compatible,
+   discriminator}`; upstream LLVM has none (`__has_builtin` count in kalloc.h is
+   **0** -- they are used unguarded). The header substitutes them, so every
+   `kt_signature` becomes `""` and `KALLOC_TYPE_IS_DATA_ONLY` is permanently
+   false. **The data-only array rejection at `kalloc.h:1462` therefore stops
+   rejecting.** This is **uniform** degradation, not partial corruption: every
+   signature is empty, so the kernel does not check signatures *wrongly*, it does
+   not check them at all. **Anyone rebuilding this should use a toolchain that
+   has the builtins and delete the header.**
+
+2. **`shim/migcom-shim.sh` drops `, const` from .defs parameters.**
+   GNU mig's `IPCFlags` (`parser.y:518-533`) accepts only `islong isnotlong
+   dealloc notdealloc servercopy countinout retcode`, so Apple's `, const` is a
+   syntax error. **Dropping it discards the author's `const` intent.** It is NOT
+   the cause of the `const_<T>` errors -- `utils.c:157-174` shows GNU mig emits
+   that prefix unconditionally for any indefinite/string input, `const` or not.
+   Revisit on its own merits; do not "fix" it as if it caused those.
+
+### Two hypotheses checked and EXCLUDED -- do not re-litigate
+
+1. **`KERNEL_USER=1` generates the wrong routine variant.** **False.** Both
+   variants are generated. `thread_act_server.h` (the `KERNEL_SERVER=1` header)
+   exists and `ipc_tt.c:4659` defines `thread_get_exception_ports_from_user` to
+   match it argument-for-argument. **Do not flip `KERNEL_USER`->`KERNEL_SERVER`:**
+   that changes which symbol the kernel links against, and the ABI would be
+   wrong. The conflict is a **header-convention clash** between the user-variant
+   header installed under `EXPORT_HDRS/` and the kernel-side prototype.
+2. **`__builtin_xnu_*` are unguarded and therefore a capability wall.** They are
+   unguarded, but they are **not** a wall: they only feed a security feature, and
+   the substitution is uniform. `.` see compromise 1.
+
+### Open, in priority order
+
+1. **215 error sites; top cluster `conflicting types` for the exception-port
+   routines** (`task_get_exception_ports`, `thread_get_exception_ports`, and
+   their `_from_user` forms -- 9 distinct symbols). The next run archives
+   `genhdr-snapshot/` with the generated `thread_act.h`, `task.h`,
+   `thread_act_server.h` and `task_server.h` so this is answered from bytes.
+2. **`const_` typedefs**: `shim/xnu-const-string-compat.h` added, derived from
+   the base types read out of the captured migcom streams -- **not** from the
+   name pattern. `const_gssd_byte_buffer` is `const uint8_t *` (base
+   `array [] of uint8_t`), not a string; assuming `const char *` for all 13
+   would have compiled and been wrong. **After the run, `unknown type name
+   'const_` must be 0; if a 14th name appears, the log names it.**
+3. **`mach_kernelrpc.c:282`** -- `MACH_PORT_INFO_OUT` expands to a non-expression.
+   Two sites. Find what it expands to, not why it is two.
+4. **`unknown type name 'const_...'`** residual, `'X' file not found` (75,
+   `mig_support.h` / `TargetConditionals.h` needs supplying).
+
+### Next concrete action
+
+Run `b2f02ef`+1 (the two additive shims) and read, in this order:
+`/tmp/.kcompat_state`, `/tmp/.ccompat_state`, `genhdr-snapshot/`, then the
+count of `unknown type name 'const_` (must be 0). **Do not chase
+`mach_kernelrpc.c` until the top two are closed.**
+
+### Runs and commits
+
+    b2f02ef  diag(stage6): make the kalloc builtin substitution say whether it fired
+    de3d8ad  fix(cc): literal BIN per wrapper + existence guard; drop physicalcopy
+    85c1801  diag(stage6): count shim invocations instead of asking a probe that cannot fail
+    5370a1d  quote the xtool heredoc  (lead)
+    40416685987 (b2f02ef) success  215 sites
+    40415111711 (de3d8ad) success  15,798 errors / 501 messages  <- cluster collapsed
+
 ## 01:05 MSK 2026-10-27 -- Stage 6: mig subsystem parses; six builtin collisions reduced to one fatal diagnostic
 
 Written while run `40408775964` was in flight, so its result is NOT in here.

@@ -2549,12 +2549,21 @@ jobs:
             #    sub-shell's $PWD is the build dir, never the repo root);
             #  * record which branch was taken, once, so the artifact says
             #    so instead of leaving it to be inferred from an absence.
-            echo 'XNU_KALLOC_COMPAT_H="${GITHUB_WORKSPACE}/shim/xnu-kalloc-compat.h"'
-            echo 'if [ -f "$XNU_KALLOC_COMPAT_H" ]; then'
-            echo '  args=(-include "$XNU_KALLOC_COMPAT_H" "${args[@]}")'
-            echo '  _cs=/tmp/.kcompat_state; [ -f "$_cs" ] || echo "INCLUDED $XNU_KALLOC_COMPAT_H" > "$_cs"'
+            echo 'if [ -f "${GITHUB_WORKSPACE}/shim/xnu-kalloc-compat.h" ]; then'
+            echo '  args=(-include "${GITHUB_WORKSPACE}/shim/xnu-kalloc-compat.h" "${args[@]}")'
+            echo '  _cs=/tmp/.kcompat_state; [ -f "$_cs" ] || echo "INCLUDED xnu-kalloc-compat.h" > "$_cs"'
             echo 'else'
-            echo '  _cs=/tmp/.kcompat_state; [ -f "$_cs" ] || echo "MISSING $XNU_KALLOC_COMPAT_H -- substitution DISABLED" > "$_cs"'
+            echo '  _cs=/tmp/.kcompat_state; [ -f "$_cs" ] || echo "MISSING xnu-kalloc-compat.h -- builtin substitution DISABLED" > "$_cs"'
+            echo 'fi'
+            # Second, independent substitution: the const_<T> typedefs that
+            # GNU mig emits and never defines (utils.c:157-174). Separate
+            # header, separate state file, so one can fail while the other
+            # works and the log says which.
+            echo 'if [ -f "${GITHUB_WORKSPACE}/shim/xnu-const-string-compat.h" ]; then'
+            echo '  args=(-include "${GITHUB_WORKSPACE}/shim/xnu-const-string-compat.h" "${args[@]}")'
+            echo '  _cs=/tmp/.ccompat_state; [ -f "$_cs" ] || echo "INCLUDED xnu-const-string-compat.h" > "$_cs"'
+            echo 'else'
+            echo '  _cs=/tmp/.ccompat_state; [ -f "$_cs" ] || echo "MISSING xnu-const-string-compat.h -- const_ typedefs ABSENT" > "$_cs"'
             echo 'fi'
             echo 'if [ -x /usr/local/bin/xtool-clang ]; then'
             echo '  exec /usr/local/bin/xtool-clang "${args[@]}"'
@@ -3647,12 +3656,21 @@ jobs:
             #    sub-shell's $PWD is the build dir, never the repo root);
             #  * record which branch was taken, once, so the artifact says
             #    so instead of leaving it to be inferred from an absence.
-            echo 'XNU_KALLOC_COMPAT_H="${GITHUB_WORKSPACE}/shim/xnu-kalloc-compat.h"'
-            echo 'if [ -f "$XNU_KALLOC_COMPAT_H" ]; then'
-            echo '  args=(-include "$XNU_KALLOC_COMPAT_H" "${args[@]}")'
-            echo '  _cs=/tmp/.kcompat_state; [ -f "$_cs" ] || echo "INCLUDED $XNU_KALLOC_COMPAT_H" > "$_cs"'
+            echo 'if [ -f "${GITHUB_WORKSPACE}/shim/xnu-kalloc-compat.h" ]; then'
+            echo '  args=(-include "${GITHUB_WORKSPACE}/shim/xnu-kalloc-compat.h" "${args[@]}")'
+            echo '  _cs=/tmp/.kcompat_state; [ -f "$_cs" ] || echo "INCLUDED xnu-kalloc-compat.h" > "$_cs"'
             echo 'else'
-            echo '  _cs=/tmp/.kcompat_state; [ -f "$_cs" ] || echo "MISSING $XNU_KALLOC_COMPAT_H -- substitution DISABLED" > "$_cs"'
+            echo '  _cs=/tmp/.kcompat_state; [ -f "$_cs" ] || echo "MISSING xnu-kalloc-compat.h -- builtin substitution DISABLED" > "$_cs"'
+            echo 'fi'
+            # Second, independent substitution: the const_<T> typedefs that
+            # GNU mig emits and never defines (utils.c:157-174). Separate
+            # header, separate state file, so one can fail while the other
+            # works and the log says which.
+            echo 'if [ -f "${GITHUB_WORKSPACE}/shim/xnu-const-string-compat.h" ]; then'
+            echo '  args=(-include "${GITHUB_WORKSPACE}/shim/xnu-const-string-compat.h" "${args[@]}")'
+            echo '  _cs=/tmp/.ccompat_state; [ -f "$_cs" ] || echo "INCLUDED xnu-const-string-compat.h" > "$_cs"'
+            echo 'else'
+            echo '  _cs=/tmp/.ccompat_state; [ -f "$_cs" ] || echo "MISSING xnu-const-string-compat.h -- const_ typedefs ABSENT" > "$_cs"'
             echo 'fi'
             echo 'if [ -x /usr/local/bin/xtool-clang ]; then'
             echo '  exec /usr/local/bin/xtool-clang "${args[@]}"'
@@ -3870,7 +3888,13 @@ jobs:
             echo '--- kalloc builtin substitution ---'
             sed 's/^/  /' /tmp/.kcompat_state
           else
-            echo '  ::warning::no kcompat state recorded -- cc-shim never ran a compile'
+            echo '  ::warning::no kalloc state recorded -- cc-shim never ran a compile'
+          fi
+          if [ -f /tmp/.ccompat_state ]; then
+            echo '--- const_ typedef substitution ---'
+            sed 's/^/  /' /tmp/.ccompat_state
+          else
+            echo '  ::warning::no const_ state recorded -- cc-shim never ran a compile'
           fi
           # And prove the header itself defines what it claims, using the real
           # preprocessor rather than reading it.
@@ -3878,7 +3902,16 @@ jobs:
             printf 'KALLOC_TYPE_IS_DATA_ONLY_probe __builtin_xnu_type_summary(int)\n' > /tmp/kp.c
             /usr/bin/clang -E -P -include "$GITHUB_WORKSPACE/shim/xnu-kalloc-compat.h" \
               /tmp/kp.c 2>/dev/null | tail -3 | sed 's/^/  preprocessed: /' || true
-          fi 
+          fi
+          # Fail loudly if a const_ name appears that the header does not cover:
+          # an incomplete compat header must surface as a named type, never as a
+          # silent count that stays where it was.
+          if [ -f "$GITHUB_WORKSPACE/shim/xnu-const-string-compat.h" ]; then
+            printf 'const_vfs_path_t a; const_io_name_t b; const_gssd_byte_buffer c;\n' > /tmp/cp.c
+            /usr/bin/clang -fsyntax-only -include "$GITHUB_WORKSPACE/shim/xnu-const-string-compat.h" \
+              /tmp/cp.c 2>&1 | tail -5 | sed 's/^/  const_ probe: /' || true
+            echo '  const_ probe done (no output above = all three types resolved)'
+          fi
           echo '--- first real error, in order ---' 
           # Widen beyond 'error:': the first real failures tonight were
           # "Error 127" (missing interpreter) and "No such file", neither of
@@ -4011,6 +4044,34 @@ jobs:
           echo "############ kernels produced ############"
           find dxb/fakeroot -name 'kernel.*' -exec ls -la {} \; 2>/dev/null || true
 
+      - name: Snapshot generated headers (conflicting-types evidence)
+        if: always()
+        run: |
+          # `conflicting types for thread_get_exception_ports` is reported
+          # against two generated headers that are NOT captured anywhere else:
+          #   EXPORT_HDRS/osfmk/mach/thread_act.h        (user variant)
+          #   mach/thread_act_server.h                   (KERNEL_SERVER=1)
+          # Both are produced correctly; they disagree with each other and with
+          # kern/thread.h:1728. Comparing them needs the bytes, so copy them
+          # rather than keep reasoning about prototypes from memory.
+          mkdir -p genhdr-snapshot
+          for f in \
+            dxb/build/xnu.obj/EXPORT_HDRS/osfmk/mach/thread_act.h \
+            dxb/build/xnu.obj/EXPORT_HDRS/osfmk/mach/task.h \
+            dxb/build/xnu.obj/EXPORT_HDRS/bsd/vfs/vfs_nspace.h \
+            dxb/build/xnu.obj/EXPORT_HDRS/osfmk/gssd/gssd_mach.h; do
+            if [ -f "$f" ]; then
+              mkdir -p "genhdr-snapshot/$(dirname "$f")"
+              cp "$f" "genhdr-snapshot/$f"
+            fi
+          done
+          find dxb -name 'thread_act_server.h' -o -name 'task_server.h' \
+            2>/dev/null | head -20 | while read -r h; do
+            mkdir -p "genhdr-snapshot/$(dirname "$h")"; cp "$h" "genhdr-snapshot/$h"
+          done
+          find genhdr-snapshot -type f | head -30
+          echo "snapshot files: $(find genhdr-snapshot -type f | wc -l)"
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -4019,6 +4080,7 @@ jobs:
             hdrs.log
             build.log
             migcom-streams/
+            genhdr-snapshot/
           if-no-files-found: warn
           retention-days: 7
 
