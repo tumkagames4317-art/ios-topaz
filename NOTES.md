@@ -1,3 +1,51 @@
+## 10:05 MSK 2026-10-26 -- the early console finally prints its own panic
+
+### What changed
+
+`patch 0010` no longer lets `early_disabled` silence `sweet_early_panic`, and the
+panic path paints a solid red block (y 340..419) *before* touching `_doprnt`.
+That block is the cheapest possible "did we get here" signal: no formatter, no
+extra stack, no VA beyond the frame buffer.
+
+Both appeared. So the hook runs, `early_fb` is valid, and the message is real.
+
+### How to read the screen at all
+
+`fbshow.py` alone is not enough once lines differ from the stage banners. The
+glyphs are 8x8 drawn at 2x on a 16px pitch. Build a glyph dictionary from a line
+whose text is already known, then decode the unknown line cell by cell:
+
+    known = 'SWEET EARLY 1: arm_init entered (MMU on)'   # at y=4
+    # map cell[i] -> known[i], then decode y=228 with that dict
+
+That turned a wall of `?` into readable text far faster than guessing widths.
+
+### The panic itself
+
+The screen now reads, roughly:
+
+    PANIC arm_vm_init <line> Assertion failed: err ...
+
+and the kernel's own trap format is
+
+    "%s:%d Assertion failed: %s (0x%llx %s 0x%llx)"
+
+with `%s` = the expression text. Here it is just `err`, i.e. an
+`assert(err == KERN_SUCCESS)`-shaped check on a `kern_return_t` inside upstream
+`arm_vm_init`. No patch in this tree introduces it, so it is stock XNU failing
+on the ginkgo layout rather than anything the SWEET patches wrote.
+
+### Traps that wasted time today
+
+* `assert()` text lives in the binary anyway; `k.find(b'va + ARM_TT_L2_SIZE')`
+  returning -1 is proof the expression is not in the build, so do not argue with
+  it -- reread the screen instead.
+* A hunk body edited without recounting `@@` makes `git apply` say
+  `corrupt patch at line N`; CI logs that as a **warning** and ships a kernel
+  missing the whole patch. Grep the log for `Skipping patch` every single time.
+* `_DebuggerTrapWithState` is reached from `_handle_debugger_trap`, not only
+  from `panic_trap_to_debugger`. A hook in the latter misses panics that arrive
+  through the exception vector.
 ## 08:45 MSK 2026-10-26 -- why stage 9 never appears, and two self-inflicted wounds
 
 ### The stage-9 panic is arithmetic, not a hardware quirk
