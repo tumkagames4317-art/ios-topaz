@@ -27,3 +27,24 @@
  		err = SecureDTGetProperty(memory_map, "TrustCache", (void const **)&trustCacheRange, &trustCacheRangeSize);
  		if (err == kSuccess) {
  			if (trustCacheRangeSize != sizeof(DTMemoryMapRange)) {
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -377,6 +377,17 @@ phystokv(pmap_paddr_t pa)
+ 		}
+ 	}
+ 	if (__improbable((pa < gPhysBase) || ((pa - gPhysBase) >= real_phys_size))) {
++#if defined(SWEET)
++		/*
++		 * ginkgo: the ptov table is the only thing that can translate a
++		 * physical address here, and it is empty when arm_vm_physmap_slide()
++		 * bailed out. Print how much of it exists so the caller is obvious.
++		 */
++		printf("phystokv: %u ptov entries, first pa 0x%llx len 0x%llx\n",
++		    (unsigned int)ptov_index,
++		    (unsigned long long)ptov_table[0].pa,
++		    (unsigned long long)ptov_table[0].len);
++#endif
+ 		panic("%s: illegal PA: 0x%llx; phys base 0x%llx, size 0x%llx", __func__,
+ 		    (unsigned long long)pa, (unsigned long long)gPhysBase, (unsigned long long)real_phys_size);
+ 	}
