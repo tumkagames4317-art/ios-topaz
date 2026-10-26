@@ -398,28 +398,107 @@ jobs:
             if [ -n "$found" ] && [ -s "$found" ]; then
               echo "  $obj: COMPILED ($found)"
             else
-              echo "  $obj: NOT COMPILED -- libdispatch may still not be real"
-              for e in InputFiles Resolver OutputFile libcodedirectory; do
-                grep -nE "^${e}\.(cpp|c):[0-9]+:[0-9]+: error:" /tmp/make.log | head -5 || true
-              done
+              echo "  $obj: NOT FOUND as an object -- see make.log above"
             fi
           done
+          # The proof that real libdispatch worked must live in the log, not
+          # in our memory of it: grep make.log for ANY error from the four
+          # files that used to fail, and print "(none)" when they are clean.
+          echo "=== error lines from the four formerly-failing dispatch TUs ==="
+          for obj in InputFiles Resolver OutputFile libcodedirectory; do
+            hits=$(grep -nE "${obj}\.(cpp|c):[0-9]+:[0-9]+: error:" /tmp/make.log 2>/dev/null | head -5)
+            if [ -n "$hits" ]; then
+              echo "  $obj: ERRORS"
+              echo "$hits" | sed 's/^/    /'
+            else
+              echo "  $obj: (none)"
+            fi
+          done
+          # ---- expose the tools under the names xnu's Makefiles call -------
+          #
+          # cctools was configured with --target=x86_64-linux-gnu, so automake
+          # installs every program prefixed. ld64/src/ld/Makefile.am:3 says
+          #
+          #     bin_PROGRAMS = ld
+          #
+          # so the Mach-O linker lands as x86_64-linux-gnu-ld. There is NO
+          # program called `ld64` in cctools-port at all -- ld64 is the
+          # source directory name. Earlier runs tested
+          #     test -x "$RUNNER_TEMP/cross/bin/ld64"
+          # which could never succeed, so `ld64: MISSING` was printed in every
+          # run this evening including ones where the build had actually
+          # succeeded (40374602950 ended with make install exit 0 and 31
+          # binaries present). The check was asking the wrong question.
+          #
+          # xnu's makedefs expect bare names (LIPO=lipo, NM=nm, ...) and the
+          # HOST_* variables in Stage 6 point at plain commands, so provide
+          # unprefixed symlinks alongside the prefixed originals.
+          PREFIX=x86_64-linux-gnu-
+          bin_dir="$RUNNER_TEMP/cross/bin"
+          linked=""
+          for t in ld nm ar ranlib lipo otool strip size strings \
+                   install_name_tool nmedit segedit codesign_allocate \
+                   ObjectDump vtool bitcode_strip; do
+            if [ -x "$bin_dir/$PREFIX$t" ]; then
+              ln -sf "$bin_dir/$PREFIX$t" "$bin_dir/$t"
+              linked="$linked $t"
+            fi
+          done
+          echo "unprefixed symlinks created for:$linked"
           echo "=== did we get what the build actually needs? ==="
-          test -x "$RUNNER_TEMP/cross/bin/ld64" && echo "ld64: OK" || echo "ld64: MISSING"
-          test -x "$RUNNER_TEMP/cross/bin/nm"   && echo "nm:   OK" || echo "nm:   MISSING"
-          test -d include/mach-o                && echo "include/mach-o: OK" || echo "include/mach-o: MISSING"
+          # `ld` here IS ld64. Prove the identity rather than trusting the
+          # name: GNU ld and Apple's ld64 both answer to `ld`, and a stray
+          # /usr/bin/ld on PATH would be a silent, catastrophic substitution.
+          LD_OK=0
+          if [ -x "$bin_dir/ld" ]; then
+            echo "--- $bin_dir/ld -v ---"
+            "$bin_dir/ld" -v 2>&1 | head -5 || true
+            if "$bin_dir/ld" -v 2>&1 | grep -qi 'ld64\|Apple\|@(#)PROGRAM:ld'; then
+              LD_OK=1
+              echo "ld: OK (ld64 confirmed by -v)"
+            else
+              echo "ld: present but did NOT identify as ld64"
+            fi
+          else
+            echo "ld: MISSING"
+          fi
+          test -x "$bin_dir/nm"   && echo "nm:   OK" || echo "nm:   MISSING"
+          test -x "$bin_dir/lipo" && echo "lipo: OK" || echo "lipo: MISSING"
+          test -d include/mach-o  && echo "include/mach-o: OK" || echo "include/mach-o: MISSING"
           ls -d include/* 2>/dev/null | head -20 || true
-          echo "$RUNNER_TEMP/cross/bin" >> "$GITHUB_PATH"
+          echo "$bin_dir" >> "$GITHUB_PATH"
+
+          # Assert every symlink we just made actually resolves. A dangling
+          # link would fail much later and much less legibly (Stage 6 would
+          # report a missing tool from inside xnu's Makefiles, where the real
+          # cause is invisible), so check it here where the context is.
+          echo "=== symlink integrity ==="
+          ls -la "$bin_dir"
+          TOOLS_BAD=""
+          for t in ld nm lipo ar ranlib strip; do
+            if [ -L "$bin_dir/$t" ] && [ ! -e "$bin_dir/$t" ]; then
+              echo "  $t: DANGLING symlink"
+              TOOLS_BAD="$TOOLS_BAD $t(dangling)"
+            elif [ -x "$bin_dir/$t" ]; then
+              echo "  $t: resolves -> $(readlink -f "$bin_dir/$t")"
+            else
+              echo "  $t: MISSING"
+              TOOLS_BAD="$TOOLS_BAD $t(missing)"
+            fi
+          done
+          echo "symlink verdict:${TOOLS_BAD:- all resolve}"
+
           # The verdict IS the exit status. Everything downstream cannot work
-          # without ld64/nm, so reporting MISSING and returning success is
+          # without the linker, so reporting MISSING and returning success is
           # exactly the lie that cost several runs.
           if [ "$make_rc" != 0 ] || [ "$inst_rc" != 0 ] \
-             || [ ! -x "$RUNNER_TEMP/cross/bin/ld64" ] \
-             || [ ! -x "$RUNNER_TEMP/cross/bin/nm" ]; then
-            echo "::error::Stage 1 did not produce ld64/nm (make=$make_rc install=$inst_rc)"
+             || [ "$LD_OK" != 1 ] \
+             || [ -n "$TOOLS_BAD" ] \
+             || [ ! -x "$bin_dir/nm" ]; then
+            echo "::error::Stage 1 did not produce a usable ld64/nm (make=$make_rc install=$inst_rc ld64_confirmed=$LD_OK tools_bad='$TOOLS_BAD')"
             exit 1
           fi
-          echo "Stage 1 verdict: cctools OK (ld64 + nm present)"
+          echo "Stage 1 verdict: cctools OK (ld64 confirmed by -v, symlinks resolve)"
 
       # ------------------------------------------- stage 1b: macOS host shims
       # The SETUP/ host tools (config, decomment, setsegname, installfile,
