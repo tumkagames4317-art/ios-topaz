@@ -2287,6 +2287,31 @@ jobs:
           fi
           export MIGCC="$SHIM"
 
+          # --- __LP64__ PROBE -------------------------------------------------
+          # machine_types.defs uses `#if defined(__LP64__)` in SIX places to
+          # pick 64-bit vs 32-bit spellings of uintptr_t/intptr_t, register_t,
+          # vm_address_t/vm_offset_t/vm_size_t. GNU mig treats a REPEATED
+          # `type X = ...` as a FATAL error (parser.y:339 calls error(), not
+          # warn()), so if cpp ever emits BOTH branches we get exactly six
+          # "overriding previous definition" errors and exit 1.
+          #
+          # Apple mig.sh:91 passes only -D__MACH30__ and relies on
+          # `-arch arm64` making the compiler define __LP64__ itself. Our MIGCC
+          # shim STRIPS -arch, so __LP64__ now comes from the host compiler
+          # target instead. This probe prints the ground truth rather than
+          # assuming it: which branch cpp actually takes for that condition.
+          {
+            echo "#if defined(__LP64__)"
+            echo "LP64_BRANCH_TAKEN"
+            echo "#else"
+            echo "ILP32_BRANCH_TAKEN"
+            echo "#endif"
+          } > "$RUNNER_TEMP/lp64probe.c"
+          LP64_STATE=$($SHIM -E -arch arm64 "$RUNNER_TEMP/lp64probe.c" 2>/dev/null | grep -E "LP64_BRANCH_TAKEN|ILP32_BRANCH_TAKEN" || echo "PROBE-FAILED")
+          echo "  __LP64__ probe (cc -E after -arch strip): $LP64_STATE"
+          echo "  host cc: $(/usr/bin/cc --version 2>&1 | head -1)"
+          echo "  host uname: $(uname -m)"
+
           echo "=== INSTALL: Debian mig-x86-64-gnu ==="
           MIGPKG="$RUNNER_TEMP/migpkg"; rm -rf "$MIGPKG"; mkdir -p "$MIGPKG"
           MIG_DEB_URL="http://deb.debian.org/debian/pool/main/m/mig/mig-x86-64-gnu_1.8+git20231217-8_amd64.deb"
