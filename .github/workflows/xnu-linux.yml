@@ -113,31 +113,38 @@ jobs:
 
       # ---------------------------------------------------------------- deps
       - name: Install clang-15 and build deps
-        timeout-minutes: 12
+        timeout-minutes: 25
         run: |
-          # Run 40364472111 sat inside this step for 16+ minutes and had to be
-          # cancelled by hand: the Azure apt mirror can stall mid-transfer.
-          # Bound every fetch so a wedged mirror costs minutes, not the run.
-          APT_OPTS="-o Acquire::Retries=3 -o Acquire::http::Timeout=15 \
-                    -o Acquire::https::Timeout=15 \
+          # Run 40367778595 died here with exit code 124 while the Azure mirror
+          # was answering "Ign:" for libllvm15t64 (25 MB) and ccache, so the
+          # step burned its whole budget retrying the same broken host. Point
+          # apt at the canonical archive and let it retry per package.
+          sudo sed -i 's|http://azure.archive.ubuntu.com|http://archive.ubuntu.com|g' \
+            /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/apt-mirrors.txt 2>/dev/null || true
+          grep -rh '^deb ' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null | head -5 || true
+          APT_OPTS="-o Acquire::Retries=8 -o Acquire::http::Timeout=60 \
+                    -o Acquire::https::Timeout=60 \
                     -o Acquire::http::Pipeline-Depth=0 \
                     -o Dpkg::Options::=--force-confdef \
                     -o Dpkg::Options::=--force-confold"
-          sudo DEBIAN_FRONTEND=noninteractive timeout 180 apt-get update $APT_OPTS \
-            || sudo DEBIAN_FRONTEND=noninteractive apt-get update $APT_OPTS
-          sudo DEBIAN_FRONTEND=noninteractive timeout 600 \
-            apt-get install -y --no-install-recommends $APT_OPTS \
-            build-essential llvm-15 clang-15 lld-15 \
-            libssl-dev libbz2-dev liblzma-dev zlib1g-dev libncurses-dev \
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update $APT_OPTS
+          # Two passes: the small packages should never be blocked by a flaky
+          # 25 MB LLVM archive, and the LLVM set gets its own retry loop.
+          sudo DEBIAN_FRONTEND=noninteractive timeout 480 apt-get install -y --no-install-recommends $APT_OPTS \
+            build-essential libssl-dev libbz2-dev liblzma-dev zlib1g-dev libncurses-dev \
             uuid-dev libcap-dev bison flex libblocksruntime-dev \
-            libedit-dev libelf-dev python3 jq cmake ninja-build ccache
+            libedit-dev libelf-dev python3 jq cmake ccache || true
+          for attempt in 1 2 3; do
+            sudo DEBIAN_FRONTEND=noninteractive timeout 420 apt-get install -y --no-install-recommends $APT_OPTS \
+              llvm-15 clang-15 lld-15 ninja-build && break
+            echo "llvm install attempt $attempt failed; retrying after 10s"
+            sleep 10
+          done
           sudo update-alternatives --install /usr/bin/clang    clang    /usr/bin/clang-15    100
           sudo update-alternatives --install /usr/bin/clang++  clang++  /usr/bin/clang++-15  100
           sudo update-alternatives --install /usr/bin/ld.lld   ld.lld   /usr/bin/ld.lld-15   100
           clang --version
           llvm-ar-15 --version | head -1
-          # The runner image ships several of these already; report what is
-          # actually available so a missing package is visible immediately.
           for t in clang bison flex m4 perl git jq curl make; do
             printf '%-8s %s\n' "$t" "$(command -v $t || echo MISSING)"
           done
