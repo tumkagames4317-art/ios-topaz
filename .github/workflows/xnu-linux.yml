@@ -2273,22 +2273,43 @@ jobs:
           {
             echo '#!/bin/bash'
             echo '# Strip Darwin-only "-arch <value>"; pass "-target <value>" through.'
-            echo 'args=(); dropped=""; narch=0'
+            echo '# Also strip the Darwin CODE-GEN switches. mig.sh routes every'
+            echo '# unrecognised "-*" into cppflags (mig.sh:129), and MIGFLAGS'
+            echo '# (MakeInc.def:895) carries CFLAGS_ARM64 and'
+            echo '# DEPLOYMENT_TARGET_FLAGS, so the preprocessor gets'
+            echo '#     -mkernel -msoft-float -mmacosx-version-min=13.3 ...'
+            echo '# Clang tolerates these; GCC rejects them outright:'
+            echo '#     cc: error: unrecognized command-line option (quote)-mkernel(quote)'
+            echo '#     cc: error: unrecognized command-line option'
+            echo '#         (quote)-mmacosx-version-min=13.3(quote)'
+            echo '# which is what run 40401667613 reported 131 times. They are'
+            echo '# codegen switches and -E discards codegen entirely, so dropping'
+            echo '# them here cannot change the preprocessed .defs text.'
+            echo 'args=(); dropped=""; narch=0; ncc=0'
             echo 'while [ $# -gt 0 ]; do'
             echo '  case "$1" in'
             echo '    -arch) dropped="$dropped $1 $2"; narch=$((narch+1)); shift 2 ;;'
+            echo '    -mkernel|-msoft-float|-mno-soft-float) dropped="$dropped $1"; ncc=$((ncc+1)); shift ;;'
+            echo '    -mmacosx-version-min=*|-miphoneos-version-min=*) dropped="$dropped $1"; ncc=$((ncc+1)); shift ;;'
             echo '    *)     args+=("$1"); shift ;;'
             echo '  esac'
             echo 'done'
-            echo 'echo "MIGCC SHIM: stripped $narch -arch pair(s):${dropped:- (none)} | argc now ${#args[@]}" >&2'
+            echo 'echo "MIGCC SHIM: stripped $narch -arch pair(s), $ncc darwin codegen switch(es):${dropped:- (none)} | argc now ${#args[@]}" >&2'
             echo 'if [ ! -f "${MIGCC_SHIM_MARK:-/tmp/.migcc_mark}" ]; then'
             echo '  { echo "MIGCC SHIM first invocation"'
             echo '    echo "  DROPPED:$dropped"'
             echo '    echo "  argc now: ${#args[@]}"'
-            echo '    echo "  exec: /usr/bin/cc ${args[*]}"'
+            echo '    echo "  exec: clang ${args[*]}"'
             echo '  } | tee "${MIGCC_SHIM_MARK:-/tmp/.migcc_mark}"'
             echo 'fi'
-            echo 'exec /usr/bin/cc "${args[@]}"'
+            # EXEC CLANG, NOT cc.
+            # On ubuntu-latest /usr/bin/cc is GCC, not clang. Clang accepts
+            # the -arch/-target Darwin spellings the shim passes through and
+            # is the compiler xnu is written for; GCC understands neither and
+            # also cannot parse the Apple C dialect that std_types.defs
+            # drags in. clang is put on the path by the toolchain step
+            # (update-alternatives, or the image's clang 18).
+            echo 'exec clang "${args[@]}"'
           } > "$SHIM"
           chmod +x "$SHIM"
           MIGCC_SHIM_MARK="$RUNNER_TEMP/migcc_mark"; rm -f "$MIGCC_SHIM_MARK"; export MIGCC_SHIM_MARK
