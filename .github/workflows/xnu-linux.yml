@@ -430,6 +430,101 @@ jobs:
           echo "$RUNNER_TEMP/cross/bin" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/cross/bin/mig" -version || true
 
+      # ------------------------------------- stage 5b: SETUP host tools
+      # kextsymboltool / setsegname / installfile need Apple's compat.h
+      # (setmode, getmode, fcopyfile, getprogname) and <mach/mach_init.h>,
+      # <mach-o/swap.h>. Build them here against our libc shim plus
+      # cctools-port's Mach-O headers, then preinstall them so SETUP/'s own
+      # makefiles find them newer than their sources.
+      - name: "Stage 5b: prebuild SETUP host tools (kextsymboltool, setsegname, installfile)"
+        id: setuptools
+        continue-on-error: true
+        run: |
+          set -x
+          XROOT="$GITHUB_WORKSPACE/dxb/xnu"
+          OBJROOT="$GITHUB_WORKSPACE/dxb/build/xnu.obj"
+          CCT="$GITHUB_WORKSPACE/cctools-port/cctools"
+          mkdir -p "$OBJROOT/SETUP/kextsymboltool" "$OBJROOT/SETUP/setsegname" \
+                   "$OBJROOT/SETUP/installfile"
+
+          # Apple's compat.h -> the POSIX pieces the tools actually use.
+          cat > hostshim/compat.h <<'EOF'
+          #ifndef _LINUX_HOST_COMPAT_SHIM_H
+          #define _LINUX_HOST_COMPAT_SHIM_H
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <unistd.h>
+          #include <fcntl.h>
+          #include <errno.h>
+          #include <libgen.h>
+          #include <sys/stat.h>
+          #include <sys/types.h>
+          #include <sys/wait.h>
+          #include <stdint.h>
+          #include <stdbool.h>
+          #ifndef __APPLE__
+          extern const char *program_invocation_short_name;
+          #define getprogname() program_invocation_short_name
+          /* BSD mode-string API from <bsd/stdlib.h>; glibc has neither. */
+          typedef void *mode_t_s; /* unused */
+          void *setmode(const char *);
+          mode_t getmode(const void *, mode_t);
+          int fcopyfile(int, int, void *, unsigned int);
+          #endif
+          #endif
+          EOF
+          cp hostshim/compat.h /usr/local/include/ 2>/dev/null || sudo cp hostshim/compat.h /usr/local/include/
+          cat > hostshim/bsdcompat.c <<'EOF'
+          #include <sys/types.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <unistd.h>
+          #include <fcntl.h>
+          /* setmode/getmode: just the bit patterns installfile uses. */
+          void *setmode(const char *p)
+          {
+              mode_t m = (mode_t)strtol(p, NULL, 8);
+              mode_t *r = malloc(sizeof m);
+              if (r) *r = m;
+              return r;
+          }
+          mode_t getmode(const void *v, mode_t base)
+          {
+              return v ? *(const mode_t *)v : base;
+          }
+          int fcopyfile(int from, int to, void *state, unsigned int flags)
+          {
+              (void)state; (void)flags;
+              char buf[65536]; ssize_t n;
+              while ((n = read(from, buf, sizeof buf)) > 0) {
+                  if (write(to, buf, (size_t)n) != n) return -1;
+              }
+              return n < 0 ? -1 : 0;
+          }
+          EOF
+          cc -c -O2 -o "$RUNNER_TEMP/bsdcompat.o" hostshim/bsdcompat.c
+
+          # cctools-port carries the Mach-O host headers (<mach-o/swap.h>,
+          # <mach/mach_init.h>) that Apple's SDK would otherwise provide.
+          MACHD_INC=$(dirname "$(find "$CCT" -name swap.h -path '*mach-o*' | head -1)")
+          echo "mach-o headers: $MACHD_INC"
+          CFLAGS="-isysroot / -g -O0 -I/usr/local/include -I$MACHD_INC -I$XROOT/EXTERNAL_HEADERS"
+          for d in kextsymboltool setsegname installfile; do
+            echo "== SETUP/$d"
+            ( cd "$XROOT/SETUP/$d" && for f in *.c; do
+                clang $CFLAGS -c -o "$OBJROOT/SETUP/$d/${f%.c}.o" "$f" || exit 1
+              done ) || echo "PARTIAL: SETUP/$d"
+            # Tools needing extra bits: kextsymboltool and installfile both
+            # use setmode/fcopyfile, so link the shim in for each.
+            if ls "$OBJROOT/SETUP/$d"/*.o >/dev/null 2>&1; then
+              clang -o "$OBJROOT/SETUP/$d/$d" "$OBJROOT/SETUP/$d"/*.o "$RUNNER_TEMP/bsdcompat.o" 2>&1 | tail -10 || true
+              ls -la "$OBJROOT/SETUP/$d/" | head -20
+            fi
+          done
+          echo '--- which tools got built ---'
+          find "$OBJROOT/SETUP" -maxdepth 2 -type f -executable -exec ls -la {} \; || true
+
       # ------------------------------------------- stage 6: the real thing
       - name: "Stage 6: make installhdrs + install (this is the build)"
         id: build
@@ -458,7 +553,7 @@ jobs:
             DSTROOT="$FAKEROOT" FAKEROOT_DIR="$FAKEROOT"
             OBJROOT="$OBJROOT" SYMROOT="$GITHUB_WORKSPACE/dxb/build/xnu.sym"
             CC=clang CXX=clang++ HOST_CC=clang
-            HOST_BISON=bison HOST_FLEX=flex HOST_GM4=gm4
+            HOST_BISON=bison HOST_FLEX=flex HOST_GM4=m4
             MIG="$RUNNER_TEMP/cross/bin/mig"
             MIGCOM="$RUNNER_TEMP/cross/bin/migcom"
             LIPO=lipo STRIP=strip AR=ar RANLIB=ranlib NM=nm OTOOL=otool
