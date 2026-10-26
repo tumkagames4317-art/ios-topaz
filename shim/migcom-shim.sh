@@ -224,6 +224,49 @@ fi
 
 echo "migcom-shim: hoisted subsystem statement to top of input" >&2
 
+# --- (4b) PROVENANCE for duplicate type declarations ------------------------
+# GNU mig treats a repeated `type X = ...` as FATAL (parser.y:339 calls
+# error(); error() prints with no severity prefix; and warn() at error.c:55 is
+# suppressed once errors != 0, so the fatal lines look like the harmless ones).
+# Stage 6 reports six of them, every run:
+#     machine_types.defs:38 short   :39 int   :61 uintptr_t   :62 intptr_t
+#     std_types.defs:84 int64       :90 char
+# A count cannot distinguish the two causes, and a count is what let this
+# survive several runs. The #line provenance can:
+#   same file AND same line twice  -> the file really was included twice
+#   same file, DIFFERENT lines     -> two revisions, or two files, same name
+# So print, for each target type, every occurrence with the #line-attributed
+# file that precedes it. Cheap: one awk over a file we already have.
+{
+  echo "migcom-shim: TYPE PROVENANCE (file@line for each declaration, on the hoisted stream):"
+  awk '
+    /^[ \t]*#/ && /"/ {
+      # cpp line marker: # <num> "<file>" [flags]
+      f = $0
+      sub(/^[ \t]*#[ \t]*[0-9]+[ \t]+"/, "", f)
+      sub(/".*$/, "", f)
+      cur = f
+      l = $0
+      sub(/^[ \t]*#[ \t]*/, "", l)
+      sub(/[ \t]+".*$/, "", l)
+      curline = l
+      next
+    }
+    /^[ \t]*type[ \t]+(short|int|uintptr_t|intptr_t|int64|char|natural_t)[ \t]*=/ {
+      n = $0
+      sub(/^[ \t]*type[ \t]+/, "", n)
+      sub(/[ \t]*=.*$/, "", n)
+      print "    " n " @ " cur ":" curline
+      seen[cur ":" curline]++
+    }
+    END {
+      d = 0
+      for (k in seen) if (seen[k] > 1) { print "    DUPLICATE (same file:line " k " x" seen[k] ")" ; d++ }
+      if (d == 0) print "    (no same-file:line duplicate in this stream)"
+    }
+  ' "$hoisted"
+} >&2
+
 # --- (5) supply mach_msg_type_number_t, which Apple's mig has built in -----
 # Run 40396625873 got past SameCount (9 markers converted) and then failed at
 #     task.defs, line 278: type 'mach_msg_type_number_t' not defined
