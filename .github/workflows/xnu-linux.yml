@@ -1886,6 +1886,25 @@ jobs:
             # mysterious compile failure.
             mkdir -p "$OBJROOT/SETUP/$d"
             ok=1
+            # SETUP/config is partly generated. Its Makefile says
+            #     parser.c: parser.y
+            #         $(HOST_BISON) -y -d -d -o $@ $<
+            #     lexer.yy.c: lexer.l
+            #         env M4=$(HOST_GM4) $(HOST_FLEX) --header-file=... -o $@ $<
+            # and nothing has run bison/flex here, so main.c failed with
+            #     main.c:63:10: fatal error: 'parser.h' file not found
+            # (run 40381388491). Generate the two files in place, in the
+            # source dir, because main.c includes "parser.h" directly.
+            if [ "$d" = config ]; then
+              ( cd "$XROOT/SETUP/config" \
+                && bison -y -d -d -o parser.c parser.y \
+                && flex --header-file=lexer.yy.h -o lexer.yy.c lexer.l ) \
+                || { echo "::error::SETUP/config: bison/flex generation failed"; ok=0; setup_failed="$setup_failed config(generate)"; }
+              ls -la "$XROOT/SETUP/config/parser.h" \
+                     "$XROOT/SETUP/config/parser.c" \
+                     "$XROOT/SETUP/config/lexer.yy.c" 2>/dev/null \
+                || { echo "::error::SETUP/config: generated files missing"; ok=0; }
+            fi
             # Each SETUP subdir is compiled from inside its own directory and
             # may include a header that lives beside it. SETUP/config does
             #     externs.c:26:10: error: 'config.h' file not found with
