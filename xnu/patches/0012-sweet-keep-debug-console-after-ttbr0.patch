@@ -1,7 +1,7 @@
 diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
 --- a/osfmk/arm64/arm_vm_init.c
 +++ b/osfmk/arm64/arm_vm_init.c
-@@ -1825,6 +1825,32 @@
+@@ -1825,6 +1825,63 @@
  #define ARM64_PHYSMAP_ALIGNMENT_PADDING (PTOV_TABLE_SIZE * ARM_TT_TWIG_SIZE)
  #endif
  
@@ -59,6 +59,8 @@ diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
 +	__asm__ volatile("dsb ishst" ::: "memory");
 +	sweet_early_fb_va = va;
 +}
++
++#endif
 +
  void
  arm_vm_init(uint64_t memory_size, boot_args * args)
@@ -161,7 +163,7 @@ diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
  	sweet_early_string(": ");
  	sweet_early_string(label);
  	sweet_early_putc('\n');
-@@ -121,9 +126,17 @@
+@@ -121,9 +126,23 @@
  }
  
  void
@@ -186,23 +188,6 @@ diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
  	early_disabled = 1;
  	__asm__ volatile("dsb sy" ::: "memory");
  }
-@@ -100,7 +114,13 @@
- }
- 
- void
- sweet_early_panic(const char *fmt, va_list *args)
- {
--	if (early_disabled || early_panicking) {
-+	/*
-+	 * Deliberately ignore early_disabled. arm_vm_init switches the console
-+	 * off immediately before TTBR0 is invalidated, which is exactly where
-+	 * an early panic matters most; a best-effort write is harmless once the
-+	 * mapping has gone away.
-+	 */
-+	if (early_panicking) {
- 		return;
- 	}
- 
 diff --git a/osfmk/arm64/sweet_early.h b/osfmk/arm64/sweet_early.h
 --- a/osfmk/arm64/sweet_early.h
 +++ b/osfmk/arm64/sweet_early.h
@@ -273,7 +258,7 @@ diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
  #include <pexpert/arm/protos.h>
  #include <kern/sched_prim.h>
  #if HIBERNATION
-@@ -833,7 +834,9 @@
+@@ -833,8 +834,10 @@
  	if (!fbcon_width || !fbcon_height || fbcon_stride < fbcon_width * 4) {
  		return;
  	}
