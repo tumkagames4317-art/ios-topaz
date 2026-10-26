@@ -216,6 +216,25 @@ jobs:
             echo "=== any remaining bare 'exit 1' near libdispatch? ==="
             grep -n 'exit 1' "$f" | head -8 || true
           done
+          # ld64/src/ld/passes/order.cpp and code_dedup.cpp do an
+          # unconditional `#include <dispatch/dispatch.h>` and then use
+          # nothing from it. Run 40371545864 died on exactly that:
+          #     order.cpp:30:10: fatal error:
+          #         'dispatch/dispatch.h' file not found
+          # Ubuntu has no libdispatch, so supply a header that satisfies the
+          # include and nothing more. If either file ever calls dispatch_*,
+          # the compile fails loudly instead of silently misbehaving.
+          mkdir -p /usr/local/include/dispatch
+          cat > /usr/local/include/dispatch/dispatch.h <<'DISPEOF'
+          #ifndef _LINUX_HOST_DISPATCH_STUB_H
+          #define _LINUX_HOST_DISPATCH_STUB_H
+          /* Host stand-in for Apple's libdispatch. cctools' ld64 includes this
+           * header from order.cpp and code_dedup.cpp but uses no symbol from
+           * it; Ubuntu ships no libdispatch, and configure is run with
+           * --with-libdispatch=no. Deliberately empty. */
+          #endif
+          DISPEOF
+          echo "dispatch stub installed: $(ls -la /usr/local/include/dispatch/dispatch.h)"
           # --with-libdispatch=no is the documented opt-out; the rewrite above is
           # the belt to that braces.
           set +e
