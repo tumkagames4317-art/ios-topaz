@@ -792,7 +792,35 @@ jobs:
           }
           EOF
           cc -c -O2 -o hostshim/bsdcompat.o hostshim/bsdcompat.c
-          ar rcs hostshim/libbsdcompat.a hostshim/bsdcompat.o
+          # Build this archive with GNU binutils explicitly. Stage 1 puts
+          # cctools' Mach-O `ar`/`ranlib` first on PATH (needed by Stage 6),
+          # and once that happened `ar rcs` silently wrote a Mach-O archive
+          # that GNU ld cannot index:
+          #     warning: x86_64-linux-gnu-ranlib: archive library:
+          #       hostshim/libbsdcompat.a the table of contents is empty
+          #       (no object file members in the library define global symbols)
+          # The file still existed and was installed, so Stage 1b passed, and
+          # the damage only surfaced much later in Stage 5b as
+          #     undefined reference to `setmode' / `getmode' /
+          #     `fcopyfile' / `getprogname'
+          # for installfile and replacecontents. Use the real GNU tools and
+          # prove the index is non-empty before installing.
+          GNU_AR=$(command -v x86_64-linux-gnu-ar || command -v gcc-ar || \
+                   echo /usr/bin/ar)
+          GNU_RANLIB=$(command -v x86_64-linux-gnu-ranlib || \
+                       echo /usr/bin/ranlib)
+          echo "bsdcompat archive tools: $GNU_AR / $GNU_RANLIB"
+          rm -f hostshim/libbsdcompat.a
+          "$GNU_AR" rcs hostshim/libbsdcompat.a hostshim/bsdcompat.o
+          "$GNU_RANLIB" hostshim/libbsdcompat.a
+          echo '--- libbsdcompat.a global symbols (must be non-empty) ---'
+          nm -g --defined-only hostshim/libbsdcompat.a || true
+          if ! nm -g --defined-only hostshim/libbsdcompat.a \
+                 | grep -qE 'T (getprogname|setmode|getmode|fcopyfile)'; then
+            echo "::error::libbsdcompat.a defines none of getprogname/setmode/getmode/fcopyfile"
+            nm -g hostshim/libbsdcompat.a || true
+            exit 1
+          fi
           # /usr/local/{include,lib} are writable on the GitHub ubuntu image,
           # so an unconditional `sudo cp` fails there and the file never
           # lands ("fatal error: '/usr/local/include/compat.h' file not
@@ -803,6 +831,8 @@ jobs:
           install_shim hostshim/compat.h        /usr/local/include/compat.h
           install_shim hostshim/libbsdcompat.a  /usr/local/lib/libbsdcompat.a
           echo "compat: $(ls -la /usr/local/include/compat.h /usr/local/lib/libbsdcompat.a)"
+          echo '--- installed archive global symbols ---'
+          nm -g --defined-only /usr/local/lib/libbsdcompat.a || true
 
       # ------------------------------------------ stage 1c: emulate Apple paths
       # MakeInc.cmd/MakeInc.top hard-code /usr/bin/xcrun, sw_vers and
@@ -1434,10 +1464,21 @@ jobs:
             # mysterious compile failure.
             mkdir -p "$OBJROOT/SETUP/$d"
             ok=1
+            # Each SETUP subdir is compiled from inside its own directory and
+            # may include a header that lives beside it. SETUP/config does
+            #     externs.c:26:10: error: 'config.h' file not found with
+            #         <angled> include; use "quotes" instead
+            # so put the subdir itself on the include path.
             ( cd "$XROOT/SETUP/$d" && for f in *.c; do
-                clang $CFLAGS -c -o "$OBJROOT/SETUP/$d/${f%.c}.o" "$f" || exit 1
+                clang $CFLAGS -I"$XROOT/SETUP/$d" -c \
+                  -o "$OBJROOT/SETUP/$d/${f%.c}.o" "$f" || exit 1
               done ) || { ok=0; echo "COMPILE FAILED: SETUP/$d"; setup_failed="$setup_failed $d(compile)"; }
             if [ "$ok" = 1 ] && ls "$OBJROOT/SETUP/$d"/*.o >/dev/null 2>&1; then
+              # Print the exact command and the archive's symbol table so the
+              # link order and the archive contents are observed, not assumed.
+              echo "LINK CMD: clang -o $OBJROOT/SETUP/$d/$d $OBJROOT/SETUP/$d/*.o -L/usr/local/lib -lbsdcompat"
+              echo "ARCHIVE SYMBOLS (/usr/local/lib/libbsdcompat.a):"
+              nm -g --defined-only /usr/local/lib/libbsdcompat.a 2>&1 | head -20 || true
               clang -o "$OBJROOT/SETUP/$d/$d" "$OBJROOT/SETUP/$d"/*.o \
                 -L/usr/local/lib -lbsdcompat || { echo "LINK FAILED: SETUP/$d"; setup_failed="$setup_failed $d(link)"; }
               ls -la "$OBJROOT/SETUP/$d/" | head -20
