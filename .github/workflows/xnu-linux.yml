@@ -3471,6 +3471,40 @@ jobs:
               echo "REPLAY VERDICT: migcom REJECTS the captured bytes."
               echo "  The capture is faithful; the fault is in the stream."
             fi
+
+            # --- CONTROL: delete the `type int64` line and replay again -------
+            # Reading type.c/parser.y/lexxer.c has now failed to explain this
+            # twice. If int64 really is declared twice, removing the one visible
+            # declaration must make the error go away or move to another name.
+            # If the message stays byte-identical, it was never about this line.
+            #
+            # Written so it CAN fail in the direction that matters: it prints the
+            # before/after counts, so a grep that silently matched nothing cannot
+            # be mistaken for a pass.
+            grep -vE '^type[[:space:]]+int64[[:space:]]*=' "$RUNNER_TEMP/replay.defs" \
+              > "$RUNNER_TEMP/replay_no64.defs" || true
+            b64=$(grep -cE '^type[[:space:]]+int64[[:space:]]*=' "$RUNNER_TEMP/replay.defs" || true)
+            a64=$(grep -cE '^type[[:space:]]+int64[[:space:]]*=' "$RUNNER_TEMP/replay_no64.defs" || true)
+            echo "CONTROL: int64 decls before=${b64:-0} after=${a64:-0}"
+            set +e
+            "$MIGCOM" -server /dev/null -user /dev/null \
+                      -header "$RUNNER_TEMP/rc.h" -sheader "$RUNNER_TEMP/rcS.h" \
+                      < "$RUNNER_TEMP/replay_no64.defs" 2> "$RUNNER_TEMP/control.err"
+            control_rc=$?
+            set -e
+            echo "CONTROL raw migcom exit: $control_rc"
+            echo "CONTROL overriding-definition lines:"
+            grep 'overriding previous definition' "$RUNNER_TEMP/control.err" | sed -n '1,10p' || echo "  (none)"
+            if grep -q 'overriding previous definition of int64' "$RUNNER_TEMP/control.err"; then
+              echo "CONTROL VERDICT: int64 STILL reported with its only declaration"
+              echo "  removed -> the name does not come from this stream's int64 line."
+            elif [ "$control_rc" -eq 0 ]; then
+              echo "CONTROL VERDICT: removing the int64 line FIXES it -> int64 is"
+              echo "  the genuine cause, and there is exactly one such line."
+            else
+              echo "CONTROL VERDICT: error persists under a different name:"
+              grep 'overriding previous definition' "$RUNNER_TEMP/control.err" | head -3
+            fi
           else
             echo "REPLAY: no captured streams present, skipped"
           fi
