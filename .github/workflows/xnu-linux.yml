@@ -2361,6 +2361,20 @@ jobs:
           # ===============================================================
           echo "=== FLAGS (recorded, not probed) ==="
           echo "  -maxonstack 1024: REJECTED (exit 1, unknown flag) -- not passed"
+          # These two were defined in the deleted probe block. Removing the
+          # probe silently unset them: run 40390467722 then ran
+          # `gen_and_compile lockd "" lockd_mach` and `wd="/task"` ->
+          # "mkdir: cannot create directory '/task': Permission denied".
+          # Define them here, and ASSERT them, so deleting a neighbour can
+          # never silently leave them empty again.
+          ACCT="$RUNNER_TEMP/acct"; rm -rf "$ACCT"; mkdir -p "$ACCT"
+          LOCKD_DEFS="$XNUTREE/osfmk/lockd/lockd_mach.defs"
+          for v in ACCT LOCKD_DEFS; do
+            eval "val=\$$v"
+            if [ -z "$val" ]; then echo "::error::$v is EMPTY -- would silently skip work"; fi
+          done
+          echo "  ACCT=$ACCT"
+          echo "  LOCKD_DEFS=$LOCKD_DEFS"
 
           # ===============================================================
           # LOCKD + TASK: generate real headers and COMPILE them.
@@ -2398,7 +2412,7 @@ jobs:
             # macros, cpp removes them before migcom ever sees them. These
             # are added so the routines are visible; the declared-vs-emitted
             # count below is what tells us whether that worked.
-            KSW="-DKERNEL=1 -DKERNEL_PRIVATE=1 -D__APPLE_API_UNSTABLE=1 -DPRIVATE=1"
+            KSW="-DKERNEL=1 -DKERNEL_PRIVATE=1 -D__APPLE_API_UNSTABLE=1 -DPRIVATE=1 -DARCH_arm64=1 -DARM64=1"
             printf '  declared `routine` directives in %s: %s\n' \
               "$(basename "$gdefs")" \
               "$(grep -cE '^[[:space:]]*routine[[:space:]]|^[[:space:]]*simpleroutine[[:space:]]' "$gdefs" 2>/dev/null || echo 0)"
