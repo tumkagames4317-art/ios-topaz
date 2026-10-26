@@ -2511,6 +2511,16 @@ jobs:
                     # system-wide, so point cpp at the XNU checkout we already
                     # have. Without this the build dies at the first object:
                     #   cpu.symc:1:10: fatal error: mach/message.h: No such file
+                    # -DKERNEL is not cosmetic. bsd/sys/cdefs.h:790-793:
+                    #     #ifdef KERNEL
+                    #     #define __DARWIN_ALIAS_STARTING(_mac,_iphone,x)
+                    #     #else
+                    #     #include <sys/_symbol_aliasing.h>
+                    # _symbol_aliasing.h is a macOS SDK header that xnu never
+                    # ships (absent from bsd/sys AND EXTERNAL_HEADERS), so
+                    # without the define the build chases a file that does not
+                    # exist by design. cpu.sym is kernel assembly; KERNEL is the
+                    # correct define and the #else branch then disappears.
                     XNUMACH="$GITHUB_WORKSPACE/dxb/xnu/osfmk"
                     if [ -d "$XNUMACH/mach" ]; then
                       export CFLAGS="${CFLAGS} -I$XNUMACH"
@@ -2539,7 +2549,7 @@ jobs:
                     make -j"$(nproc)" migcom \
                       CC="$HOSTCC" CFLAGS="-O1 -w" \
                       TARGET_CC="$HOSTCC" \
-                      TARGET_CPPFLAGS="-I$XNUMACH -I$GITHUB_WORKSPACE/dxb/xnu/bsd -I$GITHUB_WORKSPACE/dxb/xnu/EXTERNAL_HEADERS" \
+                      TARGET_CPPFLAGS="-DKERNEL -I$XNUMACH -I$GITHUB_WORKSPACE/dxb/xnu/bsd -I$GITHUB_WORKSPACE/dxb/xnu/EXTERNAL_HEADERS" \
                       TARGET_CFLAGS="-O1 -w" 2>&1 | tail -45
                     exit "${PIPESTATUS[0]}"
                   )
@@ -3507,7 +3517,15 @@ jobs:
           echo '--- SETUP host tools actually present? ---'
           find "$OBJROOT/SETUP" -maxdepth 2 -type f -executable | sort || true
           echo '--- first real error, in order ---'
-          grep -nE 'fatal error:|error:' "$GITHUB_WORKSPACE/build.log" | head -10 || echo "(no error: lines)"
+          # Widen beyond 'error:': the first real failures tonight were
+          # "Error 127" (missing interpreter) and "No such file", neither of
+          # which contains the string `error:`. A grep that only knows one
+          # spelling printed nothing while the build was dying.
+          grep -nE 'fatal error:|error:|\*\*\* |Error [0-9]+|No such file|not found' \
+            "$GITHUB_WORKSPACE/build.log" | head -25 || echo "(no error-ish lines)"
+          echo '--- first error inside a .c/.cpp/.s/.cc compile, verbatim ---'
+          grep -nE '^[^ ].*\.(c|cpp|s|cc):[0-9]+:[0-9]+: (error|fatal error)' \
+            "$GITHUB_WORKSPACE/build.log" | head -5 || echo "(no compile errors: build died earlier)"
           # --- what did cpp actually emit? ---------------------------------
           # mig reports six type RE-declarations (error.c:69 prints lineno-1,
           # so its :84/:90/:38/:39/:61/:62 are really :85/:91/:39/:40/:62/:63,
