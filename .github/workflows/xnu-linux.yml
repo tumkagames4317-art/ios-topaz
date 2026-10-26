@@ -189,150 +189,167 @@ jobs:
           ls -la cctools-port | head -20
           ls -la cctools-port/cctools/configure* 2>&1 | head -5
           cd cctools-port/cctools
-          # cctools' configure hard-requires libdispatch, and Ubuntu ships no
-          # such library (libblocksruntime is a different thing). Run
-          # 40369846814 died here:
-          #     checking for dispatch_once in -ldispatch... no
-          #     checking for dispatch_once in -lc... no
-          #     Required library libdispatch not installed
-          # which is also why nothing downstream had Mach-O headers.
-          #
-          # configure.ac reads:
+          # configure.ac hard-requires libdispatch:
           #     AC_CHECK_LIB([c], [dispatch_once], [...], [
           #         echo "Required library libdispatch not installed" >&2
           #         exit 1
           #     ])
-          # so rewriting the message alone is not enough: the `exit 1` on the
-          # very next line still runs. Run 40370900378 proved it -- configure
-          # printed the demoted message and still returned 1, with no error
-          # text for grep to find. Both lines have to go together.
-          for f in configure configure.ac; do
-            [ -f "$f" ] || continue
-            cp "$f" "$f.orig"
-            perl -0pi -e 's/(echo "Required library libdispatch not installed" >&2\s*\n)(\s*)exit 1/$1$2:  # demoted: libdispatch is not needed by ld64/g' "$f"
-            perl -0pi -e 's/AC_MSG_ERROR\(\[Required library libdispatch not installed\]\)/AC_MSG_WARN([libdispatch not found, continuing])/g' "$f"
-            echo "=== libdispatch context in $f ==="
-            grep -n -A2 'libdispatch not installed' "$f" | head -12 || echo "(message no longer present)"
-            echo "=== any remaining bare 'exit 1' near libdispatch? ==="
-            grep -n 'exit 1' "$f" | head -8 || true
-          done
-          # ld64/src/ld/passes/order.cpp and code_dedup.cpp do an
-          # unconditional `#include <dispatch/dispatch.h>` and then use
-          # nothing from it. Run 40371545864 died on exactly that:
-          #     order.cpp:30:10: fatal error:
-          #         'dispatch/dispatch.h' file not found
-          # Ubuntu has no libdispatch, so supply a header that satisfies the
-          # include and nothing more. If either file ever calls dispatch_*,
-          # the compile fails loudly instead of silently misbehaving.
-          # /usr/local/include is root-owned on the runner, so this needs sudo
-          # (run 40372127788: "mkdir: cannot create directory
-          # '/usr/local/include/dispatch': Permission denied").
-          sudo mkdir -p /usr/local/include/dispatch
-          sudo tee /usr/local/include/dispatch/dispatch.h >/dev/null <<'DISPEOF'
-          #ifndef _LINUX_HOST_DISPATCH_STUB_H
-          #define _LINUX_HOST_DISPATCH_STUB_H
-          /* Host stand-in for Apple's libdispatch. cctools' ld64 includes this
-           * header from order.cpp and code_dedup.cpp but uses no symbol from
-           * it; Ubuntu ships no libdispatch, and configure is run with
-           * --with-libdispatch=no. Deliberately empty. */
-          #endif
-          DISPEOF
-          echo "dispatch stub installed: $(ls -la /usr/local/include/dispatch/dispatch.h)"
-          # order.cpp and code_dedup.cpp are the only two files that call
-          # dispatch_apply(), and they do it while mutating locals that live
-          # *outside* the block:
+          # Earlier runs demoted that `exit 1` and shipped an empty
+          # dispatch/dispatch.h stub so configure would pass. That was a
+          # mistake: it did not remove the dependency, it buried it in six
+          # ld64 translation units. Both patches are gone. Stage 1 now
+          # provides real libdispatch below, so the check passes honestly.
+          # ---- libdispatch: use the real library, not a stub -----------------
           #
-          #     dispatch_apply(_state.sections.size(), DISPATCH_APPLY_AUTO,
-          #                    ^(size_t index) { ... sect ... });   // order.cpp
-          #     dispatch_apply(state.sections.size(), DISPATCH_APPLY_AUTO,
-          #                    ^(size_t index) { ... pos ... fit ... });  // code_dedup
+          # History, because this cost us a whole evening and the conclusion
+          # reverses an earlier "fix":
           #
-          # With real Apple libdispatch that is a legal parallel-for. With the
-          # empty stub above, `^{...}` degrades to a plain C++ block literal,
-          # and C++ forbids mutating an enclosing local from inside one -- run
-          # 40372391857 produced 18 such errors and ld64 never linked:
-          #     code_dedup.cpp:356:30: error: reference to local variable 'pos'
-          #         declared in enclosing block literal
-          #     order.cpp:701:24: error: reference to local variable 'sect'
-          #         declared in enclosing block literal
+          # cctools' ld64 does not merely include <dispatch/dispatch.h> for
+          # decoration. SIX files use the real API:
+          #     ld64/src/ld/passes/code_dedup.cpp   dispatch_apply
+          #     ld64/src/ld/passes/order.cpp        dispatch_apply
+          #     ld64/src/ld/InputFiles.cpp          dispatch_apply
+          #     ld64/src/ld/Resolver.cpp            dispatch_apply
+          #     ld64/src/ld/OutputFile.cpp          dispatch_apply + dispatch_group_*,
+          #                                         dispatch_queue_*, dispatch_get_global_queue
+          #     ld64/src/ld/libcodedirectory.c      dispatch_once / queue_create / sync / apply
           #
-          # The passes cannot simply be dropped: ld.cpp:1631-1632 calls both
-          # unconditionally, branch_island and compact_unwind document that
-          # they must run. So serialise the two dispatch_apply calls into
-          # plain loops instead. Same work, same order, no parallelism.
-          for src in ld64/src/ld/passes/order.cpp ld64/src/ld/passes/code_dedup.cpp; do
-            [ -f "$src" ] || { echo "MISSING PASS SOURCE: $src"; exit 1; }
-            cp "$src" "$src.orig"
-            python3 - "$src" <<'SERIALPY'
-          import re, sys, pathlib
-          p = pathlib.Path(sys.argv[1])
-          s = p.read_text()
-          # 1) dispatch_apply(EXPR, DISPATCH_APPLY_AUTO, ^(size_t index) {
-          #      ->  for (size_t index = 0; index < (size_t)(EXPR); ++index) {
-          open_pat = re.compile(
-              r'dispatch_apply\(\s*(?P<n>[^,]+?)\s*,\s*DISPATCH_APPLY_AUTO\s*,\s*'
-              r'\^\(\s*size_t\s+index\s*\)\s*\{')
-          m = open_pat.search(s)
-          if not m:
-              sys.exit('no dispatch_apply(...) block literal found in %s' % (p,))
-
-          body_start = m.end()          # just past the block's opening brace
-          for_loop = ('for (size_t index = 0; index < (size_t)(%s); ++index) {'
-                      % m.group('n').strip())
-
-          # 2) Find the MATCHING close brace by counting depth. Rewriting only
-          #    the opening token leaves the block's "});" behind, which does
-          #    not compile -- verified against the real files before writing
-          #    this: order.cpp closes at its line 704, code_dedup at 369.
-          depth = 1
-          i = body_start
-          while i < len(s) and depth:
-              if s[i] == '{':
-                  depth += 1
-              elif s[i] == '}':
-                  depth -= 1
-              i += 1
-          if depth:
-              sys.exit('unbalanced braces after dispatch_apply in %s' % (p,))
-          close_pos = i - 1            # index of the matching '}'
-
-          # 3) dispatch_apply(...)'s terminator is "})" then ";". For a for
-          #    loop that becomes a single "}".
-          if s[close_pos:close_pos + 2] != '})':
-              sys.exit('unexpected close token %r in %s'
-                       % (s[close_pos:close_pos + 3], p))
-          rest = s[close_pos + 2:]
-          semi = re.match(r'\s*;', rest)
-          if not semi:
-              sys.exit('no terminating ; after block close in %s' % (p,))
-
-          new = (s[:m.start()] + for_loop
-                 + s[body_start:close_pos]
-                 + '}' + rest[semi.end():])
-          p.write_text(new)
-          print('serialised dispatch_apply in %s' % (p,))
-          SERIALPY
-            echo "=== $src after rewrite ==="
-            grep -n 'for (size_t index = 0' "$src" || echo "REWRITE NOT VISIBLE IN $src"
-            grep -c 'dispatch_apply' "$src" || true
-          done
-          for src in ld64/src/ld/passes/order.cpp ld64/src/ld/passes/code_dedup.cpp; do
-            if grep -q 'dispatch_apply' "$src"; then
-              echo "STILL CONTAINS dispatch_apply: $src"
-              grep -n 'dispatch_apply' "$src"
-              exit 1
-            fi
-          done
-          # --with-libdispatch=no is the documented opt-out; the rewrite above is
-          # the belt to that braces.
+          # Earlier runs tried to make do without libdispatch: configure's
+          # "Required library libdispatch not installed" + `exit 1` was
+          # demoted, and an empty dispatch/dispatch.h stub was installed.
+          # That made configure pass, which looked like progress and was not:
+          # with an empty header `^{...}` degrades from an Apple block to a
+          # plain C++ block literal, and C++ forbids mutating an enclosing
+          # local inside one. Runs 40372391857 / 40373894611 / 40373938349
+          # then failed with 15-18 errors of exactly that shape and
+          # `ld64: MISSING`. Serialising the two easiest call sites only
+          # exposed the next four files.
+          #
+          # cctools-port's README lists libdispatch-dev and libblocksruntime
+          # as required dependencies. So install the real thing and let
+          # configure's own AC_CHECK_LIB succeed on its merits.
+          #
+          # Path 1: the distro package. Path 2: build the same author's
+          # apple-libdispatch from source. Whichever wins must pass a strict
+          # symbol probe -- a header alone is not libdispatch, and an old
+          # package without block support would fail later and far less
+          # legibly than here.
+          dispatch_ok=0
+          dispatch_how=""
+          probe_dispatch() {
+            [ -f /usr/include/dispatch/dispatch.h ] || [ -f /usr/local/include/dispatch/dispatch.h ] || return 1
+            local lib=""
+            for cand in /usr/lib/x86_64-linux-gnu/libdispatch.so \
+                        /usr/local/lib/libdispatch.so \
+                        /usr/lib64/libdispatch.so; do
+              [ -e "$cand" ] && { lib="$cand"; break; }
+            done
+            [ -n "$lib" ] || return 1
+            echo "=== probing $lib ==="
+            local missing=0
+            for sym in dispatch_apply dispatch_group_async dispatch_sync dispatch_once dispatch_queue_create; do
+              if nm -D --defined-only "$lib" 2>/dev/null | grep -qw "$sym"; then
+                echo "  $sym: present"
+              else
+                echo "  $sym: MISSING"
+                missing=1
+              fi
+            done
+            return $missing
+          }
+          echo "=== path 1: distro libdispatch-dev ==="
           set +e
+          sudo DEBIAN_FRONTEND=noninteractive timeout 300 apt-get install -y --no-install-recommends \
+            libdispatch-dev libblocksruntime-dev > /tmp/dispatchpkg.log 2>&1
+          pkg_rc=$?
+          set -e
+          echo "apt-get libdispatch-dev exit: $pkg_rc"
+          tail -15 /tmp/dispatchpkg.log
+          if [ "$pkg_rc" = 0 ] && probe_dispatch; then
+            dispatch_ok=1
+            dispatch_how="distro package (libdispatch-dev)"
+            echo "libdispatch source: $dispatch_how"
+          else
+            echo "=== path 1 rejected; falling back to source build ==="
+            echo "=== path 2: tpoechtrager/apple-libdispatch ==="
+            set +e
+            (
+              set -e
+              git clone -q --depth 1 https://github.com/tpoechtrager/apple-libdispatch.git apple-libdispatch
+              cd apple-libdispatch
+              mkdir -p build && cd build
+              cmake -G Ninja \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_INSTALL_PREFIX=/usr/local \
+                -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+                -DBUILD_TESTING=OFF \
+                .. > /tmp/libdispatch_cmake.log 2>&1
+              echo "cmake exit: $?"
+              tail -25 /tmp/libdispatch_cmake.log
+              ninja -j"$(nproc)" > /tmp/libdispatch_build.log 2>&1
+              echo "ninja exit: $?"
+              tail -25 /tmp/libdispatch_build.log
+              sudo ninja install > /tmp/libdispatch_install.log 2>&1
+              echo "ninja install exit: $?"
+              tail -15 /tmp/libdispatch_install.log
+            ) > /tmp/libdispatch_src.log 2>&1
+            src_rc=$?
+            set -e
+            echo "source build exit: $src_rc"
+            tail -60 /tmp/libdispatch_src.log
+            sudo ldconfig 2>/dev/null || true
+            if [ "$src_rc" = 0 ] && probe_dispatch; then
+              dispatch_ok=1
+              dispatch_how="source build (tpoechtrager/apple-libdispatch)"
+              echo "libdispatch source: $dispatch_how"
+            fi
+          fi
+          if [ "$dispatch_ok" != 1 ]; then
+            echo "=== EVERYTHING WE HAVE ==="
+            ls -la /usr/include/dispatch/ 2>/dev/null || echo "  no /usr/include/dispatch"
+            ls -la /usr/local/include/dispatch/ 2>/dev/null || echo "  no /usr/local/include/dispatch"
+            ls -la /usr/lib/x86_64-linux-gnu/libdispatch* 2>/dev/null || true
+            ls -la /usr/local/lib/libdispatch* 2>/dev/null || true
+            echo "=== apt candidate info ==="
+            apt-cache policy libdispatch-dev 2>/dev/null || true
+            echo "::error::libdispatch could not be provided (distro package and source build both failed)"
+            exit 1
+          fi
+          echo "DISPATCH VERDICT: $dispatch_how"
+          # With real libdispatch, configure's own AC_CHECK_LIB([dispatch],
+          # [dispatch_once]) succeeds, so no --with-libdispatch=no and no
+          # patch to configure is needed. The old stub and the demoted
+          # `exit 1` rewrite are both gone: they are what turned a missing
+          # dependency into six files of C++ we had to hand-rewrite.
+          #
+          # The two dispatch_apply loop rewrites in order.cpp/code_dedup.cpp
+          # are also reverted. They were correct, brace-matched and did
+          # compile, but they only ever existed to work around the stub.
+          # A pristine ld64 is worth more than a preserved workaround when
+          # the next layer is what we are debugging.
+          echo "=== ld64 sources are untouched (no dispatch rewrite applied) ==="
+          grep -c 'dispatch_apply' ld64/src/ld/passes/order.cpp ld64/src/ld/passes/code_dedup.cpp \
+            ld64/src/ld/InputFiles.cpp ld64/src/ld/Resolver.cpp ld64/src/ld/OutputFile.cpp \
+            ld64/src/ld/libcodedirectory.c || true
+          set +e
+          # No --with-libdispatch=no: libdispatch is now genuinely present
+          # (see the provisioning block above), so configure's own
+          # AC_CHECK_LIB([dispatch],[dispatch_once]) must succeed on its
+          # merits. If it does not, that is a real result and we want it.
+          # LDFLAGS/LIBRARY_PATH already cover /usr/local/lib for the
+          # source-build fallback.
           ./configure --prefix="$RUNNER_TEMP/cross" --target=x86_64-linux-gnu \
-                      --enable-static --disable-shared --with-libdispatch=no \
+                      --enable-static --disable-shared \
                       > /tmp/conf.log 2>&1
           rc=$?
           set -e
           echo "configure exit status: $rc"
           tail -40 /tmp/conf.log
+          echo "=== did configure actually find libdispatch? ==="
+          grep -nE 'dispatch_once|libdispatch|libblocksruntime|BlocksRuntime' /tmp/conf.log | tail -12 || echo "(no dispatch lines)"
+          grep -q 'checking for dispatch_once in -ldispatch... yes' /tmp/conf.log \
+            && echo "CONFIGURE: libdispatch found (-ldispatch yes)" \
+            || echo "CONFIGURE: libdispatch NOT confirmed in -ldispatch"
           if [ "$rc" != 0 ]; then
             echo "=== configure FAILED; last 60 lines ==="
             tail -60 /tmp/conf.log
@@ -371,6 +388,22 @@ jobs:
             tail -30 /tmp/inst.log
           fi
           ls -la "$RUNNER_TEMP/cross/bin" || true
+          echo "=== did the four previously-failing dispatch TUs compile? ==="
+          # This is the real proof that libdispatch is genuine rather than a
+          # stub: these four files are the ones that failed in runs
+          # 40372391857 / 40373894611 / 40373938349 with block-literal and
+          # unknown-type errors, and none of them were edited.
+          for obj in InputFiles Resolver OutputFile libcodedirectory; do
+            found=$(find ld64 -name "$obj.o" -o -name "$obj.lo" 2>/dev/null | head -1)
+            if [ -n "$found" ] && [ -s "$found" ]; then
+              echo "  $obj: COMPILED ($found)"
+            else
+              echo "  $obj: NOT COMPILED -- libdispatch may still not be real"
+              for e in InputFiles Resolver OutputFile libcodedirectory; do
+                grep -nE "^${e}\.(cpp|c):[0-9]+:[0-9]+: error:" /tmp/make.log | head -5 || true
+              done
+            fi
+          done
           echo "=== did we get what the build actually needs? ==="
           test -x "$RUNNER_TEMP/cross/bin/ld64" && echo "ld64: OK" || echo "ld64: MISSING"
           test -x "$RUNNER_TEMP/cross/bin/nm"   && echo "nm:   OK" || echo "nm:   MISSING"
