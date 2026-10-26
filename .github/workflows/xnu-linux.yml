@@ -2273,13 +2273,14 @@ jobs:
           {
             echo '#!/bin/bash'
             echo '# Strip Darwin-only "-arch <value>"; pass "-target <value>" through.'
-            echo 'args=(); dropped=""'
+            echo 'args=(); dropped=""; narch=0'
             echo 'while [ $# -gt 0 ]; do'
             echo '  case "$1" in'
-            echo '    -arch) dropped="$dropped $1 $2"; shift 2 ;;'
+            echo '    -arch) dropped="$dropped $1 $2"; narch=$((narch+1)); shift 2 ;;'
             echo '    *)     args+=("$1"); shift ;;'
             echo '  esac'
             echo 'done'
+            echo 'echo "MIGCC SHIM: stripped $narch -arch pair(s):${dropped:- (none)} | argc now ${#args[@]}" >&2'
             echo 'if [ ! -f "${MIGCC_SHIM_MARK:-/tmp/.migcc_mark}" ]; then'
             echo '  { echo "MIGCC SHIM first invocation"'
             echo '    echo "  DROPPED:$dropped"'
@@ -2386,6 +2387,21 @@ jobs:
             fi
             if grep -q "__MIGCOM_REAL__" "$MIGSHIM"; then
               echo "::error::shim still contains the __MIGCOM_REAL__ placeholder"
+            fi
+            # RE-POINT cross/libexec/migcom. It was symlinked earlier, when
+            # cross/bin/migcom was still the source-built binary; line 2345
+            # then `mv`d that aside and line 2379 recreated cross/bin/migcom
+            # as the FILTER. A symlink to a moved file is DANGLING, and
+            # mig.sh:68 resolves migcomPath to exactly this path. That is the
+            # whole cause of
+            #     cross/bin/mig: line 183: cross/bin/migcom: No such file or directory
+            # in run 40401122633. Recreate it now, after both moves.
+            mkdir -p "$RUNNER_TEMP/cross/libexec"
+            ln -sfn "$MIGSHIM" "$RUNNER_TEMP/cross/libexec/migcom"
+            if [ -x "$RUNNER_TEMP/cross/libexec/migcom" ]; then
+              echo "  INSTALL: cross/libexec/migcom -> cross/bin/migcom (mig.sh:68 default) OK"
+            else
+              echo "::error::cross/libexec/migcom still not executable -- mig.sh will not find migcom"
             fi
             echo "  INSTALL: migcom in place at cross/bin/migcom (drop-flags + hoist-subsystem shim)"
             echo "  INSTALL: raw binary at cross/bin/migcom-debian"
@@ -3064,7 +3080,9 @@ jobs:
             HOST_BISON=bison HOST_FLEX=flex HOST_GM4=m4
             MIG="$RUNNER_TEMP/cross/bin/mig"
             MIGCOM="$RUNNER_TEMP/cross/bin/migcom"
+            MIGCC="$RUNNER_TEMP/cross/bin/migcc-shim"
             IIG="$RUNNER_TEMP/cross/bin/iig"
+
             LIPO=lipo STRIP=strip AR=ar RANLIB=ranlib NM=nm OTOOL=otool
             LIBTOOL=libtool DSYMUTIL=true NMEDIT=true UNIFDEF=unifdef GIT=git
             HOST_CODESIGN=true HOST_CODESIGN_ALLOCATE=true
@@ -3075,6 +3093,38 @@ jobs:
             TIGHTBEAMC=tightbeamc-not-supported
             LDFLAGS_EXTRA="-L$RUNNER_TEMP -l:copyfile.o -L$RUNNER_TEMP/cross/lib -lmacho -lstuff -luuid"
           )
+
+          # --- the three values the MIG rule will actually see ------------
+          # Measured, not assumed. mig.sh (Apple, bootstrap_cmds) resolves:
+          #     mig.sh:66  scriptPath = realpath $0        -> cross/bin/mig
+          #     mig.sh:68  migcomPath = ../libexec/migcom  -> cross/libexec/migcom
+          #     mig.sh:84  M=${MIGCOM-${migcomPath}}       <-- ENV VAR wins
+          #     mig.sh:74  if [ -z "${MIGCC}" ]            <-- ENV VAR wins
+          # Passing MIGCOM/MIGCC as make variables is NOT enough: mig.sh is
+          # run as a bare `$(MIG)` by the makefile, so it only sees the
+          # environment. Run 40401122633 proved that by dying with
+          #     cross/bin/mig: line 183: cross/bin/migcom: No such file or directory
+          # because migcomPath resolved to cross/libexec/migcom, which we
+          # never populate (we install to cross/bin/).
+          export MIG MIGCOM MIGCC
+          echo '=== STAGE 6 ENV: the MIG trio, before make ==='
+          for v in MIG MIGCOM MIGCC; do
+            eval "p=\$$v"
+            if [ -z "$p" ]; then
+              echo "  $v = <UNSET>  <-- FAIL"
+            elif [ ! -e "$p" ]; then
+              echo "  $v = $p  <-- DOES NOT EXIST"
+            elif [ ! -x "$p" ]; then
+              echo "  $v = $p  <-- NOT EXECUTABLE"
+            else
+              echo "  $v = $p  [exists, +x]"
+            fi
+          done
+          echo "  MIG -version: $("$MIG" -version 2>&1 | head -3 | tr '\n' ' ')"
+          echo "  MIGCOM -version: $("$MIGCOM" -version 2>&1 | head -3 | tr '\n' ' ')"
+          echo "  MIGCOM via libexec (what mig.sh would use without the env var):"
+          echo "    $RUNNER_TEMP/cross/libexec/migcom -> $(readlink -f "$RUNNER_TEMP/cross/libexec/migcom" 2>/dev/null || echo '(absent)')"
+          echo '=== END STAGE 6 ENV ==='
 
           echo '===================== installhdrs ====================='
           # `-k` keeps going so we see every independent failure, but the exit

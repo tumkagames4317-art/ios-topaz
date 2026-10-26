@@ -57,18 +57,35 @@ real="__MIGCOM_REAL__"
 
 args=()
 dropped=""
+n_dropped=0
 while [ $# -gt 0 ]; do
   case "$1" in
     -novouchers|-mach_msg2|-split)
-      dropped="$dropped $1"; shift ;;
+      dropped="$dropped $1"; n_dropped=$((n_dropped+1)); shift ;;
     -maxonstack|-max_descrs|-max_reply_descrs)
-      dropped="$dropped $1 $2"; shift 2 ;;
+      dropped="$dropped $1 $2"; n_dropped=$((n_dropped+1)); shift 2 ;;
     *)
       args+=("$1"); shift ;;
   esac
 done
 
-[ -n "$dropped" ] && echo "migcom-shim: dropped:$dropped" >&2
+# Print the COUNT as well as the names. A bare name list cannot be told apart
+# from a shim that never ran; a count plus the argument vector migcom will
+# actually receive can be. Stage 6 needs this: run 40401122633 showed MIGFLAGS
+# carrying -novouchers into the real build, and we need to see it removed here
+# rather than infer it from the absence of a fatal later.
+echo "migcom-shim: dropped $n_dropped Apple-only switch(es):${dropped:- (none)}" >&2
+# NOTE: print ${args[@]}, NOT "$@". The while/shift loop above drains $#  to
+# zero, so "$#" here is always 0 and "$@" always empty -- a first version of
+# this diagnostic printed "(none)" even though migcom received
+# `-header out.h -user out.c`. Another instrument that would have lied.
+if [ "${#args[@]}" -gt 0 ]; then
+  printf 'migcom-shim: migcom argv (%d after drop):' "${#args[@]}" >&2
+  printf ' %s' "${args[@]}" >&2
+  printf '\n' >&2
+else
+  echo "migcom-shim: migcom argv (0 after drop): (none)" >&2
+fi
 
 inp=$(mktemp)
 real_out=$(mktemp)
