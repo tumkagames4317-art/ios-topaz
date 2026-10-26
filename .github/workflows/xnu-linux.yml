@@ -1577,6 +1577,50 @@ jobs:
           # into a bare `y -d ...` (that is what run 40359414251 hit).
           # HOST_OS_VERSION was also empty, producing -mmacosx-version-min=
           # with no value.
+          # kextsymboltool needs symbols that only cctools provides:
+          #   NXGetLocalArchInfo            libmacho/arch.c
+          #   swap_mach_header_64,          libstuff/bytesex.c
+          #   swap_segment_command_64,
+          #   swap_uuid_command, swap_nlist(_64), ...
+          #   uuid_generate                 libutil
+          # Ubuntu lacks the first two entirely, and both libraries are
+          # noinst_LTLIBRARIES, so `make install` never installs them:
+          #   undefined reference to `NXGetLocalArchInfo'
+          #   undefined reference to `swap_mach_header_64'
+          #   undefined reference to `uuid_generate'
+          # (run 40377291091). Stage 1's build tree still has them, so link
+          # straight against it. Prefer the .a, fall back to .la, and report
+          # a missing archive loudly rather than letting the link fail
+          # cryptically later.
+          CT_ROOT="$GITHUB_WORKSPACE/cctools-port/cctools"
+          CT_ARCHIVES=""
+          CT_LIBS=""
+          for lib in macho stuff; do
+            stage="$CT_ROOT/lib$lib/.libs/lib$lib.a"
+            if [ -f "$stage" ]; then
+              mkdir -p "$RUNNER_TEMP/cross/lib"
+              cp -f "$stage" "$RUNNER_TEMP/cross/lib/"
+              CT_ARCHIVES="$RUNNER_TEMP/cross/lib"
+              CT_LIBS="$CT_LIBS -l$lib"
+              echo "cctools archive: lib$lib.a (staged)"
+            else
+              echo "::warning::lib$lib.a not found at $stage"
+            fi
+          done
+          CT_LIBS="$CT_LIBS -luuid"
+          echo "cctools link dir: ${CT_ARCHIVES:-<none>}  libs: $CT_LIBS"
+          ls -la "$CT_ARCHIVES" 2>/dev/null || true
+          # Prove the two decisive symbols are actually present.
+          for sym in NXGetLocalArchInfo swap_mach_header_64; do
+            if [ -n "$CT_ARCHIVES" ] && \
+               /usr/bin/nm -g --defined-only "$CT_ARCHIVES"/lib*.a 2>/dev/null \
+                 | grep -qw "$sym"; then
+              echo "  $sym: FOUND"
+            else
+              echo "::error::cctools archive does not define $sym"
+            fi
+          done
+
           make_flags=(
             SDKROOT=macosx HOST_SDKROOT=macosx
             HOST_OS_VERSION=13.3
@@ -1597,8 +1641,8 @@ jobs:
             # self-contained override authoritative.
             HOST_CC="clang -isystem $CCTOOLS_FOREIGN_INCLUDE -include /usr/local/include/compat.h -I$GITHUB_WORKSPACE/cctools-port/cctools/include"
             HOST_CXX="clang++ -isystem $CCTOOLS_FOREIGN_INCLUDE -include /usr/local/include/compat.h -I$GITHUB_WORKSPACE/cctools-port/cctools/include"
-            HOST_LDFLAGS="-L/usr/local/lib -lbsdcompat"
-            LDFLAGS="-L/usr/local/lib -lbsdcompat"
+            HOST_LDFLAGS="-L/usr/local/lib -lbsdcompat -L$CT_ARCHIVES $CT_LIBS"
+            LDFLAGS="-L/usr/local/lib -lbsdcompat -L$CT_ARCHIVES $CT_LIBS"
             HOST_BISON=bison HOST_FLEX=flex HOST_GM4=m4
             MIG="$RUNNER_TEMP/cross/bin/mig"
             MIGCOM="$RUNNER_TEMP/cross/bin/migcom"
