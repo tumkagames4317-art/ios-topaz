@@ -76,7 +76,8 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
+def build(seed=None, qemu=False, highmem=False, native=False, midmem=False,
+          ufs_addr=None):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     phys_base, mem_size = ((MID_PHYS_BASE, MID_MEM_SIZE) if midmem else
                            (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE))
@@ -208,10 +209,14 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
     ])
 
     # bsd/dev/sweet_ufs.c: the UFS host ABL leaves running (absolute physical reg).
+    # On QEMU virt the controller is `-device ufs` on a PCI BAR, so the address
+    # is not the phone's 0x04804000: it is whatever firmware (edk2) assigned to
+    # BAR0, read back from ECAM. That is passed in with --ufs-addr.
+    ufs_pa = ufs_addr if ufs_addr is not None else UFS
     ufs = node('sweet-ufs', [
         ph(),
         ('compatible', cstr('qcom,ufshc')),
-        ('reg', u64(UFS, UFS_SIZE)),
+        ('reg', u64(ufs_pa, UFS_SIZE)),
     ])
 
     # pmap_compute_max_asids requires the node even when no overrides are set.
@@ -252,12 +257,23 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product +
+        ([] if (qemu and ufs_addr is None) else [ufs]))
+
+
+def _arg_value(flag, default=None):
+    """--flag=VALUE, used by the QEMU-only options that are not plain switches."""
+    for i, tok in enumerate(sys.argv):
+        if tok.startswith(flag + '='):
+            return tok.split('=', 1)[1]
+    return default
 
 
 if __name__ == '__main__':
+    ufs_arg = _arg_value('--ufs-addr')
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv,
-                 native='--native' in sys.argv, midmem='--midmem' in sys.argv)
+                 native='--native' in sys.argv, midmem='--midmem' in sys.argv,
+                 ufs_addr=int(ufs_arg, 0) if ufs_arg else None)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

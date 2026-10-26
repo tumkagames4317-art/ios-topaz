@@ -68,6 +68,48 @@ The kernel is waiting for an `IOMedia`. Give it one: build a ramdisk-backed
 root (patch 0021/0024 mockfs virtual ramdisk IO already exist) and present it
 through the boot payload, then re-run `qrun.py` and read the screen again.
 
+## 17:35 MSK 2026-10-26 -- the root filesystem, and why QEMU cannot have one today
+
+After the deviceTreeP fix the only thing between the console and launchd is
+the root device. `IOFindBSDRoot` ends at
+
+    Waiting on (dict ... kIOProviderClass ... kIOMediaClass ... Apple HFS ...)
+
+and nothing will ever answer: `FILESYS_BASE` has no IOStorageFamily, so SWEET
+has no IOMedia objects at all. `0022` only stops the *assert* about that.
+
+The one supported root is the phone's UFS:
+
+    sweet_ufs.c  -- polled UFSHCI 2.1 driver, finds a GPT partition by name
+                    (boot-arg `ufsroot=`, default "userdata"), exposes it as
+                    `ufsroot0`, and `rd=ufsroot0` makes it the root.
+
+`sweet_ufs.c` needs a `/sweet-ufs` device-tree node with the controller's
+`reg`. `tools/mkadt.py:255` deliberately omits that node when built with
+`--qemu` ("QEMU virt has none"), which is why the driver never even prints
+its "no /sweet-ufs node" line in the QEMU harness. Adding the node is a
+one-line change; emulating UFSHCI inside QEMU is not.
+
+So a desktop in QEMU needs, in order:
+
+1. a UFSHCI (or any block) emulator in QEMU -- none exists upstream and
+   QEMU cannot be rebuilt here without the SDK;
+2. an HFS+ iOS root, which means `tools/mkiosroot.sh`;
+3. `mkiosroot.sh` needs Linux or macOS with `apfs-fuse`, `hfsprogs` and
+   root -- it is bash and mounts with `mount -t hfsplus -o loop`.
+
+Step 2/3 is the part that can be solved on this machine: `ipsw` (blacktop)
+builds for Windows and can unpack an IPSW, and an HFS+ image can be written
+without Linux. WSL1 is enabled now but needs a reboot, and
+`VirtualMachinePlatform` was already enabled while `HypervisorPresent` reads
+False, so WSL2/FUSE is not available until the BIOS exposes SVM.
+
+Progress this round: `ipsw` v3.1.739 unpacked at `work/tools/bin/ipsw.exe`
+and the iPhone X 16.7.16 (20H392) IPSW download started. WSL1 feature enabled
+(reboot pending). CI run 40340015671 dispatched with `platform=ginkgo`
+(the push-triggered 40337882651 would have built topaz, since `platform`
+defaults to `topaz`).
+
 ## 11:45 MSK 2026-10-26 -- arm_vm_init is passed; the blocker was one assert
 
 ### The breakthrough

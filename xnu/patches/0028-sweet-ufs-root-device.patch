@@ -41,7 +41,7 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_ufs.c
-@@ -0,0 +1,536 @@
+@@ -0,0 +1,551 @@
 +/*
 + * SWEET internal UFS root device (read-only).
 + *
@@ -311,9 +311,25 @@ new file mode 100644
 +		printf("SWEET UFS: host not ready (hce 0x%x hcs 0x%x)\n", hce, hcs);
 +		return ENXIO;
 +	}
++	/*
++	 * ABL hands over with an empty doorbell, but an emulated host does not:
++	 * QEMU's ufs device leaves UTRLDBR non-zero until the driver clears it.
++	 * Refusing here made `rd=ufsroot0` panic with "UFS root unavailable" on
++	 * the QEMU virt board while everything else about the handover was fine.
++	 * Clear the doorbell instead -- the requests it names belong to a
++	 * bootloader that is gone either way, and the list this driver installs
++	 * below replaces the one they referred to.
++	 */
 +	if (ufs_rd(REG_UTRLDBR)) {
-+		printf("SWEET UFS: requests outstanding from the bootloader\n");
-+		return EBUSY;
++		printf("SWEET UFS: clearing %u request(s) left by the bootloader\n",
++		    ufs_rd(REG_UTRLDBR));
++		ufs_wr(REG_UTRLDBR, ufs_rd(REG_UTRLDBR));
++		ufs_wr(REG_UTRLCLR, 0xffffffff);
++		if (ufs_rd(REG_UTRLDBR)) {
++			printf("SWEET UFS: the host will not clear its request doorbell (0x%x)\n",
++			    ufs_rd(REG_UTRLDBR));
++			return EBUSY;
++		}
 +	}
 +	ufs_wr(REG_IE, 0);                      /* polled operation */
 +	ufs_wr(REG_IS, ufs_rd(REG_IS));
