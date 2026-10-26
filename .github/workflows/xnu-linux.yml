@@ -2446,8 +2446,25 @@ jobs:
                   # it as `sh ./configure`. The exit status is threaded out
                   # explicitly because a `| tail` pipeline would otherwise
                   # report tail's status, not make's.
+                  # The JOB environment carries the XNU cross toolchain: an
+                  # Apple-flavoured `ld` (cctools-port) is on PATH, and the
+                  # xcodeshim sets -F/System/Library/Frameworks. Measured in
+                  # run 40409305588:
+                  #   configure: C compiler cannot create executables
+                  #   ld: unknown option: -plugin
+                  #   ld: warning: directory not found ... -F/System/...
+                  # So `cc` is NOT the host compiler here. Build migcom with
+                  # the platform compiler pinned explicitly, and with PATH cut
+                  # down to system dirs so no shim linker can be picked up.
+                  HOSTCC=/usr/bin/gcc
+                  command -v "$HOSTCC" >/dev/null 2>&1 || HOSTCC=/usr/bin/cc
+                  echo "  host compiler: $HOSTCC ($("$HOSTCC" --version 2>&1 | head -1))"
                   set +e
                   ( cd "$MIGTOP" || exit 1
+                    export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+                    export CC="$HOSTCC" LD=/usr/bin/ld AR=/usr/bin/ar RANLIB=/usr/bin/ranlib
+                    export CFLAGS="-O1 -w" LDFLAGS=""
+                    unset CPATH C_INCLUDE_PATH LIBRARY_PATH FAKE_PLATFORMS 2>/dev/null || true
                     [ -f Makefile ] || { echo "  running configure"; sh ./configure 2>&1 | tail -25; }
                     make -j"$(nproc)" migcom 2>&1 | tail -45
                     exit "${PIPESTATUS[0]}"
