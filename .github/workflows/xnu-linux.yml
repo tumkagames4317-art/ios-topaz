@@ -2490,15 +2490,17 @@ jobs:
                  -D__MACH30__ -DMACH_KERNEL_PRIVATE -DKERNEL_USER=1 $KSW $GINCS "$@" \
                  -user "$wd/$gbase.c" -header "$wd/$gbase.h" \
                  -server /dev/null -sheader /dev/null \
-                 "$gdefs" 2>"$wd/mig.err"
-            # CAPTURE THE NUMERIC EXIT CODE. The previous `if mig ...; then`
-            # form discarded it: run 40396010350 reported "MIG EXIT: nonzero"
-            # with an EMPTY message, because migcom produced no text matching
-            # the error filter -- and we could not say whether it exited 1, 2,
-            # or died from a signal. A status we cannot see is the same defect
-            # as a message we truncate: it manufactures a row that reads like
-            # data without being a verdict.
-            mig_rc=$?
+                 "$gdefs" 2>"$wd/mig.err" || mig_rc=$?
+            # CAPTURE THE NUMERIC EXIT CODE without tripping `set -e`.
+            # The old `if mig ...; then` form discarded the status, so run
+            # 40396010350 reported "MIG EXIT: nonzero" with an EMPTY message
+            # and we could not say whether it was 1, 2, or a signal. Running
+            # mig as a BARE command then made `set -e` abort the whole step on
+            # any nonzero exit (run 40397229850 died at the first lockd call
+            # with no diagnostics at all) because these steps run under
+            # `set -e`. `|| mig_rc=$?` satisfies both: the command is not the
+            # last of a list so `set -e` does not fire, and the status is kept.
+            mig_rc=${mig_rc:-0}
             echo "  MIG EXIT: $mig_rc"
             # Print the lines that MATTER, not the first N. Run 40394250479
             # lost a whole cycle because head -3 returned three "overriding
