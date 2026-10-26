@@ -3055,6 +3055,18 @@ jobs:
           done
           echo "  UNIFDEF=unifdef is passed on the make line: $(command -v unifdef || echo 'BUT NOT INSTALLED')"
 
+          # These three must be REAL environment variables, not just entries in
+          # the make_flags array below. Inside `make_flags=( ... )` each
+          # `MIG=/path` is a string element handed to make on the command line;
+          # it never assigns a shell variable and never reaches mig.sh's
+          # environment. Assign and export them HERE, before the array, so
+          # mig.sh:74 `[ -z "${MIGCC}" ]` and mig.sh:84 `M=${MIGCOM-...}` both
+          # take our values. Run 40401667613 measured all three as <UNSET>.
+          MIG="$RUNNER_TEMP/cross/bin/mig"
+          MIGCOM="$RUNNER_TEMP/cross/bin/migcom"
+          MIGCC="$RUNNER_TEMP/cross/bin/migcc-shim"
+          export MIG MIGCOM MIGCC
+
           make_flags=(
             SDKROOT=macosx HOST_SDKROOT=macosx
             HOST_OS_VERSION=13.3
@@ -3106,7 +3118,6 @@ jobs:
           #     cross/bin/mig: line 183: cross/bin/migcom: No such file or directory
           # because migcomPath resolved to cross/libexec/migcom, which we
           # never populate (we install to cross/bin/).
-          export MIG MIGCOM MIGCC
           echo '=== STAGE 6 ENV: the MIG trio, before make ==='
           for v in MIG MIGCOM MIGCC; do
             eval "p=\$$v"
