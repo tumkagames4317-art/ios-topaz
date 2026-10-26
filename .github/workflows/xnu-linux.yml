@@ -2486,10 +2486,20 @@ jobs:
                     # with the include absent even though CFLAGS carried it.
                     # So pass the include on the MAKE command line, which
                     # overrides the builtin rule's recipe variables.
+                    # The .symc.symo suffix rule uses TARGET_CC /
+                    # TARGET_CPPFLAGS / TARGET_CFLAGS, NOT CC / CPPFLAGS /
+                    # CFLAGS. Makefile.am:29-30:
+                    #     .symc.symo:
+                    #         $(TARGET_CC) -S $(TARGET_CPPFLAGS) $(TARGET_CFLAGS) \
+                    #             -ffreestanding -x c -o $@ $<
+                    # That is exactly the hardcoded-looking line measured in
+                    # runs 40410234795 and 40410664860, where CFLAGS on the
+                    # make command line demonstrably had no effect.
                     make -j"$(nproc)" migcom \
-                      CC="$HOSTCC" \
-                      CFLAGS="-O1 -w -I$XNUMACH" \
-                      CPPFLAGS="-I$XNUMACH" 2>&1 | tail -45
+                      CC="$HOSTCC" CFLAGS="-O1 -w" \
+                      TARGET_CC="$HOSTCC" \
+                      TARGET_CPPFLAGS="-I$XNUMACH" \
+                      TARGET_CFLAGS="-O1 -w" 2>&1 | tail -45
                     exit "${PIPESTATUS[0]}"
                   )
                   MIGMAKE_RC=$?
