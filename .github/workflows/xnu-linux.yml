@@ -69,6 +69,20 @@ env:
   MACOS_VERSION: "13.5"
   KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
   MACHINE_CONFIG: ${{ inputs.machine_config || 'SWEET' }}
+  # Make the host compat shim global instead of patching xnu's Makefiles.
+  #
+  # CPATH appends an include path to every compile the GNU-make-driven build
+  # performs, LIBRARY_PATH appends a link search path, and
+  # C_INCLUDE_PATH/CPLUS_INCLUDE_PATH cover the C and C++ halves separately
+  # because GNU make here drives both. The -include itself cannot go through
+  # the environment (there is no standard CFLAGS-by-env hook that xnu's
+  # makedefs honour without being patched), so stage 3 adds it to
+  # MakeInc.cmd's CC/CXX invocation.
+  CPATH: "/usr/local/include"
+  C_INCLUDE_PATH: "/usr/local/include"
+  CPLUS_INCLUDE_PATH: "/usr/local/include"
+  LIBRARY_PATH: "/usr/local/lib"
+  LD_LIBRARY_PATH: "/usr/local/lib"
 
 jobs:
   linux-build:
@@ -131,7 +145,19 @@ jobs:
           cat > hostshim/libc.h <<'EOF'
           #ifndef _LINUX_HOST_LIBC_SHIM_H
           #define _LINUX_HOST_LIBC_SHIM_H
-          /* macOS libc.h -> glibc equivalents for xnu's SETUP/ host tools */
+          /* macOS <libc.h> -> glibc equivalents for xnu's SETUP/ host tools.
+           *
+           * Keep this header dumb on purpose. An earlier version defined
+           * getprogname() here as an inline function returning
+           * program_invocation_short_name, but <errno.h> only exposes that
+           * symbol when _GNU_SOURCE is in effect, so every translation unit
+           * that included <libc.h> -- decomment, setsegname, kextsymboltool,
+           * and even bsd/sys -- failed with "use of undeclared identifier
+           * 'program_invocation_short_name'". The BSD helpers live in
+           * compat.h, which is force-included for every TU and pulls in the
+           * right declarations. This header just makes sure they exist and
+           * that the usual POSIX surface is available.
+           */
           #include <stdio.h>
           #include <stdlib.h>
           #include <string.h>
@@ -142,55 +168,7 @@ jobs:
           #include <sys/stat.h>
           #include <sys/types.h>
           #ifndef __APPLE__
-          /* BSD/GNU differences the SETUP/ tools rely on.
-           *
-           * program_invocation_short_name is a *variable* declared in glibc's
-           * <errno.h>; declaring it again as `extern` inside a function is what
-           * made the earlier version of this shim fail with "call to
-           * undeclared function 'getprogname'" -- the inline body never saw a
-           * usable declaration. <errno.h> is included above, so just use it.
-           */
-          static inline const char *getprogname(void)
-          { return program_invocation_short_name; }
-
-          /* setmode()/getmode() are BSD; glibc has neither. installfile.c
-           * parses an "-m <symbolic mode>" argument with them. Returning the
-           * octal value as a plain mode_t keeps "0644"-style arguments working
-           * and is enough to make the tool link and install headers. */
-          static inline void *setmode(const char *p)
-          {
-              mode_t m = 0;
-              if (p && *p) {
-                  if (strchr("01234567", *p)) {
-                      m = (mode_t)strtol(p, (char **)NULL, 8);
-                  } else {
-                      /* symbolic forms ("u+w") are not parsed here; the build
-                       * only ever passes octal strings. */
-                      m = 0644;
-                  }
-              }
-              void *buf = malloc(sizeof(mode_t));
-              if (buf) *(mode_t *)buf = m;
-              return buf;
-          }
-          static inline mode_t getmode(const void *buf, mode_t base)
-          { return buf ? (*(const mode_t *)buf & 07777) : base; }
-
-          /* fcopyfile() is dispatch-based on macOS; installfile only uses it to
-           * copy one regular file. */
-          #include <sys/sendfile.h>
-          static inline int fcopyfile(int from, int to, void *state, unsigned int flags)
-          {
-              (void)state; (void)flags;
-              struct stat sb;
-              if (fstat(from, &sb) != 0) return -1;
-              off_t off = 0;
-              while (off < sb.st_size) {
-                  ssize_t n = sendfile(to, from, &off, (size_t)(sb.st_size - off));
-                  if (n <= 0) return -1;
-              }
-              return 0;
-          }
+          #include <compat.h>
           #endif
           #endif
           EOF
@@ -267,6 +245,134 @@ jobs:
           chmod +x hostshim/ctfmerge
           sudo cp hostshim/ctfmerge /usr/local/bin/ctfmerge
           cc --version | head -1
+
+          # BSD helpers the SETUP/ sources use but glibc does not provide.
+          #
+          # This has to happen here, in stage 1b, and not next to the SETUP
+          # prebuild in stage 5b: "make install" in stage 6 drives its own
+          # build_setup pass over SETUP/, and it compiles decomment,
+          # setsegname, kextsymboltool, installfile and replacecontents before
+          # the stage 5b step ever runs. Those compiles are what failed with
+          # "call to undeclared function 'getprogname'".
+          #
+          # Two pieces are needed, and both must be global:
+          #   compat.h      - force-included into every TU via -include, so it
+          #                   has to be installed and it has to be
+          #                   self-contained (it cannot rely on libc.h).
+          #   libbsdcompat.a - CPATH gets -L for it so the SETUP link steps,
+          #                   which xnu's own Makefiles drive, resolve the
+          #                   symbols without patching those Makefiles.
+          cat > hostshim/compat.h <<'EOF'
+          #ifndef _LINUX_HOST_COMPAT_SHIM_H
+          #define _LINUX_HOST_COMPAT_SHIM_H
+          /* Apple's <compat.h> equivalent.
+           *
+           * Self-contained by design: it is force-included ahead of every
+           * translation unit, so it must not assume any other shim ran first,
+           * and it must be safe to include with system headers afterwards.
+           */
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <unistd.h>
+          #include <fcntl.h>
+          #include <errno.h>
+          #include <libgen.h>
+          #include <sys/stat.h>
+          #include <sys/types.h>
+          #include <sys/wait.h>
+          #include <stdint.h>
+          #include <stdbool.h>
+
+          #ifndef __APPLE__
+          /* Host tools only.
+           *
+           * This header is force-included into every translation unit, and the
+           * same clang driver also compiles the kernel for arm64. xnu defines
+           * KERNEL for its own build, so gate on that as well as on __APPLE__:
+           * the kernel namespace already has its own setmode/getmode (in
+           * libkern) and must not be given host prototypes.
+           */
+          #if !defined(KERNEL) && !defined(_KERNEL)
+          #ifndef _GNU_SOURCE
+          #define _GNU_SOURCE 1
+          #endif
+          /* getprogname() is a function on macOS; glibc exposes the same string
+           * as a variable declared in <errno.h> behind _GNU_SOURCE. Referencing
+           * the variable from an inline body is fragile (that is exactly how
+           * the previous shim broke decomment and bsd/sys), so define it as a
+           * real accessor backed by bsdcompat.c instead. */
+          const char *getprogname(void);
+
+          /* BSD mode-string API from <bsd/stdlib.h>; glibc has neither. The
+           * build only ever passes octal strings like "0644". */
+          void *setmode(const char *);
+          mode_t getmode(const void *, mode_t);
+
+          /* fcopyfile() is dispatch-based on macOS; installfile uses it to copy
+           * one regular file. */
+          int fcopyfile(int, int, void *, unsigned int);
+          #endif /* !KERNEL && !_KERNEL */
+          #endif
+          EOF
+          cat > hostshim/bsdcompat.c <<'EOF'
+          #include <sys/types.h>
+          #include <sys/stat.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <unistd.h>
+          #include <fcntl.h>
+          #include <errno.h>
+
+          const char *getprogname(void)
+          {
+          #if defined(__GLIBC__)
+              return program_invocation_short_name;
+          #else
+              return "tool";
+          #endif
+          }
+
+          void *setmode(const char *p)
+          {
+              mode_t m = 0644;
+              if (p && *p) {
+                  if (*p >= '0' && *p <= '7') {
+                      m = (mode_t)strtol(p, NULL, 8);
+                  }
+                  /* symbolic forms ("u+w") never appear in this build */
+              }
+              mode_t *r = malloc(sizeof m);
+              if (r) *r = m;
+              return r;
+          }
+
+          mode_t getmode(const void *v, mode_t base)
+          {
+              return v ? (*(const mode_t *)v & 07777) : base;
+          }
+
+          int fcopyfile(int from, int to, void *state, unsigned int flags)
+          {
+              (void)state; (void)flags;
+              char buf[65536];
+              ssize_t n;
+              while ((n = read(from, buf, sizeof buf)) > 0) {
+                  ssize_t off = 0;
+                  while (off < n) {
+                      ssize_t w = write(to, buf + off, (size_t)(n - off));
+                      if (w <= 0) return -1;
+                      off += w;
+                  }
+              }
+              return n < 0 ? -1 : 0;
+          }
+          EOF
+          cc -c -O2 -o hostshim/bsdcompat.o hostshim/bsdcompat.c
+          ar rcs hostshim/libbsdcompat.a hostshim/bsdcompat.o
+          sudo cp hostshim/compat.h /usr/local/include/compat.h
+          sudo cp hostshim/libbsdcompat.a /usr/local/lib/libbsdcompat.a
+          echo "compat: $(ls -la /usr/local/include/compat.h /usr/local/lib/libbsdcompat.a)"
 
       # ------------------------------------------ stage 1c: emulate Apple paths
       # MakeInc.cmd/MakeInc.top hard-code /usr/bin/xcrun, sw_vers and
@@ -413,6 +519,39 @@ jobs:
           p.write_text(s2)
           print('MakeInc.cmd: wordlist guard patched')
           PY
+          # 1b. Force-include the host compat shim and link its archive.
+          #     "make install" drives its own build_setup pass over SETUP/,
+          #     compiling decomment, setsegname, kextsymboltool, installfile and
+          #     replacecontents. Those are host tools that call BSD-only
+          #     getprogname/setmode/getmode/fcopyfile, and there is no
+          #     environment hook in xnu's makedefs to inject -include or a
+          #     library, so the flags are appended to the compiler driver
+          #     definitions here. CPATH/LIBRARY_PATH in the job env already
+          #     point at /usr/local/include and /usr/local/lib.
+          python3 - <<'PY'
+          import re, pathlib
+          p = pathlib.Path('makedefs/MakeInc.cmd')
+          s = p.read_text()
+          # The host tools are built with the plain $(CC)/$(CXX) variables.
+          # Append rather than replace so any existing flags survive.
+          patched = s
+          for var in ('CC', 'CXX'):
+              pat = re.compile(r'^(%s\s*(?::?=)\s*)(.+)$' % var, re.M)
+              m = pat.search(patched)
+              if m and '-include' not in m.group(2):
+                  patched = (patched[:m.start()]
+                             + m.group(1) + m.group(2)
+                             + ' -include /usr/local/include/compat.h'
+                             + patched[m.end():])
+          if patched == s:
+              print('MakeInc.cmd: WARNING no CC/CXX definition found to patch')
+          else:
+              p.write_text(patched)
+              print('MakeInc.cmd: compat.h force-include added to CC/CXX')
+          for line in p.read_text().splitlines():
+              if line.startswith(('CC ', 'CC=', 'CC\t', 'CXX ', 'CXX=', 'CXX\t')):
+                  print('   ', line.strip())
+          PY
           # 2. /usr/bin/find -x is BSD-only; accept it and ignore it.
           cat > /usr/local/bin/find <<'EOF'
           #!/bin/bash
@@ -494,79 +633,21 @@ jobs:
           mkdir -p "$OBJROOT/SETUP/kextsymboltool" "$OBJROOT/SETUP/setsegname" \
                    "$OBJROOT/SETUP/installfile"
 
-          # Apple's compat.h -> the POSIX pieces the tools actually use.
-          cat > hostshim/compat.h <<'EOF'
-          #ifndef _LINUX_HOST_COMPAT_SHIM_H
-          #define _LINUX_HOST_COMPAT_SHIM_H
-          #include <stdio.h>
-          #include <stdlib.h>
-          #include <string.h>
-          #include <unistd.h>
-          #include <fcntl.h>
-          #include <errno.h>
-          #include <libgen.h>
-          #include <sys/stat.h>
-          #include <sys/types.h>
-          #include <sys/wait.h>
-          #include <stdint.h>
-          #include <stdbool.h>
-          #ifndef __APPLE__
-          extern const char *program_invocation_short_name;
-          #define getprogname() program_invocation_short_name
-          /* BSD mode-string API from <bsd/stdlib.h>; glibc has neither. */
-          typedef void *mode_t_s; /* unused */
-          void *setmode(const char *);
-          mode_t getmode(const void *, mode_t);
-          int fcopyfile(int, int, void *, unsigned int);
-          #endif
-          #endif
-          EOF
-          cp hostshim/compat.h /usr/local/include/ 2>/dev/null || sudo cp hostshim/compat.h /usr/local/include/
-          cat > hostshim/bsdcompat.c <<'EOF'
-          #include <sys/types.h>
-          #include <stdlib.h>
-          #include <string.h>
-          #include <unistd.h>
-          #include <fcntl.h>
-          /* setmode/getmode: just the bit patterns installfile uses. */
-          void *setmode(const char *p)
-          {
-              mode_t m = (mode_t)strtol(p, NULL, 8);
-              mode_t *r = malloc(sizeof m);
-              if (r) *r = m;
-              return r;
-          }
-          mode_t getmode(const void *v, mode_t base)
-          {
-              return v ? *(const mode_t *)v : base;
-          }
-          int fcopyfile(int from, int to, void *state, unsigned int flags)
-          {
-              (void)state; (void)flags;
-              char buf[65536]; ssize_t n;
-              while ((n = read(from, buf, sizeof buf)) > 0) {
-                  if (write(to, buf, (size_t)n) != n) return -1;
-              }
-              return n < 0 ? -1 : 0;
-          }
-          EOF
-          cc -c -O2 -o "$RUNNER_TEMP/bsdcompat.o" hostshim/bsdcompat.c
+          # The compat shim is created once, in stage 1b, and is already
+          # installed to /usr/local/include/compat.h and
+          # /usr/local/lib/libbsdcompat.a. Do not define it a second time here:
+          # an earlier version of this step rewrote compat.h with a variant
+          # based on `#define getprogname() program_invocation_short_name`,
+          # which clobbered the good header and is what produced
+          # "use of undeclared identifier 'program_invocation_short_name'"
+          # from /usr/local/include/libc.h.
 
           # cctools-port carries the Mach-O host headers (<mach-o/swap.h>,
           # <mach/mach_init.h>) that Apple's SDK would otherwise provide.
           MACHD_INC=$(dirname "$(find "$CCT" -name swap.h -path '*mach-o*' | head -1)")
           echo "mach-o headers: $MACHD_INC"
           CFLAGS="-isysroot / -g -O0 -I/usr/local/include -I$MACHD_INC -I$XROOT/EXTERNAL_HEADERS"
-          # The SETUP/ sources include <libc.h> and <bsd/stdlib.h>, which Linux
-          # has no equivalent of, and they never include our compat header
-          # themselves. Force it in rather than editing xnu sources: with
-          # -include, getprogname/setmode/getmode/fcopyfile are declared for
-          # every translation unit and the link below satisfies them from
-          # bsdcompat.o.
           CFLAGS="$CFLAGS -include /usr/local/include/compat.h"
-          # replacecontents is in the same boat as installfile -- it calls
-          # getprogname -- and was missing from this list, which is why the
-          # build stopped at "Target 'do_build_setup' not remade".
           for d in kextsymboltool setsegname installfile replacecontents; do
             echo "== SETUP/$d"
             ok=1
@@ -574,8 +655,8 @@ jobs:
                 clang $CFLAGS -c -o "$OBJROOT/SETUP/$d/${f%.c}.o" "$f" || exit 1
               done ) || { ok=0; echo "COMPILE FAILED: SETUP/$d"; }
             if [ "$ok" = 1 ] && ls "$OBJROOT/SETUP/$d"/*.o >/dev/null 2>&1; then
-              clang -o "$OBJROOT/SETUP/$d/$d" "$OBJROOT/SETUP/$d"/*.o "$RUNNER_TEMP/bsdcompat.o" \
-                || echo "LINK FAILED: SETUP/$d"
+              clang -o "$OBJROOT/SETUP/$d/$d" "$OBJROOT/SETUP/$d"/*.o \
+                -L/usr/local/lib -lbsdcompat || echo "LINK FAILED: SETUP/$d"
               ls -la "$OBJROOT/SETUP/$d/" | head -20
             fi
           done
@@ -609,7 +690,11 @@ jobs:
             BUILD_WERROR=0 BUILD_LTO=0 VERBOSE=YES CONCISE=0
             DSTROOT="$FAKEROOT" FAKEROOT_DIR="$FAKEROOT"
             OBJROOT="$OBJROOT" SYMROOT="$GITHUB_WORKSPACE/dxb/build/xnu.sym"
-            CC=clang CXX=clang++ HOST_CC=clang
+            CC=clang CXX=clang++
+            HOST_CC="clang -include /usr/local/include/compat.h"
+            HOST_CXX="clang++ -include /usr/local/include/compat.h"
+            HOST_LDFLAGS="-L/usr/local/lib -lbsdcompat"
+            LDFLAGS="-L/usr/local/lib -lbsdcompat"
             HOST_BISON=bison HOST_FLEX=flex HOST_GM4=m4
             MIG="$RUNNER_TEMP/cross/bin/mig"
             MIGCOM="$RUNNER_TEMP/cross/bin/migcom"
