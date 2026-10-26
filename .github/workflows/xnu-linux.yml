@@ -2528,6 +2528,24 @@ jobs:
             # The wrapper itself handles -arch (clang accepts it once a Darwin
             # --target is set); this shim only removes what clang rejects even
             # with that target.
+            # Force-include the substitute for Apple clang's kalloc_type
+            # signature builtins. Upstream LLVM has no
+            # __builtin_xnu_type_summary/_signature/_types_compatible, and
+            # kalloc.h uses them unguarded, so every kalloc_type() call site
+            # fails to parse (see shim/xnu-kalloc-compat.h for the full
+            # account and the encoding argument). Injected here rather than
+            # via CFLAGS so it reaches every compile -- kernel objects,
+            # host tools and the C++ TUs -- without depending on how any
+            # individual makefile builds its flag list. The header is a
+            # no-op under compilers that do implement the builtins.
+            # EMITTED into the shim (we are inside `{ ... } > "$cc_shim"`; a
+            # bare `if` here would run in the generator rather than be
+            # written out). The header path is baked in literally so the shim
+            # needs no exported variables of its own.
+            echo 'XNU_KALLOC_COMPAT_H="${GITHUB_WORKSPACE:-$PWD}/shim/xnu-kalloc-compat.h"'
+            echo 'if [ -f "$XNU_KALLOC_COMPAT_H" ]; then'
+            echo '  args=(-include "$XNU_KALLOC_COMPAT_H" "${args[@]}")'
+            echo 'fi'
             echo 'if [ -x /usr/local/bin/xtool-clang ]; then'
             echo '  exec /usr/local/bin/xtool-clang "${args[@]}"'
             echo 'fi'
@@ -3598,6 +3616,24 @@ jobs:
             # The wrapper itself handles -arch (clang accepts it once a Darwin
             # --target is set); this shim only removes what clang rejects even
             # with that target.
+            # Force-include the substitute for Apple clang's kalloc_type
+            # signature builtins. Upstream LLVM has no
+            # __builtin_xnu_type_summary/_signature/_types_compatible, and
+            # kalloc.h uses them unguarded, so every kalloc_type() call site
+            # fails to parse (see shim/xnu-kalloc-compat.h for the full
+            # account and the encoding argument). Injected here rather than
+            # via CFLAGS so it reaches every compile -- kernel objects,
+            # host tools and the C++ TUs -- without depending on how any
+            # individual makefile builds its flag list. The header is a
+            # no-op under compilers that do implement the builtins.
+            # EMITTED into the shim (we are inside `{ ... } > "$cc_shim"`; a
+            # bare `if` here would run in the generator rather than be
+            # written out). The header path is baked in literally so the shim
+            # needs no exported variables of its own.
+            echo 'XNU_KALLOC_COMPAT_H="${GITHUB_WORKSPACE:-$PWD}/shim/xnu-kalloc-compat.h"'
+            echo 'if [ -f "$XNU_KALLOC_COMPAT_H" ]; then'
+            echo '  args=(-include "$XNU_KALLOC_COMPAT_H" "${args[@]}")'
+            echo 'fi'
             echo 'if [ -x /usr/local/bin/xtool-clang ]; then'
             echo '  exec /usr/local/bin/xtool-clang "${args[@]}"'
             echo 'fi'
