@@ -2326,6 +2326,20 @@ jobs:
           fi
           export MIGCC="$SHIM"
 
+          # Capture the exact byte stream migcom is handed, once per target.
+          # The duplicate-type question has been argued from indirect evidence
+          # twice and drew a wrong answer both times (the include-guard typo
+          # theory, which was wrong -- the guard is spelled consistently and
+          # does work -- and a "same file:line x2" that proved to be the
+          # provenance dump's own off-by-one). Instead of inferring a third
+          # time, this run records what migcom actually receives and uploads
+          # it. The capture is off by default inside the shim, so this is the
+          # only place it is switched on.
+          export MIGCOM_SHIM_DUMP="$GITHUB_WORKSPACE/migcom-streams"
+          rm -rf "$MIGCOM_SHIM_DUMP"
+          mkdir -p "$MIGCOM_SHIM_DUMP"
+          echo "MIGCOM_SHIM_DUMP=$MIGCOM_SHIM_DUMP (capturing migcom stdin per target)"
+
           # --- __LP64__ PROBE -------------------------------------------------
           # machine_types.defs uses `#if defined(__LP64__)` in SIX places to
           # pick 64-bit vs 32-bit spellings of uintptr_t/intptr_t, register_t,
@@ -3248,6 +3262,7 @@ jobs:
           path: |
             hdrs.log
             build.log
+            migcom-streams/
           if-no-files-found: warn
           retention-days: 7
 

@@ -384,4 +384,35 @@ if ! grep -qE '^[[:blank:]]*type[[:blank:]]+mach_msg_type_number_t' "$hoisted"; 
   echo "migcom-shim: injected type mach_msg_type_number_t = MACH_MSG_TYPE_INTEGER_32 (Apple built-in; primitive, no .defs needed)" >&2
 fi
 
+# --- (6) optional capture of the exact stream migcom receives -------------
+# Off unless MIGCOM_SHIM_DUMP points at a directory. This exists because the
+# duplicate-type question has now been argued from indirect evidence twice and
+# indirect evidence produced a wrong answer both times -- first the include
+# guard typo theory, which was wrong (the guard is spelled consistently and
+# works), then a bogus "same file:line x2" that was the provenance dump's own
+# off-by-one. With this on, the next run hands us the literal text, so the
+# question becomes a lookup rather than an inference.
+#
+# Capture is attributable two ways: the filename comes from the -header or
+# -sheader argument, and argv is written into the first line of the stream.
+if [ -n "${MIGCOM_SHIM_DUMP:-}" ]; then
+  mkdir -p "$MIGCOM_SHIM_DUMP" 2>/dev/null || true
+  dump_name="unknown"
+  prev=""
+  for a in "${args[@]}"; do
+    case "$prev" in
+      -header|-sheader|-user|-server|-iheader) dump_name="$(basename "$a")" ;;
+    esac
+    prev="$a"
+  done
+  dump_path="$MIGCOM_SHIM_DUMP/${dump_name}.stream"
+  {
+    printf '# argv:'
+    printf ' %s' "${args[@]}"
+    printf '\n'
+    cat "$hoisted"
+  } > "$dump_path" 2>/dev/null || true
+  echo "migcom-shim: dumped migcom stream to $dump_path" >&2
+fi
+
 exec "$real" "${args[@]}" < "$hoisted"
