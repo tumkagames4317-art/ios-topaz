@@ -157,7 +157,23 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive timeout 480 apt-get install -y --no-install-recommends $APT_OPTS \
             build-essential libssl-dev libbz2-dev liblzma-dev zlib1g-dev libncurses-dev \
             uuid-dev libcap-dev bison flex libblocksruntime-dev \
+            libc++abi-dev \
             libedit-dev libelf-dev python3 jq cmake ccache || true
+          # libc++abi-dev is separate from the runtime package: Ubuntu ships
+          # libc++abi.so.1 always, but the unversioned libc++abi.so that
+          # `-lc++abi` needs only comes with the -dev package. kextsymboltool
+          # references __cxa_demangle, which is a libc++abi symbol -- NOT a
+          # libstdc++ one, so linking with clang++ or -lstdc++ does not help.
+          # Verify the unversioned link exists and defines the symbol.
+          echo '=== libc++abi availability ==='
+          ls -la /usr/lib/x86_64-linux-gnu/libc++abi.so* 2>/dev/null || \
+            echo "no libc++abi.so in /usr/lib/x86_64-linux-gnu"
+          if nm -D /usr/lib/x86_64-linux-gnu/libc++abi.so 2>/dev/null \
+               | grep -q '__cxa_demangle'; then
+            echo "libc++abi.so: defines __cxa_demangle (good)"
+          else
+            echo "::warning::libc++abi.so missing or does not define __cxa_demangle"
+          fi
           for attempt in 1 2 3; do
             sudo DEBIAN_FRONTEND=noninteractive timeout 420 apt-get install -y --no-install-recommends $APT_OPTS \
               llvm-15 clang-15 lld-15 ninja-build && break
@@ -1828,6 +1844,35 @@ jobs:
                 SETUP_LIBS="$SETUP_LIBS -L$ct_lib $ct_flags -luuid"
               else
                 echo "::warning::no cctools archives; kextsymboltool will not link"
+              fi
+              # __cxa_demangle is a libc++abi symbol (NOT libstdc++, so
+              # clang++/-lstdc++ does not supply it). Link it when the
+              # unversioned library is present; kextsymboltool uses demangling
+              # only to print symbol names in mismatch diagnostics.
+              CXXABI_STUB=""
+              if [ -e /usr/lib/x86_64-linux-gnu/libc++abi.so ]; then
+                SETUP_LIBS="$SETUP_LIBS -lc++abi"
+                echo "  linking -lc++abi for __cxa_demangle"
+              else
+                # Last resort: a stub returning NULL. kextsymboltool then
+                # prints the mangled name instead of the demangled one, which
+                # is cosmetically worse and functionally identical.
+                echo "::warning::libc++abi.so absent; providing a __cxa_demangle stub"
+                cat > "$RUNNER_TEMP/cxa_stub.c" <<'CXAEOF'
+          /* Minimal stand-in for libc++abi's __cxa_demangle. Returns NULL so
+           * the caller falls back to printing the mangled name. */
+          #include <stddef.h>
+          char *__cxa_demangle(const char *mangled, char *buf, size_t *len,
+                               int *status)
+          {
+            (void)mangled; (void)buf; (void)len;
+            if (status) { *status = -2; }
+            return NULL;
+          }
+          CXAEOF
+                cc -c -o "$RUNNER_TEMP/cxa_stub.o" "$RUNNER_TEMP/cxa_stub.c"
+                CXXABI_STUB="$RUNNER_TEMP/cxa_stub.o"
+                SETUP_LIBS="$SETUP_LIBS $CXXABI_STUB"
               fi
               # Print the exact command so link order is observed, not assumed.
               echo "LINK CMD: clang -o $OBJROOT/SETUP/$d/$d $OBJROOT/SETUP/$d/*.o $SETUP_LIBS"
