@@ -1899,7 +1899,23 @@ jobs:
             # That is the same class of bug as the x86_64-linux-gnu-ar
             # shadowing fixed earlier. Pinning the compilers stops CMake
             # probing PATH at all; CMAKE_LINKER removes the error at its root.
-            cmake -S "$IIGSRC" -B "$IIGSRC/build" -DCMAKE_BUILD_TYPE=Release \
+            # CMAKE_LINKER is NOT enough. gcc/clang invoke the linker via
+            # collect2, which searches PATH for `ld` -- so Stage 1's ld64 in
+            # cross/bin still wins no matter what -DCMAKE_LINKER says. Run
+            # 40388443098 proved it: the pins were applied (the log shows
+            # /usr/bin/c++ running) and `ld: unknown option: -plugin` still
+            # appeared. The only reliable fix is to take cross/bin OFF PATH
+            # for this host build.
+            IIG_PATH=$(echo "$PATH" | tr ':' '\n' | grep -v "^${RUNNER_TEMP}/cross/bin$" | paste -sd:)
+            # Never leave PATH empty: if cross/bin were somehow the only
+            # entry, fall back to the canonical system path.
+            [ -n "$IIG_PATH" ] || IIG_PATH="/usr/local/bin:/usr/bin:/bin"
+            case ":$IIG_PATH:" in
+              *":${RUNNER_TEMP}/cross/bin:"*)
+                echo "::warning::cross/bin still on host build PATH";;
+            esac
+            echo "  host build PATH (cross/bin removed): $(echo "$IIG_PATH" | cut -d: -f1-3)"
+            PATH="$IIG_PATH" cmake -S "$IIGSRC" -B "$IIGSRC/build" -DCMAKE_BUILD_TYPE=Release \
               -DCMAKE_C_COMPILER=/usr/bin/cc \
               -DCMAKE_CXX_COMPILER=/usr/bin/c++ \
               -DCMAKE_LINKER=/usr/bin/ld \
@@ -1908,7 +1924,7 @@ jobs:
             cfg_rc=${PIPESTATUS[0]}
             echo "configure rc=$cfg_rc"
             echo "=== iig-tools build ==="
-            cmake --build "$IIGSRC/build" -j"$(nproc)" 2>&1 | tail -40
+            PATH="$IIG_PATH" cmake --build "$IIGSRC/build" -j"$(nproc)" 2>&1 | tail -40
             bld_rc=${PIPESTATUS[0]}
             echo "build rc=$bld_rc"
             if [ "$cfg_rc" -ne 0 ] || [ "$bld_rc" -ne 0 ] || [ ! -x "$IIGSRC/build/iig" ]; then
@@ -2079,6 +2095,7 @@ jobs:
             echo "::error::compat.h missing; Stage 1b must run before Stage 5"
             exit 1
           fi
+          MIGCOMPILE_BAD=""
           for f in error.c global.c handler.c header.c mig.c routine.c \
                    server.c statement.c string.c type.c user.c utils.c \
                    out/parser.c out/lexxer.c; do
@@ -2087,6 +2104,7 @@ jobs:
               -o "out/$(basename "${f%.c}").o" -c "$f" $INC \
               || {
                 echo "MIGCOM COMPILE FAILED: $f"
+                MIGCOMPILE_BAD="$MIGCOMPILE_BAD $f"
                 # -H prints every header actually opened, in order, with the
                 # path each resolved to. Without this we can only guess which
                 # header set is in play, which is precisely the error that
@@ -2096,7 +2114,10 @@ jobs:
                 clang -std=gnu89 -w -Dlinux -include /usr/local/include/compat.h \
                   -H -fsyntax-only "$f" $INC 2>&1 \
                   | grep -E '^\.+' | head -25 || true
-                exit 1
+                # DO NOT exit here. We no longer need this migcom: the
+                # Debian prebuilt one (mig-x86-64-gnu) replaces it below, and
+                # exiting here is what has blocked every downstream section
+                # for five consecutive runs. Record the failure and continue.
               }
           done
           clang -o out/migcom out/*.o -lm || echo "MIGCOM LINK FAILED"
@@ -2149,13 +2170,16 @@ jobs:
           # visible cause because `|| true` hid both the failure and its
           # message. Report the real verdict instead: migcom must exist and
           # answer -version.
-          echo "=== mig verdict ==="
-          if [ -x "$RUNNER_TEMP/cross/bin/migcom" ] && "$RUNNER_TEMP/cross/bin/migcom" -version; then
-            echo "migcom: OK"
+          echo "=== mig verdict (source-built, informational) ==="
+          echo "  source-built migcom files that failed to compile:${MIGCOMPILE_BAD:- none}"
+          if [ -x "$RUNNER_TEMP/cross/bin/migcom" ] && "$RUNNER_TEMP/cross/bin/migcom" -version 2>&1 | head -2; then
+            echo "  migcom(source-built): answers -version"
           else
-            echo "::error::migcom was not produced or failed its -version probe"
-            exit 1
+            echo "  migcom(source-built): unusable -- expected, Debian's replaces it below"
           fi
+          # No exit. The source-built migcom is superseded by the prebuilt
+          # Debian binary; aborting here is what blocked every downstream
+          # section for five runs.
 
           # ---------------------------------------------------------------
           # ACCEPTANCE TEST: one .defs file, end to end.
