@@ -1031,17 +1031,27 @@ jobs:
           # Ubuntu clang, forced to the Darwin arm64 target. Reached only via
           # xcrun -find clang -> this path (MakeInc.cmd:184). The heredoc is
           # QUOTED, so nothing here needs backslash escaping.
-          n=$#
           out=()
           while [ $# -gt 0 ]; do
             case "$1" in
-              -arch) out+=("$1" "$2"); shift 2 ;;
+              # MakeInc.def:270  ARCH_FLAGS_ARM64 = -arch $(ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG)
+              # and the value comes from EMBEDDED_DEVICE_MAP, e.g.
+              #     -arch armv8.2-a+crypto
+              # That is a GCC-style CPU string, not an Apple -arch name. Passing
+              # it through makes clang read it as -mcpu and reject it with
+              #     error: unknown target CPU 'armv8.2-a+crypto'
+              # whose "valid values" note is an X86 list -- 627 times in
+              # 40413177461. So -arch is CONSUMED here and replaced by one
+              # canonical target; the CPU/march detail is re-added below as a
+              # flag clang for this triple actually understands.
+              -arch) shift 2 ;;
+              -mcpu=*) out+=("$1"); shift ;;
               -mkernel|-msoft-float|-mno-soft-float|-fapple-kext) shift ;;
               -mmacosx-version-min=*|-miphoneos-version-min=*) shift ;;
               *) out+=("$1"); shift ;;
             esac
           done
-          exec /usr/bin/${_x} --target=aarch64-apple-darwin "${out[@]}"
+          exec /usr/bin/${_x} --target=aarch64-apple-darwin -march=armv8.2-a+crypto+crc "${out[@]}"
           XTEOF
             sudo chmod +x "/usr/local/bin/xtool-${_x}"
           done
@@ -3530,8 +3540,32 @@ jobs:
             echo 'exec /usr/bin/clang --target=aarch64-apple-darwin "${args[@]}"'
           } > "$CC_SHIM"
           chmod +x "$CC_SHIM"
-          export CC_SHIM
-          echo "  Stage 6 cc-shim: $CC_SHIM"
+          # The same shim, delegating to xtool-clang++ instead. The C++ half is
+          # not cosmetic: kernel .cpp files (iokit, and the C++ parts of bsd)
+          # are compiled by $(CXX), and 127 of 127 `unsupported option '-arch'`
+          # errors in run 40413177461 came from clang++ precisely because
+          # make_flags passed CXX=clang++ as a literal.
+          # One sed, both substitutions, no intermediate state. A chained
+          # `sed -i` after a redirect failed under this runner with
+          # "cannot rename ... Invalid cross-device link" and would have left
+          # the literal ${CXX_BIN} in the script -- an empty expansion at
+          # runtime, i.e. `exec --target=...` and no compiler at all.
+          CXX_SHIM="$RUNNER_TEMP/cross/bin/cxx-shim"
+          sed -e 's|xtool-clang |xtool-clang++ |' \
+              -e 's|^exec /usr/bin/clang |exec /usr/bin/clang++ |' \
+              "$CC_SHIM" > "$CXX_SHIM"
+          chmod +x "$CXX_SHIM"
+          export CC_SHIM CXX_SHIM
+          echo "  Stage 6 cc-shim:  $CC_SHIM"
+          echo "  Stage 6 cxx-shim: $CXX_SHIM"
+          grep -n 'exec' "$CXX_SHIM" | sed 's/^/    cxx-shim: /'
+          printf 'class P { public: int v; }; int probe(void){P p; p.v=0; return p.v;}\n' > "$RUNNER_TEMP/ccprobe.cpp"
+          if "$CXX_SHIM" -arch arm64e -mmacosx-version-min=13.3 -c \
+               "$RUNNER_TEMP/ccprobe.cpp" -o "$RUNNER_TEMP/ccprobe.o" 2>"$RUNNER_TEMP/cxx.err"; then
+            echo "  cxx-shim PROBE: C++ object built"
+          else
+            echo "::error::cxx-shim PROBE failed: $(head -2 "$RUNNER_TEMP/cxx.err" | tr '\n' ' ')"
+          fi
           # Two-sided probe: the Darwin flags must be gone AND a real compile
           # must still succeed, so a shim that strips too much cannot pass.
           printf 'int probe(void){return 0;}\n' > "$RUNNER_TEMP/ccprobe.c"
@@ -3550,7 +3584,15 @@ jobs:
             BUILD_WERROR=0 BUILD_LTO=0 VERBOSE=YES CONCISE=0
             DSTROOT="$FAKEROOT" FAKEROOT_DIR="$FAKEROOT"
             OBJROOT="$OBJROOT" SYMROOT="$GITHUB_WORKSPACE/dxb/build/xnu.sym"
-            CC="$CC_SHIM" CXX=clang++
+            # CXX used to be the literal `clang++`. Because that arrives on the
+            # make command line, $(origin CXX) is "command line", so
+            # MakeInc.cmd:186-188 -- which would have asked
+            # `xcrun -find clang++` and got the cross wrapper -- never ran.
+            # Measured in 40413177461: every single `unsupported option
+            # '-arch' for target 'x86_64-pc-linux-gnu'` came from clang++
+            # (127 of 127), none from clang, because CC went through the
+            # wrapper and CXX did not. CXX now goes through it too.
+            CC="$CC_SHIM" CXX="$CXX_SHIM"
             # Order matters. $CCTOOLS_FOREIGN_INCLUDE (machinc) must come
             # BEFORE cctools/include so that our self-contained
             # libkern/_OSByteOrder.h shadows the Apple original that includes
