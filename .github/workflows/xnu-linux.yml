@@ -2537,7 +2537,18 @@ jobs:
             # __APPLE_API_UNSTABLE, not the arch macros -- KERNEL_SERVER.
             # It also selects the SERVERPAIRS/IsaKernelServer branches that
             # decide which generated files migcom produces.
-            KSW="-DKERNEL=1 -DKERNEL_PRIVATE=1 -DKERNEL_SERVER=1 -D__APPLE_API_UNSTABLE=1 -DPRIVATE=1 -DARCH_arm64=1 -DARM64=1 -D_MACH_MACHINE_MACHNINE_TYPES_DEFS=1 -D_MACH_MACHINE_MACHINE_TYPES_DEFS=1"
+            KSW="-DKERNEL=1 -DKERNEL_PRIVATE=1 -DKERNEL_SERVER=1 -D__APPLE_API_UNSTABLE=1 -DPRIVATE=1 -DARCH_arm64=1 -DARM64=1"
+          # NOTE: -D_MACH_MACHINE_MACHNINE_TYPES_DEFS=1 was here and was
+          # REMOVED. It makes the #ifndef at machine_types.defs:36 false on the
+          # FIRST include, so the ENTIRE file body is skipped -- taking
+          # natural_t, integer_t, short, int, unsigned, float, double,
+          # uintptr_t, intptr_t, register_t and all vm_* types with it.
+          # std_types.defs:108-120 immediately reference natural_t, so migcom
+          # then aborted with a divide-by-zero on undefined types
+          # ('15759 Floating point exception'). It suppressed the duplicate
+          # declarations by suppressing the declarations. Duplicates are
+          # handled by the provenance dump below instead, which reports
+          # file:line so the real double include can be identified.
             # INCLUDE PATHS. A .defs is #include-ed by a driver of its own:
             #     lockd_mach.defs:30  #include <mach/std_types.defs>
             #     lockd_mach.defs:31  #include <mach/mach_types.defs>
@@ -3152,8 +3163,22 @@ jobs:
               echo "  $v = $p  [exists, +x]"
             fi
           done
-          echo "  MIG -version: $("$MIG" -version 2>&1 | head -3 | tr '\n' ' ')"
-          echo "  MIGCOM -version: $("$MIGCOM" -version 2>&1 | head -3 | tr '\n' ' ')"
+          # NOT `-version`. migcom reads .defs from STDIN and takes no
+          # positional path, so `-version` is consumed as INPUT, not as a flag:
+          # empty stdin -> yyparse finds no subsystem -> global.c:76 fatal.
+          # That check could never pass, so it printed a fatal on every run --
+          # a check that always fails is as much noise as one that cannot fail.
+          # Prove the pipeline instead: pipe a one-line subsystem through the
+          # real migcom and require exit 0. That exercises shim, stdin handling,
+          # and the binary itself, which `[ -x ]` does not.
+          _vc=$(printf 'subsystem\nKernelUser\nvprobe 1000;\n' | "$MIGCOM" -header /dev/null 2>&1)
+          _vrc=$?
+          if [ "$_vrc" = 0 ]; then
+            echo "  MIGCOM stdin pipeline: OK (subsystem parsed, exit 0)"
+          else
+            echo "  MIGCOM stdin pipeline: FAILED (exit $_vrc) -- first lines:"
+            echo "$_vc" | head -5 | sed 's/^/    /'
+          fi
           echo "  MIGCOM via libexec (what mig.sh would use without the env var):"
           echo "    $RUNNER_TEMP/cross/libexec/migcom -> $(readlink -f "$RUNNER_TEMP/cross/libexec/migcom" 2>/dev/null || echo '(absent)')"
           echo '=== END STAGE 6 ENV ==='
