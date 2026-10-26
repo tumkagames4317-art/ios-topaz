@@ -86,6 +86,10 @@ env:
   CPATH: "/usr/local/include"
   C_INCLUDE_PATH: "/usr/local/include"
   CPLUS_INCLUDE_PATH: "/usr/local/include"
+  # cctools-port keeps architecture/, machine/ and friends under include/foreign.
+  # <mach-o/swap.h> includes <architecture/byte_order.h>, which otherwise fails
+  # with "fatal error: 'architecture/byte_order.h' file not found".
+  CCTOOLS_FOREIGN_INCLUDE: "${{ github.workspace }}/cctools-port/cctools/include/foreign"
   LIBRARY_PATH: "/usr/local/lib"
   LD_LIBRARY_PATH: "/usr/local/lib"
 
@@ -746,9 +750,9 @@ jobs:
           MACHEOF
             echo "created minimal mach/ headers under $MACHD_INC"
           fi
-          CFLAGS="-isysroot / -g -O0 -I/usr/local/include -I$MACHD_INC -I$XROOT/EXTERNAL_HEADERS"
+          CFLAGS="-isysroot / -g -O0 -I/usr/local/include -I$MACHD_INC -I$CCTOOLS_FOREIGN_INCLUDE -I$XROOT/EXTERNAL_HEADERS"
           CFLAGS="$CFLAGS -include /usr/local/include/compat.h"
-          for d in kextsymboltool setsegname installfile replacecontents; do
+          for d in config kextsymboltool setsegname installfile replacecontents; do
             echo "== SETUP/$d"
             ok=1
             ( cd "$XROOT/SETUP/$d" && for f in *.c; do
@@ -791,8 +795,8 @@ jobs:
             DSTROOT="$FAKEROOT" FAKEROOT_DIR="$FAKEROOT"
             OBJROOT="$OBJROOT" SYMROOT="$GITHUB_WORKSPACE/dxb/build/xnu.sym"
             CC=clang CXX=clang++
-            HOST_CC="clang -include /usr/local/include/compat.h -I$GITHUB_WORKSPACE/cctools-port/cctools/include"
-            HOST_CXX="clang++ -include /usr/local/include/compat.h -I$GITHUB_WORKSPACE/cctools-port/cctools/include"
+            HOST_CC="clang -include /usr/local/include/compat.h -I$GITHUB_WORKSPACE/cctools-port/cctools/include -I$CCTOOLS_FOREIGN_INCLUDE"
+            HOST_CXX="clang++ -include /usr/local/include/compat.h -I$GITHUB_WORKSPACE/cctools-port/cctools/include -I$CCTOOLS_FOREIGN_INCLUDE"
             HOST_LDFLAGS="-L/usr/local/lib -lbsdcompat"
             LDFLAGS="-L/usr/local/lib -lbsdcompat"
             HOST_BISON=bison HOST_FLEX=flex HOST_GM4=m4
