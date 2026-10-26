@@ -1318,6 +1318,29 @@ jobs:
           p.write_text(s2)
           print('MakeInc.cmd: wordlist guard patched')
           PY
+          # 1a-bis. Darwin's /usr/bin/install takes -S (disable breakage of
+          # .SYMDEF symbols); GNU coreutils' install does not, and treats it
+          # as a FILE to install. MakeInc.def:983 is
+          #     DATA_INSTALL_FLAGS = -c -S -m 0644
+          # so libkern's version.h rule
+          #     version.h: version.h.template $(SRCROOT)/config/MasterVersion
+          #         $(_v)install $(DATA_INSTALL_FLAGS) $< $@
+          # becomes `install -c -S -m 0644 template version.h` and dies with
+          #     install: target 'version.h': No such file or directory
+          #     make[5]: *** [.../libkern/libkern/Makefile:121: version.h] Error 1
+          # (run 40385145640; reproduced locally, including the fact that GNU
+          # install parses -S as its source operand). Drop only the -S.
+          python3 - <<'PY'
+          import pathlib, re
+          p = pathlib.Path('makedefs/MakeInc.def')
+          s = p.read_text()
+          old = 'DATA_INSTALL_FLAGS = -c -S -m 0644'
+          new = 'DATA_INSTALL_FLAGS = -c -m 0644'
+          assert old in s, 'DATA_INSTALL_FLAGS line not found as expected'
+          assert s.count(old) == 1, 'expected exactly one DATA_INSTALL_FLAGS'
+          p.write_text(s.replace(old, new))
+          print('MakeInc.def: DATA_INSTALL_FLAGS -S removed (GNU install)')
+          PY
           # 1b. Force-include the host compat shim and link its archive.
           #     "make install" drives its own build_setup pass over SETUP/,
           #     compiling decomment, setsegname, kextsymboltool, installfile and
@@ -1830,6 +1853,71 @@ jobs:
           grep -nE 'itDeallocate|itLongForm|IsCamelot' handler.c | head -8 || true
           INC="$INC -DIsCamelot=0"
           echo "mig handler.c fixups: applied and verified"
+
+          # ---------------------------------------------------------------
+          # iig: the IOKit Interface Generator, for iokit/DriverKit.
+          #
+          # This is the one genuinely Apple-only piece left. MakeInc.cmd:199
+          # is
+          #     export IIG := $(shell $(XCRUN) -sdk $(SDKROOT) -find iig)
+          # and iig is a CLOSED-SOURCE tool shipped inside Xcode; it is not
+          # in any apple-oss-distributions repo. iokit/Makefile lists
+          # DriverKit in EXPINC_SUBDIRS, so the kernel build always runs it
+          # on 17 .iig files and fails with
+          #     IIG IOBufferMemoryDescriptor.h
+          #     make[5]: *** [.../iokit/DriverKit/Makefile:61:
+          #                  IOBufferMemoryDescriptor.h] Error 1
+          # (run 40385145640; 17 such errors).
+          #
+          # This is not optional tidying: iokit/IOKit/IOMemoryDescriptor.h:35
+          # includes <DriverKit/IOMemoryDescriptor.h> UNCONDITIONALLY, so the
+          # generated headers must exist before any IOKit code compiles.
+          #
+          # PureDarwin/iig-tools (BSD-3-Clause) is a clean-room reimplementation
+          # that takes Apple's exact CLI
+          #   iig --def X.iig --header X.h --impl X.iig.cpp --framework-name N
+          # and, per its own scope note, emits exactly what a KERNEL build
+          # needs. Build it and put it where cross/bin is already on PATH.
+          # If anything here fails the step says so loudly rather than letting
+          # Stage 6 die 17-times with no explanation.
+          IIGSRC="$RUNNER_TEMP/iig-tools"
+          rm -rf "$IIGSRC"
+          if git clone -q --depth 1 https://github.com/PureDarwin/iig-tools.git "$IIGSRC"; then
+            if cmake -S "$IIGSRC" -B "$IIGSRC/build" \
+                 -DCMAKE_BUILD_TYPE=Release >/dev/null 2>&1 \
+               && cmake --build "$IIGSRC/build" -j"$(nproc)" >/dev/null 2>&1 \
+               && [ -x "$IIGSRC/build/iig" ]; then
+              cp "$IIGSRC/build/iig" "$RUNNER_TEMP/cross/bin/iig"
+              chmod +x "$RUNNER_TEMP/cross/bin/iig"
+              echo "iig: built from PureDarwin/iig-tools"
+            else
+              echo "::error::iig-tools failed to build; DriverKit headers cannot be generated"
+              exit 1
+            fi
+          else
+            echo "::error::could not clone PureDarwin/iig-tools (iig is Apple-closed-source)"
+            exit 1
+          fi
+          # Prove it on the real thing before the kernel build depends on it:
+          # generate one DriverKit header exactly as iokit/DriverKit/Makefile
+          # does, and require a non-empty result.
+          iigprobe="$RUNNER_TEMP/iigprobe"
+          rm -rf "$iigprobe"; mkdir -p "$iigprobe"
+          if "$RUNNER_TEMP/cross/bin/iig" \
+               --def "$GITHUB_WORKSPACE/dxb/xnu/iokit/DriverKit/IOService.iig" \
+               --header "$iigprobe/IOService.h" \
+               --impl "$iigprobe/IOService.iig.cpp" \
+               --framework-name DriverKit -- ; then
+            if [ -s "$iigprobe/IOService.h" ] && [ -s "$iigprobe/IOService.iig.cpp" ]; then
+              echo "iig: probe OK ($(wc -l < "$iigprobe/IOService.h") header lines, $(wc -l < "$iigprobe/IOService.iig.cpp") impl lines)"
+            else
+              echo "::error::iig produced empty output for IOService.iig"
+              exit 1
+            fi
+          else
+            echo "::error::iig failed on iokit/DriverKit/IOService.iig"
+            exit 1
+          fi
 
           # ---------------------------------------------------------------
           # type.h / routine.h field additions.
@@ -2486,6 +2574,7 @@ jobs:
             HOST_BISON=bison HOST_FLEX=flex HOST_GM4=m4
             MIG="$RUNNER_TEMP/cross/bin/mig"
             MIGCOM="$RUNNER_TEMP/cross/bin/migcom"
+            IIG="$RUNNER_TEMP/cross/bin/iig"
             LIPO=lipo STRIP=strip AR=ar RANLIB=ranlib NM=nm OTOOL=otool
             LIBTOOL=libtool DSYMUTIL=true NMEDIT=true UNIFDEF=unifdef GIT=git
             HOST_CODESIGN=true HOST_CODESIGN_ALLOCATE=true
