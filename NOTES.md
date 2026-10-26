@@ -1,3 +1,76 @@
+## 10:45 MSK 2026-10-26 -- the first stop pinning is done; the tree is NOT the bug
+
+### Which assert it is, proved rather than guessed
+
+The screen line is unreliable at the last digit, so I disassembled the kernel and
+searched for every `ADRP+ADD` that materialises the `"arm_vm_init.c"` string,
+then looked at the immediate loaded into `w1` right beside it. At
+`0xfffffe0007ad64d4` the sequence is
+
+    adrp x0, fmt ; add x0, x0          ; x0 = "arm_vm_init.c"
+    adrp x2, .. ; add  x2, x2          ; x2 = expression text
+    movz w1, #1288                     ; __LINE__
+    bl   assert
+
+so `__LINE__ == 1288` in the *built* file. CI builds `xnu-8796.121.2`
+(`MACOS_VERSION: 13.5`), where the assert sits on source line 1287. Patch 0010
+adds exactly one line at hunk `@@ -41,6 +41,7 @@`, above 1287, so 1287 + 1 = 1288.
+The full arithmetic, over every hunk of every patch touching `arm_vm_init.c`,
+is reproduced by `tools/shift.py`:
+
+    0010  @@ -41,6   +41,7    delta +1     <- the only one above 1287
+    0010  @@ -2145,6 +2146,8  delta +2
+    0011  @@ -1813,6 +1813,18 delta +12
+    0012  @@ -1825,6 +1825,70 delta +64    (all of these are below 1287)
+
+`xnu-8796.121.2` source 1286..1287:
+
+    err = SecureDTLookupEntry(NULL, "chosen/memory-map", &memory_map);
+    assert(err == kSuccess);
+
+So the failing check is `chosen/memory-map` lookup. Not `pmap-max-asids`, not the
+CPU topology, not `TrustCache`. Those were all earlier and are now past.
+
+### What is *not* wrong (all verified in a halted guest)
+
+* `boot_args.deviceTreeP = 0xb24c8000`, `deviceTreeLength = 0x1b60` - correct.
+* The ADT copied into RAM at PA `0xb24c8000` is byte-identical to the payload blob.
+* The ADT really contains `device-tree/chosen/memory-map`, reachable by walking the
+  node records the way `SecureDTLookupEntry` does.
+* `PE_state+0x98 = 0xb24c8000` (the same PA), so `PE_state` received the pointer.
+* Passing the *VA* `0xfffffe00084c8000` instead of the PA changes nothing; the same
+  assert fires.
+
+`tools/adtwalk.py` enumerates the tree; `tools/finddt.py` diffs the in-RAM copy
+against the payload; `tools/pepeek.py` reads `PE_state` after the halt.
+
+### What was fixed on the way (keep these)
+
+* `chosen/memory-map` was missing `TrustCache`, `EXTRADATA` and `kernel-only`.
+  `tools/mkadt.py` now emits all three. This is correct regardless of the bug
+  and matches what the real `d22ap.adt` carries.
+* The QEMU ADT must be generated with `--qemu`, otherwise `cpu0/reg` is `0x100`
+  (topaz gold MPIDR) while QEMU's boot CPU reports MPIDR 0, and
+  `ml_get_cpu_number` returns -1 which trips the topology assert. Use
+  `mkadt.py OUT.adt --qemu` for every QEMU payload.
+
+### Reading the screen without a serial port
+
+`tools/readscreen.py FBRAW` decodes the eight banner rows and the panic row using
+`build/fontmap.json`, which it also grows from the known banner strings each run.
+The digit templates are reliable when taken from the banners (cell 12 of each
+`SWEET EARLY N:` row); OCR of the *last* digit of a panic line is not, hence the
+disassembly route above.
+
+### Next concrete action
+
+`SecureDTLookupEntry` is returning an error even though the node exists and the
+pointer is right. The one remaining asymmetry with Apple hardware is that iBoot
+passes `deviceTreeP` as a *physical* address while our `shim/loader.c` passes a
+VA - and `qrun.py` passes a PA. Both were tried and both fail, so the difference
+is not the pointer. Next: break on `_SecureDTLookupEntry` (`0xfffffe0007a77b84`
+in art8) and dump its `x0`/`x1` on the failing call to see the actual path string
+and root, rather than assuming the path text.
 ## 10:05 MSK 2026-10-26 -- the early console finally prints its own panic
 
 ### What changed

@@ -120,7 +120,14 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
         ('effective-production-status-ap', u32(0)),
         ('certificate-security-mode', u32(1)),
         ('effective-security-mode-sep', u32(1)),
-    ], [node('memory-map', [ph()]),
+    ], [node('memory-map', [ph(),
+        # arm_vm_init looks these up unconditionally and asserts kSuccess.
+        # Both are <phys, size> pairs; an empty range is legal and simply
+        # means "no trust cache / no extra data" at this stage.
+        ('TrustCache', struct.pack('<QQ', 0, 0)),
+        ('EXTRADATA', struct.pack('<QQ', 0, 0)),
+        # The real D22AP tree marks the map kernel-only; LocalPolicy reads it.
+        ('kernel-only', b'true\0')]),
         # Local boot policy (kern_csr.c): SIP relaxed like `csrutil disable`
         # (lp-sip0: untrusted kexts, unrestricted FS, task_for_pid, kernel
         # debugger, dtrace, nvram), lp-sip1: unauthenticated (unsealed) root.
