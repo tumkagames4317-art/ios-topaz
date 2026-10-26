@@ -2584,8 +2584,13 @@ jobs:
             echo 'simpleroutine simple_factorial(port : mach_port_t; n : int64_t);'
           } > "$CTL/control.defs"
           echo "--- CONTROL: known-good fixture (expect 2 routines) ---"
+          # Hurd migcom reads the .defs from STDIN, exactly as mig.sh feeds
+          # it (mig.sh:183 pipes cpp output into "$M"). Passing the file as a
+          # trailing argument is what produced "bad argument: '<path>'" for
+          # every direct migcom call tonight -- including all three rows of
+          # the FLAGS probe I deleted, which is why they were uninterpretable.
           if "$RUNNER_TEMP/cross/bin/migcom" -user "$CTL/control.c" -header "$CTL/control.h" \
-               -server /dev/null -sheader /dev/null "$CTL/control.defs" 2>"$CTL/err"; then
+               -server /dev/null -sheader /dev/null < "$CTL/control.defs" 2>"$CTL/err"; then
             echo "  CONTROL MIG EXIT: 0"
             echo "  control.h: $(wc -l < "$CTL/control.h" 2>/dev/null || echo 0) lines"
             echo "  routines emitted: $(grep -cE '^kern_return_t[[:space:]]+[a-zA-Z_]+[[:space:]]*\(' "$CTL/control.h" 2>/dev/null || echo 0)"
