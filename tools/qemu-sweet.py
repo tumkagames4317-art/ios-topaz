@@ -22,7 +22,12 @@ An undecodable or blank screen returns 3 with --fail-on-panic.
 """
 import argparse, json, os, socket, struct, subprocess, sys, time, zlib
 
-FB_BASE, FB_W, FB_H = 0x9c000000, 1080, 2400
+# The framebuffer address is board specific: topaz puts it at 0x9c000000, the
+# Redmi Note 8 (ginkgo) at 0x5c000000 (cont_splash_region). QEMU's virt RAM
+# starts at 0x40000000, so both fall inside it once -m is large enough (the
+# size is computed from the payload's phys_base/mem_size, not hard-coded).
+FB_BASE = int(os.environ.get('SWEET_FB_BASE', '0x9c000000'), 0)
+FB_W, FB_H = 1080, 2400
 FB_STRIDE = FB_W * 4
 PAGE = 0x4000
 STUB_PA = 0x40200000	# above the dtb QEMU places at RAM base
@@ -181,7 +186,10 @@ def main():
     # virt RAM starts at 0x40000000: cover the payload's RAM (mkadt.py --highmem needs 8G).
     mem_size = struct.unpack_from('<Q', payload, 0x40)[0]
     ram_gib = max(4, -(-(phys_base + mem_size - 0x40000000) // (1 << 30)))
-    cmd = ['qemu-system-aarch64', '-M', 'virt,gic-version=3', '-cpu', a.cpu, '-smp', '1', '-m', f'{ram_gib}G',
+    # QEMU_BIN lets a Windows host point at the installer's directory, which is
+    # not on PATH for child processes started from a script.
+    cmd = [os.environ.get('QEMU_BIN', 'qemu-system-aarch64'),
+           '-M', 'virt,gic-version=3', '-cpu', a.cpu, '-smp', '1', '-m', f'{ram_gib}G',
            '-nographic', '-serial', f'file:{out}/serial.txt', '-qmp', f'unix:{mon},server,nowait',
            '-d', 'int,guest_errors,unimp', '-D', f'{out}/qemu.log', '-no-reboot',
            '-device', f'loader,file={out}/ram.bin,addr={phys_base:#x},force-raw=on',

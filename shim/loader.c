@@ -521,6 +521,21 @@ const char *loader_boot(uintptr_t dtb)
 	 */
 	con_str("WD", "arming core watchdog before handoff");
 	watchdog_start_secondary(SWEET_WDT_SECONDS);
+	/*
+	 * Diagnostic: paint a solid white band across the top of the panel
+	 * immediately before the jump and flush it past the caches.
+	 *
+	 * The panel shows the shim's own red log, so the framebuffer path works
+	 * from here. If this band is visible after the boot, the shim's writes
+	 * reached DRAM and survived the jump; if it is NOT visible, the jump
+	 * itself never happened and the problem is before xnu, not inside it.
+	 * Cheap to add and it removes the guesswork that has cost several boots.
+	 */
+	for (int y = 0; y < 64; y++)
+		for (int x = 0; x < FB_W; x++)
+			((volatile uint32_t *)FB_BASE)[y * FB_W + x] = 0xffffffffu;
+	dcache_clean(FB_BASE, (uintptr_t)FB_STRIDE * 64);
+	__asm__ volatile("dsb sy" ::: "memory");
 	ufslog_flush();
 	((xnu_entry_t)entry_pa)(ba_pa);
 #endif
