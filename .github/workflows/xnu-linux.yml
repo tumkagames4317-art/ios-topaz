@@ -940,6 +940,18 @@ jobs:
               -sdk)   sdk="$2"; shift 2 ;;
               -sdk=*) sdk="${1#-sdk=}"; shift ;;
               -verbose) shift ;;
+              # A bare `--` must never reach `exec`. `exec -- foo` is valid,
+              # but `exec` with `--` as the COMMAND fails with
+              #     exec: --: invalid option
+              # and that is exactly what happened in run 40400170421:
+              #     + /usr/bin/xcrun --sdk macosx -show-sdk-path
+              #     /usr/bin/xcrun: line 39: exec: --: invalid option
+              #     ##[error]Process completed with exit code 2.
+              # It hit three places -- the stage-1c probe and two patch
+              # scripts -- because any caller may pass `--` to stop option
+              # parsing. Dropping it is safe: it is purely a boundary marker,
+              # and the args after it are still collected in order.
+              --) shift ;;
               *) rest+=("$1"); shift ;;
             esac
           done
