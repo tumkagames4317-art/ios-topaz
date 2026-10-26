@@ -91,10 +91,17 @@ env:
   CPATH: "/usr/local/include"
   C_INCLUDE_PATH: "/usr/local/include"
   CPLUS_INCLUDE_PATH: "/usr/local/include"
-  # cctools-port keeps architecture/, machine/ and friends under include/foreign.
+  # cctools-port keeps architecture/, machine/ and libkern/ under include/foreign.
   # <mach-o/swap.h> includes <architecture/byte_order.h>, which otherwise fails
   # with "fatal error: 'architecture/byte_order.h' file not found".
-  CCTOOLS_FOREIGN_INCLUDE: "${{ github.workspace }}/cctools-port/cctools/include/foreign"
+  #
+  # Do NOT put include/foreign itself on the include path: it also holds
+  # Apple-flavoured strings.h, stdio.h, stdlib.h, unistd.h, fcntl.h and
+  # libc.h, and shadowing glibc with those breaks everything -- run
+  # 40370458060 failed with "static declaration of 'bcmp' follows
+  # non-static declaration" from foreign/strings.h. Stage 1c instead builds
+  # this directory, symlinking only the subdirectories Mach-O needs.
+  CCTOOLS_FOREIGN_INCLUDE: "${{ runner.temp }}/machinc"
   LIBRARY_PATH: "/usr/local/lib"
   LD_LIBRARY_PATH: "/usr/local/lib"
 
@@ -183,28 +190,33 @@ jobs:
           #     checking for dispatch_once in -ldispatch... no
           #     checking for dispatch_once in -lc... no
           #     Required library libdispatch not installed
-          # which is also why nothing downstream had Mach-O headers. ld64 and
-          # the binutils we need never call dispatch_*, so demote the check
-          # from fatal to a warning.
+          # which is also why nothing downstream had Mach-O headers.
+          #
+          # configure.ac reads:
+          #     AC_CHECK_LIB([c], [dispatch_once], [...], [
+          #         echo "Required library libdispatch not installed" >&2
+          #         exit 1
+          #     ])
+          # so rewriting the message alone is not enough: the `exit 1` on the
+          # very next line still runs. Run 40370900378 proved it -- configure
+          # printed the demoted message and still returned 1, with no error
+          # text for grep to find. Both lines have to go together.
           for f in configure configure.ac; do
             [ -f "$f" ] || continue
             cp "$f" "$f.orig"
-            sed -i \
-              -e 's/as_fn_error \$? "Required library libdispatch not installed" "\$LINENO" 5/echo "libdispatch not found, continuing"/' \
-              -e 's/Required library libdispatch not installed/libdispatch not found, continuing/' \
-              -e 's/AC_MSG_ERROR(\[Required library libdispatch not installed\])/AC_MSG_WARN([libdispatch not found, continuing])/' \
-              "$f"
-            if ! cmp -s "$f" "$f.orig"; then
-              echo "patched $f"
-            else
-              echo "WARNING: no libdispatch fatal check matched in $f"
-            fi
+            perl -0pi -e 's/(echo "Required library libdispatch not installed" >&2\s*\n)(\s*)exit 1/$1$2:  # demoted: libdispatch is not needed by ld64/g' "$f"
+            perl -0pi -e 's/AC_MSG_ERROR\(\[Required library libdispatch not installed\]\)/AC_MSG_WARN([libdispatch not found, continuing])/g' "$f"
+            echo "=== libdispatch context in $f ==="
+            grep -n -A2 'libdispatch not installed' "$f" | head -12 || echo "(message no longer present)"
+            echo "=== any remaining bare 'exit 1' near libdispatch? ==="
+            grep -n 'exit 1' "$f" | head -8 || true
           done
-          # Run configure without piping through tail: the exit status is what
-          # matters, and `| tail` hides it. Full log to a file, tail on success.
+          # --with-libdispatch=no is the documented opt-out; the rewrite above is
+          # the belt to that braces.
           set +e
           ./configure --prefix="$RUNNER_TEMP/cross" --target=x86_64-linux-gnu \
-                      --enable-static --disable-shared > /tmp/conf.log 2>&1
+                      --enable-static --disable-shared --with-libdispatch=no \
+                      > /tmp/conf.log 2>&1
           rc=$?
           set -e
           echo "configure exit status: $rc"
@@ -580,6 +592,31 @@ jobs:
           echo "$val"
           EOF
           sudo chmod +x /usr/sbin/sysctl
+          # <mach-o/swap.h> needs <architecture/byte_order.h>, which cctools
+          # keeps under include/foreign. Expose only the subdirectories the
+          # Mach-O headers actually pull in -- foreign/ itself also contains
+          # strings.h/stdio.h/unistd.h/fcntl.h/libc.h, and letting those
+          # shadow glibc breaks every translation unit.
+          rm -rf "$CCTOOLS_FOREIGN_INCLUDE"
+          mkdir -p "$CCTOOLS_FOREIGN_INCLUDE"
+          FOREIGN="$GITHUB_WORKSPACE/cctools-port/cctools/include/foreign"
+          for d in architecture libkern machine; do
+            if [ -d "$FOREIGN/$d" ]; then
+              ln -s "$FOREIGN/$d" "$CCTOOLS_FOREIGN_INCLUDE/$d"
+            else
+              echo "WARNING: $FOREIGN/$d missing"
+            fi
+          done
+          # Availability.h/TargetConditionals.h are pulled in by swap.h too;
+          # they are plain macro headers with no libc content.
+          for h in Availability.h AvailabilityMacros.h TargetConditionals.h; do
+            [ -f "$FOREIGN/$h" ] && ln -s "$FOREIGN/$h" "$CCTOOLS_FOREIGN_INCLUDE/$h"
+          done
+          if [ -f "$GITHUB_WORKSPACE/cctools-port/cctools/include/TargetConditionals.h" ]; then
+            ln -sf "$GITHUB_WORKSPACE/cctools-port/cctools/include/TargetConditionals.h" \
+              "$CCTOOLS_FOREIGN_INCLUDE/TargetConditionals.h"
+          fi
+          ls -la "$CCTOOLS_FOREIGN_INCLUDE"
           echo '--- probes ---'
           /usr/bin/xcrun --sdk macosx -show-sdk-path
           /usr/bin/xcrun --sdk macosx -find clang
