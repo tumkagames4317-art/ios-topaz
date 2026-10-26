@@ -2542,9 +2542,19 @@ jobs:
             # bare `if` here would run in the generator rather than be
             # written out). The header path is baked in literally so the shim
             # needs no exported variables of its own.
-            echo 'XNU_KALLOC_COMPAT_H="${GITHUB_WORKSPACE:-$PWD}/shim/xnu-kalloc-compat.h"'
+            # The header exists in the repo and the -f test is correct, yet
+            # 3042 'use of unknown builtin' errors in run 40415111711 prove
+            # it never reached the compiler. Silence is what hid that. So:
+            #  * bake an ABSOLUTE workspace path at generation time (a make
+            #    sub-shell's $PWD is the build dir, never the repo root);
+            #  * record which branch was taken, once, so the artifact says
+            #    so instead of leaving it to be inferred from an absence.
+            echo 'XNU_KALLOC_COMPAT_H="${GITHUB_WORKSPACE}/shim/xnu-kalloc-compat.h"'
             echo 'if [ -f "$XNU_KALLOC_COMPAT_H" ]; then'
             echo '  args=(-include "$XNU_KALLOC_COMPAT_H" "${args[@]}")'
+            echo '  _cs=/tmp/.kcompat_state; [ -f "$_cs" ] || echo "INCLUDED $XNU_KALLOC_COMPAT_H" > "$_cs"'
+            echo 'else'
+            echo '  _cs=/tmp/.kcompat_state; [ -f "$_cs" ] || echo "MISSING $XNU_KALLOC_COMPAT_H -- substitution DISABLED" > "$_cs"'
             echo 'fi'
             echo 'if [ -x /usr/local/bin/xtool-clang ]; then'
             echo '  exec /usr/local/bin/xtool-clang "${args[@]}"'
@@ -3630,9 +3640,19 @@ jobs:
             # bare `if` here would run in the generator rather than be
             # written out). The header path is baked in literally so the shim
             # needs no exported variables of its own.
-            echo 'XNU_KALLOC_COMPAT_H="${GITHUB_WORKSPACE:-$PWD}/shim/xnu-kalloc-compat.h"'
+            # The header exists in the repo and the -f test is correct, yet
+            # 3042 'use of unknown builtin' errors in run 40415111711 prove
+            # it never reached the compiler. Silence is what hid that. So:
+            #  * bake an ABSOLUTE workspace path at generation time (a make
+            #    sub-shell's $PWD is the build dir, never the repo root);
+            #  * record which branch was taken, once, so the artifact says
+            #    so instead of leaving it to be inferred from an absence.
+            echo 'XNU_KALLOC_COMPAT_H="${GITHUB_WORKSPACE}/shim/xnu-kalloc-compat.h"'
             echo 'if [ -f "$XNU_KALLOC_COMPAT_H" ]; then'
             echo '  args=(-include "$XNU_KALLOC_COMPAT_H" "${args[@]}")'
+            echo '  _cs=/tmp/.kcompat_state; [ -f "$_cs" ] || echo "INCLUDED $XNU_KALLOC_COMPAT_H" > "$_cs"'
+            echo 'else'
+            echo '  _cs=/tmp/.kcompat_state; [ -f "$_cs" ] || echo "MISSING $XNU_KALLOC_COMPAT_H -- substitution DISABLED" > "$_cs"'
             echo 'fi'
             echo 'if [ -x /usr/local/bin/xtool-clang ]; then'
             echo '  exec /usr/local/bin/xtool-clang "${args[@]}"'
@@ -3839,7 +3859,26 @@ jobs:
             _p="$RUNNER_TEMP/cross/bin/$_t"
             printf '  %-10s calls=%s\n' "$_t" "$(cat "${_p}.calls" 2>/dev/null || echo 0)"
           done
-          echo '  (a compiler absent from this list bypassed the wrapper)' 
+          echo '  (a compiler absent from this list bypassed the wrapper)'
+          # Did the kalloc builtin substitution actually reach the compiler?
+          # This is the whole question the run exists to answer: if it says
+          # MISSING, the 3042 unknown-builtin errors are a plumbing fault and
+          # the -D fallback is next. If it says INCLUDED and the errors are
+          # still there, the macro definitions are not winning against clang's
+          # builtin resolution and the -D route is mandatory.
+          if [ -f /tmp/.kcompat_state ]; then
+            echo '--- kalloc builtin substitution ---'
+            sed 's/^/  /' /tmp/.kcompat_state
+          else
+            echo '  ::warning::no kcompat state recorded -- cc-shim never ran a compile'
+          fi
+          # And prove the header itself defines what it claims, using the real
+          # preprocessor rather than reading it.
+          if [ -f "$GITHUB_WORKSPACE/shim/xnu-kalloc-compat.h" ]; then
+            printf 'KALLOC_TYPE_IS_DATA_ONLY_probe __builtin_xnu_type_summary(int)\n' > /tmp/kp.c
+            /usr/bin/clang -E -P -include "$GITHUB_WORKSPACE/shim/xnu-kalloc-compat.h" \
+              /tmp/kp.c 2>/dev/null | tail -3 | sed 's/^/  preprocessed: /' || true
+          fi 
           echo '--- first real error, in order ---' 
           # Widen beyond 'error:': the first real failures tonight were
           # "Error 127" (missing interpreter) and "No such file", neither of
