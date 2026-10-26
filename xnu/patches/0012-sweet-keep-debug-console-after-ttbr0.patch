@@ -88,7 +88,7 @@ diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
  void
  arm_vm_init(uint64_t memory_size, boot_args * args)
  {
-@@ -2153,20 +2179,29 @@
+@@ -2153,20 +2179,26 @@
  
  	arm_set_user_tbi();
  
@@ -112,32 +112,29 @@ diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
 +	sweet_early_mark(10, "TTBR0 off; TLB flushed");
  	kva_active = TRUE;
  	// global table pointers may need to be different due to physical aperture remapping
-+	sweet_early_mark(25, "about to phystokv(cpu_ttep)");
  	cpu_tte = (tt_entry_t*)(phystokv(cpu_ttep));
-+	sweet_early_mark(26, "cpu_tte rebound");
  	invalid_tte = (tt_entry_t*)(phystokv(invalid_ttep));
-+	sweet_early_mark(27, "invalid_tte rebound");
  
  	// From here on out, we're off the bootstrap translation tables.
  
-@@ -2259,7 +2293,9 @@
+@@ -2259,7 +2293,17 @@
      }
  #endif
  #endif
 +	sweet_early_mark(28, "calling pmap_bootstrap");
  	pmap_bootstrap(dynamic_memory_begin);
-+	sweet_early_mark(29, "pmap_bootstrap done");
++#if defined(SWEET)
++	/*
++	 * Stop drawing now. From here the kernel reworks the very tables the alias
++	 * lives in, and an early_putc that faults takes the interrupt stack with it
++	 * ("Invalid kernel stack pointer"). Progress past this point is read from
++	 * whether the machine survives, not from the screen.
++	 */
++	sweet_early_disable();
++#endif
  
  	disable_preemption();
  
-@@ -2310,6 +2346,7 @@
- 		va_l1 = va_l2_end;
- 		cpu_l1_tte++;
- 	}
-+	sweet_early_mark(30, "early I/O page tables ready");
- 
- #if defined(KERNEL_INTEGRITY_KTRR) || defined(KERNEL_INTEGRITY_CTRR)
- 	/*
 diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
 --- a/osfmk/arm64/sweet_early.c
 +++ b/osfmk/arm64/sweet_early.c
