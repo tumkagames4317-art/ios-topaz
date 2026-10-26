@@ -165,10 +165,12 @@ jobs:
       # is what the kernel link needs).
       - name: "Stage 1: build cctools-port (ld64 + Mach-O binutils)"
         id: cctools
-        continue-on-error: true
         run: |
           set -x
           git clone -q --depth 1 -b "$CCTOOLS_BRANCH" "$CCTOOLS_REPO" cctools-port
+          echo "=== layout after clone ==="
+          ls -la cctools-port | head -20
+          ls -la cctools-port/cctools/configure* 2>&1 | head -5
           cd cctools-port/cctools
           # cctools' configure hard-requires libdispatch, and Ubuntu ships no
           # such library (libblocksruntime is a different thing). Run
@@ -189,16 +191,32 @@ jobs:
               "$f"
             if ! cmp -s "$f" "$f.orig"; then
               echo "patched $f"
-              grep -n 'libdispatch' "$f" | head -6 || true
             else
               echo "WARNING: no libdispatch fatal check matched in $f"
-              grep -n 'libdispatch' "$f" | head -6 || true
             fi
           done
+          # Run configure without piping through tail: the exit status is what
+          # matters, and `| tail` hides it. Full log to a file, tail on success.
+          set +e
           ./configure --prefix="$RUNNER_TEMP/cross" --target=x86_64-linux-gnu \
-                      --enable-static --disable-shared 2>&1 | tail -30
-          make -j"$(nproc)" 2>&1 | tail -60
-          make install 2>&1 | tail -20
+                      --enable-static --disable-shared > /tmp/conf.log 2>&1
+          rc=$?
+          set -e
+          echo "configure exit status: $rc"
+          tail -40 /tmp/conf.log
+          if [ "$rc" != 0 ]; then
+            echo "=== configure FAILED; last 60 lines ==="
+            tail -60 /tmp/conf.log
+            echo "=== looking for the fatal line ==="
+            grep -nE 'error|cannot|not installed|No such' /tmp/conf.log | tail -20 || true
+            exit 1
+          fi
+          echo "=== did configure create a Makefile? ==="
+          ls -la Makefile 2>&1 | head -3
+          make -j"$(nproc)" > /tmp/make.log 2>&1 || { echo "MAKE FAILED"; tail -60 /tmp/make.log; }
+          tail -25 /tmp/make.log
+          make install > /tmp/inst.log 2>&1 || { echo "MAKE INSTALL FAILED"; tail -30 /tmp/inst.log; }
+          tail -10 /tmp/inst.log
           ls -la "$RUNNER_TEMP/cross/bin" || true
           echo "=== did we get what the build actually needs? ==="
           test -x "$RUNNER_TEMP/cross/bin/ld64" && echo "ld64: OK" || echo "ld64: MISSING"
