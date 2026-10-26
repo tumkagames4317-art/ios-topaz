@@ -201,7 +201,13 @@ fi
 # parameter list that follows it.
 n_sat=$(grep -cE '\b(ServerAuditToken|ServerSecToken)\b' "$real_out2" || true)
 if [ "${n_sat:-0}" -gt 0 ]; then
-  sed -i -E 's/^([[:space:]]*)(ServerAuditToken|ServerSecToken)([[:space:]])/\1in\3/' "$real_out2"
+  # Two shapes occur in the tree and matching only the first left
+  # vfs_nspace.defs still failing at :103/:113 in run 40403594483:
+  #   task_access.defs:50  ServerAuditToken<TAB>caller_cred : audit_token_t);
+  #   vfs_nspace.defs:104  ServerAuditToken atoken : audit_token_t
+  #                        );       <- no semicolon; the param ends at EOL
+  # The token may therefore be followed by whitespace OR by end of line.
+  sed -i -E 's/^([[:space:]]*)(ServerAuditToken|ServerSecToken)([[:space:]]|$)/\1in\3/' "$real_out2"
   echo "migcom-shim: rewrote $n_sat ServerAuditToken/ServerSecToken -> in (Apple-only direction; no server code generated)" >&2
 fi
 
