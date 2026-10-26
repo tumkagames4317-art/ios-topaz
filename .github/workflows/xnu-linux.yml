@@ -2505,6 +2505,32 @@ jobs:
           # rejects it outright ("mig: fatal: unknown flag: '-maxonstack'").
           # One named flag, one stated reason, per the no-blind-stripping rule.
           gen_and_compile lockd "$LOCKD_DEFS" lockd_mach
+          # CONTROL: a .defs that MUST emit routines. Without it, "0
+          # routines emitted" cannot distinguish "our invocation is broken"
+          # from "task.defs is gated". This is Debian mig's own passing
+          # fixture (tests/good/routine.defs), reduced to what it needs.
+          # Written with printf, not heredocs: a heredoc body at column 0
+          # terminates the YAML block scalar and breaks the workflow.
+          CTL="$ACCT/ctl"; mkdir -p "$CTL"
+          { echo 'type int64_t = MACH_MSG_TYPE_INTEGER_64;'
+            echo 'type int32_t = MACH_MSG_TYPE_INTEGER_32;'
+            echo 'type mach_port_t = MACH_MSG_TYPE_COPY_SEND;'
+          } > "$CTL/base_types.defs"
+          { echo 'subsystem myroutine 100;'
+            echo '#include "base_types.defs"'
+            echo 'routine factorial(port : mach_port_t; n : int64_t; out result : int64_t);'
+            echo 'simpleroutine simple_factorial(port : mach_port_t; n : int64_t);'
+          } > "$CTL/control.defs"
+          echo "--- CONTROL: known-good fixture (expect 2 routines) ---"
+          if "$RUNNER_TEMP/cross/bin/migcom" -user "$CTL/control.c" -header "$CTL/control.h" \
+               -server /dev/null -sheader /dev/null "$CTL/control.defs" 2>"$CTL/err"; then
+            echo "  CONTROL MIG EXIT: 0"
+            echo "  control.h: $(wc -l < "$CTL/control.h" 2>/dev/null || echo 0) lines"
+            echo "  routines emitted: $(grep -cE '^kern_return_t[[:space:]]+[a-zA-Z_]+[[:space:]]*\(' "$CTL/control.h" 2>/dev/null || echo 0)"
+            head -20 "$CTL/control.h" 2>/dev/null || true
+          else
+            echo "  CONTROL MIG EXIT: nonzero -- $(head -3 "$CTL/err" | tr '\n' ' ')"
+          fi
           gen_and_compile task "$GITHUB_WORKSPACE/dxb/xnu/osfmk/mach/task.defs" task
           echo "=== END ACCEPTANCE ==="
 
