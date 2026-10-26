@@ -1,7 +1,7 @@
 diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
 --- a/osfmk/arm64/arm_vm_init.c
 +++ b/osfmk/arm64/arm_vm_init.c
-@@ -1825,6 +1825,63 @@
+@@ -1825,6 +1825,74 @@
  #define ARM64_PHYSMAP_ALIGNMENT_PADDING (PTOV_TABLE_SIZE * ARM_TT_TWIG_SIZE)
  #endif
  
@@ -23,10 +23,21 @@ diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
 +static vm_map_address_t
 +sweet_early_fb_slot(void)
 +{
-+	vm_map_address_t end = gVirtBase & ~(vm_map_address_t)(ARM_TT_L2_SIZE - 1);
++	/*
++	 * gVirtBase is still zero at this point in arm_vm_init, so it cannot be
++	 * used as the window bound here. VM_MIN_KERNEL_ADDRESS is a compile-time
++	 * constant and is where __TEXT is linked, which is exactly the base the
++	 * bootstrap cpu_tte was built against.
++	 */
++	/*
++	 * __TEXT is linked at VM_MIN_KERNEL_ADDRESS and occupies the block
++	 * starting there, so the free hole is BELOW it, in the same L2 table.
++	 */
++	vm_map_address_t top = VM_MIN_KERNEL_ADDRESS & ~(vm_map_address_t)(ARM_TT_L2_SIZE - 1);
++	vm_map_address_t low = top - ARM_TT_L1_SIZE;
 +
-+	for (vm_map_address_t va = end - ARM_TT_L2_SIZE;
-+	    va >= (gVirtBase - ARM_TT_L1_SIZE); va -= ARM_TT_L2_SIZE) {
++	for (vm_map_address_t va = top - ARM_TT_L2_SIZE; va >= low;
++	    va -= ARM_TT_L2_SIZE) {
 +		tt_entry_t l1 = cpu_tte[(va & ARM_TT_L1_INDEX_MASK) >> ARM_TT_L1_SHIFT];
 +		if ((l1 & (ARM_TTE_VALID | ARM_TTE_TYPE_MASK)) !=
 +		    (ARM_TTE_VALID | ARM_TTE_TYPE_TABLE)) {
