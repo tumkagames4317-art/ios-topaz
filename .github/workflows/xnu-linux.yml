@@ -998,6 +998,19 @@ jobs:
             -find)
               case "${rest[1]:-}" in
                 meson) echo /usr/bin/false ;;
+                # MakeInc.cmd:184 does  CC := $(shell xcrun -sdk ... -find clang)
+                # and then MakeInc.cmd compiles with
+                #     $(CC) $(CFLAGS) -arch $(CURRENT_ARCH) ...
+                # Answering with the HOST clang makes every kernel compile a
+                # x86_64 Linux compile, which rejects Darwin's -arch:
+                #     clang: error: unsupported option '-arch' for target
+                #            'x86_64-pc-linux-gnu'
+                # 736 of those in run 40412376461, plus ARM assembly handed to
+                # an x86 assembler ("invalid instruction mnemonic"). So the
+                # answer for clang/clang++ is a cross wrapper that forces the
+                # Darwin arm64 target; everything else stays as-is.
+                clang|clang++)
+                  echo "/usr/local/bin/xtool-${rest[1]}" ;;
                 *) command -v "${rest[1]:-}" || echo /usr/bin/false ;;
               esac ;;
             "") echo "xcrun: no command" >&2; exit 1 ;;
@@ -1005,6 +1018,37 @@ jobs:
           esac
           EOF
           sudo chmod +x /usr/bin/xcrun
+          # The cross wrapper that xcrun -find clang answers with. It forces the
+          # Darwin arm64 target, keeps the caller's arguments verbatim, and
+          # drops the Darwin-only switches this Linux clang rejects even WITH a
+          # Darwin target (-mkernel / -arch) because they are driver-level.
+          # --target= is what actually makes clang emit arm64 Darwin objects;
+          # the missing piece was simply that nobody had ever set it.
+          sudo mkdir -p /usr/local/bin
+          for _x in clang clang++; do
+            sudo tee "/usr/local/bin/xtool-${_x}" >/dev/null <<XTEOF
+          #!/bin/bash
+          # Ubuntu clang, forced to the Darwin arm64 target. Reached only via
+          # xcrun -find clang -> this path (MakeInc.cmd:184). The heredoc is
+          # QUOTED, so nothing here needs backslash escaping.
+          n=$#
+          out=()
+          while [ $# -gt 0 ]; do
+            case "$1" in
+              -arch) out+=("$1" "$2"); shift 2 ;;
+              -mkernel|-msoft-float|-mno-soft-float|-fapple-kext) shift ;;
+              -mmacosx-version-min=*|-miphoneos-version-min=*) shift ;;
+              *) out+=("$1"); shift ;;
+            esac
+          done
+          exec /usr/bin/${_x} --target=aarch64-apple-darwin "${out[@]}"
+          XTEOF
+            sudo chmod +x "/usr/local/bin/xtool-${_x}"
+          done
+          /usr/local/bin/xtool-clang --version | head -1 || true
+          printf 'int main(void){return 0;}\n' > /tmp/xt.c
+          /usr/local/bin/xtool-clang -arch arm64 -c /tmp/xt.c -o /tmp/xt.o 2>&1 | head -5 \
+            && file /tmp/xt.o || echo '  ::warning::xtool-clang control failed' 
           sudo tee /usr/bin/sw_vers >/dev/null <<'EOF'
           #!/bin/bash
           case "$1" in
@@ -2367,6 +2411,59 @@ jobs:
           fi
           export MIGCC="$SHIM"
 
+          # --- CC shim: drop Darwin-only codegen switches for kernel objects --
+          # Now that doconf works, the build reaches the actual kernel compile
+          # and every object fails the same way:
+          #
+          #     clang: error: unsupported option '-arch' for target 'x86_64-pc-linux-gnu'
+          #     clang: warning: argument unused ... '-mmacosx-version-min=13.3'
+          #     make[7]: *** [.../security/DEVELOPMENT/Makefile:157: mac_audit.o] Error 1
+          #
+          # MIGFLAGS carries `-arch arm64e` and
+          # `-mmacosx-version-min=13.3` (MakeInc.def:225-270, :70), and the
+          # kernel CFLAGS carry the same pair. The MIGCC shim already strips
+          # them for the preprocessor; kernel objects need the same treatment,
+          # because a Linux clang cannot target Darwin and has no need to --
+          # the objects are laid out by OUR linker and the Mach-O headers come
+          # from cctools.
+          #
+          # Keep everything else, and do NOT touch -E/-S/-c or optimisation
+          # flags: this must stay a faithful host compiler for the rest of the
+          # command line.
+          cc_shim="$RUNNER_TEMP/cross/bin/cc-shim"
+          {
+            echo '#!/bin/bash'
+            echo '# Drop Darwin-only switches a Linux clang rejects. See the'
+            echo '# workflow comment: -arch and -mmacosx-version-min are Darwin'
+            echo '# target selectors with no meaning on this host.'
+            echo 'args=()'
+            echo 'while [ $# -gt 0 ]; do'
+            echo '  case "$1" in'
+            echo '    -arch) shift 2 ;;'
+            echo '    -mmacosx-version-min=*|-miphoneos-version-min=*|-mios-version-min=*) shift ;;'
+            echo '    -mkernel|-msoft-float|-mno-soft-float) shift ;;'
+            echo '    *) args+=("$1"); shift ;;'
+            echo '  esac'
+            echo 'done'
+            echo 'exec /usr/bin/clang "${args[@]}"'
+          } > "$cc_shim"
+          chmod +x "$cc_shim"
+          # Two-sided proof: Darwin flags must be gone AND a real compile must
+          # still work, so a shim that strips too much cannot pass.
+          printf 'int probe(void){return 0;}\n' > "$RUNNER_TEMP/ccprobe.c"
+          if "$cc_shim" -arch arm64e -mmacosx-version-min=13.3 -c \
+               "$RUNNER_TEMP/ccprobe.c" -o "$RUNNER_TEMP/ccprobe.o" 2>"$RUNNER_TEMP/cc.err"; then
+            echo "  cc-shim PROBE: -arch/-mmacosx-version-min stripped, object built"
+          else
+            echo "::error::cc-shim PROBE failed: $(head -2 "$RUNNER_TEMP/cc.err" | tr '\n' ' ')"
+          fi
+          if "$cc_shim" -arch arm64e -c "$RUNNER_TEMP/ccprobe.c" -o /dev/null 2>&1 \
+               | grep -q "unsupported option '-arch'"; then
+            echo "::error::cc-shim still leaks -arch"
+          else
+            echo "  cc-shim PROBE: no -arch leak"
+          fi
+
           # Capture the exact byte stream migcom is handed, once per target.
           # The duplicate-type question has been argued from indirect evidence
           # twice and drew a wrong answer both times (the include-guard typo
@@ -3378,6 +3475,47 @@ jobs:
           rm -rf "$MIGCOM_SHIM_DUMP"; mkdir -p "$MIGCOM_SHIM_DUMP"
           echo "DUMP: writing captures to $MIGCOM_SHIM_DUMP"
 
+          # Build the cc-shim INSIDE this step. `export` does not survive
+          # between steps -- the same mistake that silently sent the Stage 6
+          # migcom captures to $RUNNER_TEMP and lost them -- so Stage 6 must
+          # not depend on a variable Stage 5 set. It creates its own.
+          #
+          # Needed because kernel objects fail with
+          #     clang: error: unsupported option '-arch' for target
+          #            'x86_64-pc-linux-gnu'
+          # and the same for -mmacosx-version-min. MIGFLAGS and the kernel
+          # CFLAGS both carry `-arch arm64e -mmacosx-version-min=13.3`
+          # (MakeInc.def:225-270, :70). A Linux clang cannot target Darwin and
+          # does not need to: the Mach-O layout comes from cctools and OUR
+          # linker. Everything else passes through untouched.
+          CC_SHIM="$RUNNER_TEMP/cross/bin/cc-shim"
+          mkdir -p "$(dirname "$CC_SHIM")"
+          {
+            echo '#!/bin/bash'
+            echo 'args=()'
+            echo 'while [ $# -gt 0 ]; do'
+            echo '  case "$1" in'
+            echo '    -arch) shift 2 ;;'
+            echo '    -mmacosx-version-min=*|-miphoneos-version-min=*|-mios-version-min=*) shift ;;'
+            echo '    -mkernel|-msoft-float|-mno-soft-float) shift ;;'
+            echo '    *) args+=("$1"); shift ;;'
+            echo '  esac'
+            echo 'done'
+            echo 'exec /usr/bin/clang "${args[@]}"'
+          } > "$CC_SHIM"
+          chmod +x "$CC_SHIM"
+          export CC_SHIM
+          echo "  Stage 6 cc-shim: $CC_SHIM"
+          # Two-sided probe: the Darwin flags must be gone AND a real compile
+          # must still succeed, so a shim that strips too much cannot pass.
+          printf 'int probe(void){return 0;}\n' > "$RUNNER_TEMP/ccprobe.c"
+          if "$CC_SHIM" -arch arm64e -mmacosx-version-min=13.3 -c \
+               "$RUNNER_TEMP/ccprobe.c" -o "$RUNNER_TEMP/ccprobe.o" 2>"$RUNNER_TEMP/cc.err"; then
+            echo "  cc-shim PROBE: Darwin switches stripped, object built"
+          else
+            echo "::error::cc-shim PROBE failed: $(head -2 "$RUNNER_TEMP/cc.err" | tr '\n' ' ')"
+          fi
+
           make_flags=(
             SDKROOT=macosx HOST_SDKROOT=macosx
             HOST_OS_VERSION=13.3
@@ -3386,7 +3524,7 @@ jobs:
             BUILD_WERROR=0 BUILD_LTO=0 VERBOSE=YES CONCISE=0
             DSTROOT="$FAKEROOT" FAKEROOT_DIR="$FAKEROOT"
             OBJROOT="$OBJROOT" SYMROOT="$GITHUB_WORKSPACE/dxb/build/xnu.sym"
-            CC=clang CXX=clang++
+            CC="$CC_SHIM" CXX=clang++
             # Order matters. $CCTOOLS_FOREIGN_INCLUDE (machinc) must come
             # BEFORE cctools/include so that our self-contained
             # libkern/_OSByteOrder.h shadows the Apple original that includes
