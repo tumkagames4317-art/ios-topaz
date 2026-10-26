@@ -1026,11 +1026,23 @@ jobs:
           # the missing piece was simply that nobody had ever set it.
           sudo mkdir -p /usr/local/bin
           for _x in clang clang++; do
-            sudo tee "/usr/local/bin/xtool-${_x}" >/dev/null <<XTEOF
+            sudo tee "/usr/local/bin/xtool-${_x}" >/dev/null <<'XTEOF'
           #!/bin/bash
           # Ubuntu clang, forced to the Darwin arm64 target. Reached only via
-          # xcrun -find clang -> this path (MakeInc.cmd:184). The heredoc is
-          # QUOTED, so nothing here needs backslash escaping.
+          # xcrun -find clang -> this path (MakeInc.cmd:184). The heredoc IS
+          # quoted ('XTEOF'). It was not in 40413292715, and that single
+          # missing pair of quotes broke the whole wrapper: the body expanded
+          # in the generating shell, where $#, $1 and $2 are empty, so the
+          # installed file read
+          #     while [  -gt 0 ]; do case "" in ... esac done
+          # and every invocation failed with
+          #     clang: error: no input files
+          # including the step's own control:
+          #     + /usr/local/bin/xtool-clang --version   -> clang: error: no input files
+          #     + /usr/local/bin/xtool-clang -arch arm64 -c /tmp/xt.c -o /tmp/xt.o
+          #                                              -> clang: error: no input files
+          # Because ${_x} was being used to pick /usr/bin/clang vs clang++, it
+          # is now derived from $0 inside the (literal) script instead.
           out=()
           while [ $# -gt 0 ]; do
             case "$1" in
@@ -1051,7 +1063,18 @@ jobs:
               *) out+=("$1"); shift ;;
             esac
           done
-          exec /usr/bin/${_x} --target=aarch64-apple-darwin -march=armv8.2-a+crypto+crc "${out[@]}"
+          # One-shot argv dump: the first N invocations are written verbatim so
+          # a "no input files" regression can be diagnosed from the artifact
+          # instead of from guesses about which argv shape broke it. Bounded so
+          # it cannot bloat the log.
+          if [ -n "$XTOOL_DUMP" ] && [ -d "$XTOOL_DUMP" ]; then
+            _seq=$(( $(cat "$XTOOL_DUMP/.seq" 2>/dev/null || echo 0) + 1 ))
+            echo "$_seq" > "$XTOOL_DUMP/.seq"
+            if [ "$_seq" -le 40 ]; then
+              printf 'ARGV[%d]: %s\n' "$_seq" "$*" >> "$XTOOL_DUMP/argv.txt"
+            fi
+          fi
+          exec /usr/bin/$(basename "$0") --target=aarch64-apple-darwin -march=armv8.2-a+crypto+crc "${out[@]}"
           XTEOF
             sudo chmod +x "/usr/local/bin/xtool-${_x}"
           done
@@ -3556,6 +3579,9 @@ jobs:
               "$CC_SHIM" > "$CXX_SHIM"
           chmod +x "$CXX_SHIM"
           export CC_SHIM CXX_SHIM
+          export XTOOL_DUMP="$GITHUB_WORKSPACE/xtool-argv"
+          rm -rf "$XTOOL_DUMP"; mkdir -p "$XTOOL_DUMP"
+          echo "  xtool argv dump -> $XTOOL_DUMP"
           echo "  Stage 6 cc-shim:  $CC_SHIM"
           echo "  Stage 6 cxx-shim: $CXX_SHIM"
           grep -n 'exec' "$CXX_SHIM" | sed 's/^/    cxx-shim: /'
@@ -3722,7 +3748,16 @@ jobs:
           set -e
           echo '--- SETUP host tools actually present? ---'
           find "$OBJROOT/SETUP" -maxdepth 2 -type f -executable | sort || true
-          echo '--- first real error, in order ---'
+          echo '--- VERBATIM argv the compiler wrapper received (first 40) ---'
+          cat "$XTOOL_DUMP/argv.txt" 2>/dev/null | head -40 || echo "(no argv captured)"
+          echo '--- $(origin AS) / $(origin CXX) as make sees them ---'
+          make -s --no-print-directory -f /dev/stdin <<'MKE' 2>&1 | head -6 || true
+          AS_SOFTWARE := $(origin AS)
+          CXX_SOFTWARE := $(origin CXX)
+          CC_SOFTWARE := $(origin CC)
+          $(info origin AS=$(origin AS) CXX=$(origin CXX) CC=$(origin CC))
+          MKE
+          echo '--- first real error, in order ---' 
           # Widen beyond 'error:': the first real failures tonight were
           # "Error 127" (missing interpreter) and "No such file", neither of
           # which contains the string `error:`. A grep that only knows one
