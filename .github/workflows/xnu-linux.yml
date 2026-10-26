@@ -1067,8 +1067,17 @@ jobs:
             if [ "$_seq" -le 40 ]; then
               printf 'ARGV[%d]: %s\n' "$_seq" "$*" >> "$XTOOL_DUMP/argv.txt"
             fi
+          # `+sha2` is not redundant with `+crypto`. crypto enables the AES and
+          # SHA1/SHA256 feature set, but clang's aarch64 backend only accepts
+          # the SHA2 scalar instructions (sha256h/sha256h2/sha256su0/sha256su1)
+          # under the explicit +sha2 feature; without it GNU as rejects them:
+          #     <instantiation>:1:11: error: invalid operand for instruction
+          #     sha256su0 q0, q1
+          #     sha256_compress_arm64.s:281: while in macro instantiation
+          # 77 occurrences in 40420909266. +sha3 is included because ARMv8.4
+          # sha3 sits alongside sha2 in the same corecrypto sources.
           fi
-          exec "$BIN" --target=aarch64-apple-darwin -march=armv8.2-a+crypto+crc "${out[@]}"
+          exec "$BIN" --target=aarch64-apple-darwin -march=armv8.2-a+crypto+crc+sha2+sha3 "${out[@]}"
           XTEOF
           sudo chmod +x /usr/local/bin/xtool-clang
           
@@ -1104,7 +1113,7 @@ jobs:
               printf 'ARGV[%d]: %s\n' "$_seq" "$*" >> "$XTOOL_DUMP/argv.txt"
             fi
           fi
-          exec "$BIN" --target=aarch64-apple-darwin -march=armv8.2-a+crypto+crc "${out[@]}"
+          exec "$BIN" --target=aarch64-apple-darwin -march=armv8.2-a+crypto+crc+sha2+sha3 "${out[@]}"
           XTEOF
           sudo chmod +x /usr/local/bin/xtool-clang++
           # FIFTH PROPERTY (the check whose absence cost run 40414443571): the
@@ -1435,7 +1444,19 @@ jobs:
       # --------------------------------------------- stage 3: clone xnu src
       - name: "Stage 3: clone xnu-8796.121.2, patch, and port makedefs to GNU make"
         id: xnusrc
-        continue-on-error: true
+        # NO continue-on-error. It was here until 2026-10-27 and it defeated the
+        # patch hard-failure added in 537ed78: run 40421681404 printed
+        #
+        #   ::error::PATCH FAILED 0034-sweet-ufs-dma-above-4g.patch -- it edits: bsd/dev/sweet_ufs.c
+        #
+        # and then Stage 6 built anyway from a tree that never received 0034,
+        # and the RUN CONCLUDED `success`. The step's exit 1 was real; nothing
+        # consumed it. This file already contains a "truth check" section that
+        # names this exact condition -- a green run carrying ::error:: lines --
+        # so the answer is not another warning, it is removing the swallow.
+        #
+        # Stages 2/4/5 may still continue-on-error: they only inspect. A stage
+        # that PRODUCES the tree every later stage compiles must not.
         run: |
           set -x
           cd dxb
@@ -1486,6 +1507,33 @@ jobs:
             name=$(basename "$p")
             if git apply --check "$p" >/dev/null 2>&1; then
               git apply "$p"
+              # ------------------------------------------------------------------
+              # STAGE WHAT WAS JUST APPLIED. This is load-bearing, not tidiness.
+              #
+              # Many patches CREATE files from /dev/null (0028 creates
+              # bsd/dev/sweet_ufs.c, 0046 creates SweetFramebuffer.cpp, 0113
+              # creates TopazModem.cpp, 0058 creates ~30 IOHID* files ...). An
+              # applied creation leaves the file present on disk but UNTRACKED
+              # in the index, and the next patch to that file then fails:
+              #
+              #     git apply --check  -> rc 0   (looks perfectly applicable)
+              #     git apply --3way   -> rc 1   "does not match index"
+              #
+              # --check passing while --3way fails is what hid this: the patch
+              # is not in conflict with anything, it is in conflict with the
+              # fact that git has never been told the file exists. Measured
+              # 2026-10-27 in run 40421681404:
+              #     applied 0033-sweet-bearssl-sha384-sha512.patch
+              #     error: bsd/dev/sweet_ufs.c: does not exist in index
+              #     PATCH FAILED 0034-sweet-ufs-dma-above-4g.patch
+              # Proven locally both ways: untracked -> "does not match index",
+              # after `git add -A` -> applies clean, rc 0.
+              #
+              # 0028 creates sweet_ufs.c and 15 later patches edit it; 0046
+              # creates SweetFramebuffer.cpp and 23 later patches edit it. So
+              # this one line gates the whole display and storage path.
+              # ------------------------------------------------------------------
+              git add -A
               n_ok=$((n_ok+1))
               echo "applied     $name" >> "$PATCH_REPORT"
               continue
@@ -1501,21 +1549,39 @@ jobs:
             if git apply --3way "$p" >> "$PATCH_REPORT" 2>&1 \
                && [ -z "$(git ls-files -u)" ] \
                && [ -z "$(git diff --name-only --diff-filter=U)" ]; then
+              git add -A
               n_3way=$((n_3way+1))
               echo "applied-3way $name" >> "$PATCH_REPORT"
               continue
             fi
+            # Classify the failure, because the three classes need three
+            # different remedies and "17 skipped" is what let this sit for a
+            # whole night:
+            #   NO-BASE   repository lacks the necessary blob
+            #             -> generated against a tree state we do not have
+            #   INDEX     does not exist/match index
+            #             -> plumbing; a created file was never staged
+            #   CONFLICT  patch does not apply
+            #             -> genuine context mismatch
+            threeway=$(git apply --3way "$p" 2>&1 || true)
+            case "$threeway" in
+              *"lacks the necessary blob"*) cls=NO-BASE ;;
+              *"does not exist in index"*|*"does not match index"*) cls=INDEX ;;
+              *) cls=CONFLICT ;;
+            esac
             git checkout -- . 2>/dev/null || true
             git reset -q 2>/dev/null || true
+            git add -A 2>/dev/null || true
             case " $ALLOW_SKIP " in
               *" $name "*)
                 n_skip=$((n_skip+1))
-                echo "allowed-skip $name" >> "$PATCH_REPORT"
+                echo "allowed-skip $name  [$cls]" >> "$PATCH_REPORT"
                 continue ;;
             esac
             files=$(grep -E '^\+\+\+ b/' "$p" | sed 's|^+++ b/||' | paste -sd, -)
             {
-              echo "::error::PATCH FAILED $name -- it edits: $files"
+              echo "::error::PATCH FAILED $name [$cls] -- it edits: $files"
+              echo "$threeway" | head -5
               echo "Refusing to continue: the build would report a shrinking"
               echo "error count over a tree that silently lost this change."
             } >> "$PATCH_REPORT"
