@@ -1341,6 +1341,36 @@ jobs:
           bison -d -o out/parser.c parser.y
           flex -o out/lexxer.c lexxer.l
           INC="-Iout -I. -I../../dxb/xnu/osfmk -I../../dxb/xnu/EXTERNAL_HEADERS"
+          # xnu's osfmk/mach/i386/vm_types.h:74 does `#include <i386/_types.h>`,
+          # which is Darwin-only and absent from osfmk itself. cctools-port
+          # ships it at cctools/include/foreign/i386/_types.h, and Stage 1c
+          # exposes that tree as $CCTOOLS_FOREIGN_INCLUDE (machinc), where
+          # `i386` is a symlink to it. Stage 5b always put machinc on its
+          # include path; Stage 5 did not, so mig failed with
+          #     In file included from handler.c:40: ... osfmk/mach/message.h:
+          #     ... osfmk/mach/port.h:92: ...
+          #     ... osfmk/mach/machine/vm_types.h:33:
+          #     ../../dxb/xnu/osfmk/mach/i386/vm_types.h:74:10:
+          #         fatal error: 'i386/_types.h' file not found
+          # Note the include is <i386/_types.h>, NOT <mach/i386/_types.h>,
+          # so machinc must be at the ROOT of the search path. -isystem keeps
+          # it out of the way of -I so Darwin headers never override host ones.
+          INC="$INC -isystem $CCTOOLS_FOREIGN_INCLUDE"
+          # Free pre-dispatch check: print what machinc/i386/_types.h itself
+          # includes. Darwins's copy is NOT self-contained in general -- it may
+          # want <sys/cdefs.h>, __darwin_* types or machine/_types.h, none of
+          # which glibc supplies. mig will be the first thing to actually open
+          # this header, so record what it pulls in BEFORE the compile so the
+          # next failure (if any) is diagnosed from observation, not theory.
+          echo '--- machinc/i386/_types.h: resolved path ---'
+          ls -la "$CCTOOLS_FOREIGN_INCLUDE/i386/_types.h" || \
+            echo "WARNING: i386/_types.h is not reachable via machinc"
+          echo '--- its #include directives ---'
+          grep -nE '^[[:space:]]*#[[:space:]]*include' \
+            "$CCTOOLS_FOREIGN_INCLUDE/i386/_types.h" || \
+            echo "(self-contained: no #include directives)"
+          echo '--- size ---'
+          wc -l "$CCTOOLS_FOREIGN_INCLUDE/i386/_types.h" || true
           # migcom needs the BSD scalar types (u_int and friends) that glibc
           # hides behind __USE_MISC. Stage 1b's compat.h defines them and is
           # safe to force-include here: its host-tool half is gated on
