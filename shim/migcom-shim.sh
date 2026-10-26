@@ -55,6 +55,26 @@ set -u
 
 real="__MIGCOM_REAL__"
 
+# Refuse to run if the placeholder was never substituted.
+#
+# The comparison builds the token from two pieces so this block itself contains
+# no literal placeholder. That matters: the installer substitutes every
+# occurrence in the file, so a literal token here would be rewritten in the
+# installed copy and the test would then compare a real path against itself --
+# which is exactly the bug this guard shipped with for one revision, and it
+# made every correctly installed shim report "not substituted".
+_ph="__MIGCOM""_REAL__"
+if [ "$real" = "$_ph" ] || [ -z "$real" ]; then
+  echo "migcom-shim: FATAL: the real-migcom path was not substituted at install time" >&2
+  echo "migcom-shim: this file is the template; the installed copy must replace it" >&2
+  exit 127
+fi
+unset _ph
+if [ ! -x "$real" ]; then
+  echo "migcom-shim: FATAL: real migcom '$real' is not executable" >&2
+  exit 127
+fi
+
 args=()
 dropped=""
 n_dropped=0
@@ -419,15 +439,34 @@ fi
 # -sheader argument, and argv is written into the first line of the stream.
 if [ -n "${MIGCOM_SHIM_DUMP:-}" ]; then
   mkdir -p "$MIGCOM_SHIM_DUMP" 2>/dev/null || true
-  dump_name="unknown"
+  # NAME: first -sheader/-header whose value is a real file, else the first
+  # -user value, else "stream". Never /dev/null -- Stage 6 passes it for every
+  # unused output, and using it as a name is what made 100+ captures collide on
+  # the single file "null.stream".
+  #
+  # Only the basename is taken, and only of a value that is not /dev/null and
+  # not empty. The fallback chain exists because a target may legitimately pass
+  # -header /dev/null and -sheader <real> (or the reverse).
+  dump_name=""
   prev=""
   for a in "${args[@]}"; do
     case "$prev" in
-      -header|-sheader|-user|-server|-iheader) dump_name="$(basename "$a")" ;;
+      -header|-sheader|-iheader|-user)
+        case "$a" in
+          ""|/dev/null|/dev/stdout|/dev/stderr) : ;;
+          *) [ -z "$dump_name" ] && dump_name="$(basename -- "$a")" ;;
+        esac
+        ;;
     esac
     prev="$a"
   done
-  dump_path="$MIGCOM_SHIM_DUMP/${dump_name}.stream"
+  [ -z "$dump_name" ] && dump_name="stream"
+  dump_name=$(printf '%s' "$dump_name" | tr -c 'A-Za-z0-9._-' '_')
+  # $$ is this shell's PID, so concurrent mig runs cannot collide; the
+  # sequence number keeps two calls in one process apart.
+  dump_seq=$(( ${dump_seq:-0} + 1 ))
+  dump_path="$MIGCOM_SHIM_DUMP/${dump_name}.$$_${dump_seq}.stream"
+
   {
     printf '# argv:'
     printf ' %s' "${args[@]}"
