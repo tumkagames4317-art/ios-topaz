@@ -1,3 +1,143 @@
+## 17:20 MSK 2026-10-26 -- BREAKTHROUGH: XNU boots to BSD init; deviceTreeP was a PA in the QEMU harness
+
+The kernel now runs far past `arm_vm_init`, initialises BSD, and parks in
+`cpu_idle`/`machine_idle` waiting for an `IOMedia` (root device). This is the
+first time the port has produced a real boot log rather than a panic.
+
+### The bug: qrun.py passed a physical where xnu reads a virtual
+
+`shim/loader.c:440` has always done the right thing:
+
+    ba->deviceTreeP = adt_pa - pa_of_va_base;   /* xnu reads it with the MMU on */
+
+which evaluates to `virt_base + (adt_pa - phys_base)`, i.e. a **kernel VA**.
+`work/tools/qrun.py` wrote the raw physical address instead. QEMU's log had
+been showing it all along:
+
+    Data Abort  ESR 0x96000005  FAR 0xb24c8004  ELR _SecureDTLookupEntry+0x108
+
+`FAR = adt_pa + 4` is a *low* address, which TTBR1 does not map. Every ADT
+lookup therefore faulted, `SecureDTLookupEntry` returned an error, and
+`arm_vm_init` took the `assert(err == kSuccess)` on `chosen/memory-map`.
+Patch 0013 was written to paper over that assert -- the assert was never the
+disease.
+
+Fixed in `qrun.py`: `deviceTreeP = virt_base + (adt_pa - phys_base)`.
+
+### Why the panic said "Invalid kernel stack pointer"
+
+`sweet_early_panic` draws through the framebuffer alias. Once the fault stream
+started, the trap handler itself faulted while trying to report, and arm64
+records *that* as an invalid stack pointer. The message was a symptom of a
+faulting fault handler, not a stack overflow. Do not chase the stack.
+
+### What the screen now shows (work/build/qv1)
+
+    iBoot version
+    SWEET AMFI: built-in interface registered (XML entitlements)
+    SWEET: starting device-tree platform expert
+    SWEET AKS / WDT / SURF / CPU / BATTERY / FB -- all registered
+    Copyright (c) 1982, 1986, 1989, 1991, 1993 The Regents ...
+    MAC Framework successfully initialized
+    using 1029 buffer headers and 1029 cluster IO buffer headers
+    mbinit: done 64 MB total pool size
+    dlil init: all created dlil kernel threads scheduled
+    SWEET HFS: hfs-627.100.6 registered
+    Waiting on (... kIOMediaClass ... Apple HFS ...)
+
+PC = `_cpu_idle+0x1ec`, ELR = `_machine_idle+0xfc`: a healthy idle loop.
+
+### Also changed
+
+Patch 0012 now calls `sweet_early_disable()` *before* `pmap_bootstrap`, not
+after (commit `06a54c1`). `pmap_bootstrap` rewrites the very tables the fb
+alias lives in, so any console write inside it faults. Keeping the call after
+only meant the fault happened earlier than the disable.
+
+### Reading the console
+
+`work/tools/screentext.py FBRAW` decodes the panel with a glyph map learned by
+hand from the screen. The on-screen font is **not** `iso_font`: it is 8 rows of
+a 8x16 glyph cropped to 10 rows and drawn at 2x on a 16x32 pitch. Misses show
+as `?` for ambiguous shapes (`B`/`8`, `D`/`0`) plus an unknown-glyph dump at
+the end, which is how the map gets extended.
+
+### Next concrete action
+
+The kernel is waiting for an `IOMedia`. Give it one: build a ramdisk-backed
+root (patch 0021/0024 mockfs virtual ramdisk IO already exist) and present it
+through the boot payload, then re-run `qrun.py` and read the screen again.
+
+## 11:45 MSK 2026-10-26 -- arm_vm_init is passed; the blocker was one assert
+
+### The breakthrough
+
+The kernel now prints **stage 8** ("leaving bootstrap TTBR0") and the stage-8
+colour band is on screen. That band had never appeared in any build. There is no
+red panic block. `arm_vm_init` gets past the `chosen/memory-map` lookup.
+
+The fix is patch `0013-sweet-tolerate-missing-memory-map.patch`: when
+`SecureDTLookupEntry(NULL, "chosen/memory-map", ...)` returns non-success it now
+prints and continues with `memory_map = NULL` instead of asserting. Everything
+that consumes the map below that point is already optional in upstream --
+`TrustCache` guards on its own `err`, `AuxKC` jumps to `noAuxKC` -- so continuing
+is safe.
+
+### Why nothing else had worked
+
+Nine earlier hypotheses were all consistent with the evidence and all wrong:
+the ADT contents, `TrustCache`/`EXTRADATA`/`kernel-only`, the ADT root node
+name, passing a VA instead of a PA, `sweet_early_map_final()`, and the ADT being
+zeroed in RAM. The last of those misled me badly: the observation "ADT is zero at
+`0xb24c8000` after boot" was true, but it was measured **after** the panic, by
+which time nothing mattered. `arm_vm_init` never got far enough to care.
+
+Lesson for the next blocker: measure *before* fixing, not after. Every "true
+cause" I announced today was a true *observation* attached to a wrong *story*.
+
+### Hard-won fact about patch line numbers
+
+Patch `0010` inserts one line at hunk 44, which is **above** line 1287. So by the
+time `0013` runs, the assert is on built line **1288**, not the upstream 1287.
+The first version of `0013` was anchored to 1287 and `git apply` would have
+rejected it; CI would have logged `Skipping patch` and shipped a kernel without
+it, and I would have spent hours wondering why nothing changed.
+
+Always regenerate a patch against the tree with the earlier patches applied:
+`build/xnusrc/arm_vm_init.c` (the pristine upstream file) plus
+`tools/seqtest2.py`, which applies 0010..0013 in order to a scratch copy and
+prints the resulting lines. Verified: all four apply, `git apply --check` rc=0.
+
+### The new, current blocker
+
+With the assert gone the kernel reaches the end of the TTBR0 teardown and takes
+a **prefetch abort** on the next console write:
+
+    exception 3 [Prefetch Abort]  ESR 0x21/0x86000005   (DFSC 5: translation fault, level 1)
+    halted in _halt_all_cpus + 0x34, x0 = -1
+
+The early console's framebuffer mapping lived in bootstrap TTBR0 and went away
+with it. `sweet_early_map_final()` is the code meant to survive that, and it was
+switched off for diagnosis (commit `4b85507`); it is back on as of `e7af1b6`,
+with its `phystokv()` call removed because the physmap does not exist yet at that
+point.
+
+That last change is **unverified**. The claim "the bootstrap page-table address
+is already a kernel VA here" is an assumption, not a measurement -- exactly the
+kind that has been wrong all day. If the console still dies at stage 8, measure
+`cpu_tte` and the L1 entry at the moment `sweet_early_fb_slot()` runs rather than
+reasoning about it.
+
+### Useful new tooling
+
+* `tools/seqtest2.py` -- applies the patch series to a scratch copy of the real
+  upstream `arm_vm_init.c` and shows the built line numbers.
+* `tools/arm_vm_init.c` reference copy at `build/xnusrc/arm_vm_init.c`
+  (`xnu-8796.121.2`, the version CI builds).
+* `tools/watch4.py` -- QEMU gdb watchpoint harness. Note the register packet is
+  33 words with the PC in the **last** one, little-endian.
+* `tools/readscreen.py` prints the banner rows; the stage bands at y >= H-32 are
+  a better signal than text because they are written before the console can die.
 ## 10:45 MSK 2026-10-26 -- the first stop pinning is done; the tree is NOT the bug
 
 ### Which assert it is, proved rather than guessed
