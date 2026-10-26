@@ -1413,6 +1413,94 @@ jobs:
             echo "(self-contained: no #include directives)"
           echo '--- size ---'
           wc -l "$CCTOOLS_FOREIGN_INCLUDE/sys/_types.h" || true
+          # osfmk/mach/port.h:182 then wants <sys/_types/_mach_port_t.h>, and
+          # osfmk/mach/std_types.h wants <sys/_types/_uuid_t.h>. cctools'
+          # foreign/sys has only _types.h and attr.h -- no _types/
+          # subdirectory -- so the symlink above cannot serve them.
+          #
+          # They are NOT missing, though: xnu itself ships both at
+          # bsd/sys/_types/ in the open-source tree, and they are two lines
+          # each, defining exactly one type from a __darwin_* that cctools'
+          # foreign/sys/_types.h ALREADY provides:
+          #     foreign/sys/_types.h:111  typedef __darwin_mach_port_name_t
+          #                                     __darwin_mach_port_t;
+          #     foreign/sys/_types.h:138  typedef unsigned char __darwin_uuid_t[16];
+          #     xnu bsd/sys/_types/_mach_port_t.h:
+          #         #ifndef _MACH_PORT_T
+          #         typedef __darwin_mach_port_t mach_port_t;
+          #     xnu bsd/sys/_types/_uuid_t.h:
+          #         #ifndef _UUID_T
+          #         typedef __darwin_uuid_t uuid_t;
+          # So expose xnu's own directory at <sys/_types/> rather than writing
+          # any Apple content ourselves. Prefer xnu's tree (authoritative and
+          # already checked out by Stage 3); fall back to synthesising the two
+          # typedefs only if that directory is genuinely absent.
+          mkdir -p "$RUNNER_TEMP/xnusys/types"
+          if [ -f "$XROOT/bsd/sys/_types/_mach_port_t.h" ]; then
+            echo "sys/_types source: xnu's own bsd/sys/_types"
+            cp -f "$XROOT/bsd/sys/_types/_mach_port_t.h" \
+                  "$RUNNER_TEMP/xnusys/types/" 2>/dev/null || true
+            cp -f "$XROOT/bsd/sys/_types/_uuid_t.h" \
+                  "$RUNNER_TEMP/xnusys/types/" 2>/dev/null || true
+          fi
+          if [ ! -f "$RUNNER_TEMP/xnusys/types/_mach_port_t.h" ]; then
+            echo "sys/_types source: synthesised from Apple's documented typedefs"
+            cat > "$RUNNER_TEMP/xnusys/types/_mach_port_t.h" <<'MPTEOF'
+          #ifndef _MACH_PORT_T
+          #define _MACH_PORT_T
+          #include <sys/_types.h>
+          typedef __darwin_mach_port_t mach_port_t;
+          #endif
+          MPTEOF
+            cat > "$RUNNER_TEMP/xnusys/types/_uuid_t.h" <<'UTEOF'
+          #ifndef _UUID_T
+          #define _UUID_T
+          #include <sys/_types.h>
+          typedef __darwin_uuid_t uuid_t;
+          #endif
+          UTEOF
+          fi
+          # Graft the _types/ directory into the existing foreign/sys tree.
+          # foreign/sys is itself a symlink into the cctools clone, which we
+          # must not write to, so build a real directory that mirrors it.
+          # `rm -f` first: `ln -sfn` cannot replace a symlink-to-directory
+          # on its own (it would create sys/sysmerged), and reproducing that
+          # locally showed `sys/_types/` silently coming out EMPTY.
+          rm -rf "$RUNNER_TEMP/sysmerged"
+          mkdir -p "$RUNNER_TEMP/sysmerged"
+          cp -R "$CCTOOLS_FOREIGN_INCLUDE/sys/." "$RUNNER_TEMP/sysmerged/" \
+            2>/dev/null || true
+          mkdir -p "$RUNNER_TEMP/sysmerged/_types"
+          cp -f "$RUNNER_TEMP/xnusys/types/_mach_port_t.h" \
+                "$RUNNER_TEMP/xnusys/types/_uuid_t.h" \
+                "$RUNNER_TEMP/sysmerged/_types/"
+          rm -f "$CCTOOLS_FOREIGN_INCLUDE/sys"
+          ln -sfn "$RUNNER_TEMP/sysmerged" "$CCTOOLS_FOREIGN_INCLUDE/sys"
+          echo '--- machinc/sys/ contents ---'
+          ls -la "$CCTOOLS_FOREIGN_INCLUDE/sys/" || \
+            echo "WARNING: machinc/sys is not reachable"
+          echo '--- machinc/sys/_types/ contents (must list 2 files) ---'
+          ls -1 "$CCTOOLS_FOREIGN_INCLUDE/sys/_types/" || \
+            echo "::error::sys/_types/ is not reachable via machinc"
+          ntypes=$(ls -1 "$CCTOOLS_FOREIGN_INCLUDE/sys/_types/" 2>/dev/null | wc -l)
+          if [ "$ntypes" -lt 2 ]; then
+            echo "::error::sys/_types/ has $ntypes file(s), expected 2"
+            exit 1
+          fi
+          echo '--- _mach_port_t.h ---'
+          sed -n '1,15p' "$CCTOOLS_FOREIGN_INCLUDE/sys/_types/_mach_port_t.h" || true
+          echo '--- _uuid_t.h ---'
+          sed -n '1,15p' "$CCTOOLS_FOREIGN_INCLUDE/sys/_types/_uuid_t.h" || true
+          # Positive control: the two typedefs must resolve to a __darwin_*
+          # type that foreign/sys/_types.h actually declares.
+          for dt in __darwin_mach_port_t __darwin_uuid_t; do
+            if grep -q "$dt" "$CCTOOLS_FOREIGN_INCLUDE/sys/_types.h"; then
+              echo "  $dt: declared in foreign/sys/_types.h (good)"
+            else
+              echo "::error::$dt is not declared in foreign/sys/_types.h"
+              exit 1
+            fi
+          done
           # migcom needs the BSD scalar types (u_int and friends) that glibc
           # hides behind __USE_MISC. Stage 1b's compat.h defines them and is
           # safe to force-include here: its host-tool half is gated on
