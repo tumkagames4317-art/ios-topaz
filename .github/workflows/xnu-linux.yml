@@ -2218,6 +2218,75 @@ jobs:
           # Fetched as a .deb directly rather than adding a foreign apt suite:
           # no pinning, no Release-file juggling, one verified artifact.
           # ===============================================================
+          # ===============================================================
+          # MIGCC SHIM
+          #
+          # mig.sh:183 runs  "$C" -E -arch ${arch} ... temp.c | "$M" ...
+          # where C=${MIGCC} and, unset, MIGCC falls back to xcrun -find cc
+          # or realpath "${scriptRoot}/cc" (mig.sh:74-83). On Linux that
+          # leaves `cc`, which has no -arch:
+          #     cc: error: unrecognized command-line option '-arch'
+          # This was predicted before the first run and confirmed by run
+          # 40388982459 in every invocation.
+          #
+          # mig.sh:74 is `if [ -z "${MIGCC}" ]`, so exporting MIGCC is the
+          # supported way to substitute the compiler -- no patching of
+          # mig.sh. $C is what gets executed, so the shim is used for the
+          # preprocess step.
+          #
+          # Written as bash with an ARRAY, not `eval` with a string: a
+          # quoting bug in a compiler wrapper produces errors that read like
+          # source errors, and that is a silent-wrong-result risk. Every
+          # argument is echoed on the first invocation so a mangled
+          # argument list is visible in the log rather than inferred.
+          # ===============================================================
+          # MIGCC SHIM
+          #
+          # mig.sh:183 runs  "$C" -E -arch ${arch} ... temp.c | "$M" ...
+          # where C=${MIGCC} and, unset, MIGCC falls back to xcrun -find cc
+          # or realpath "${scriptRoot}/cc" (mig.sh:74-83). On Linux that
+          # leaves `cc`, which has no -arch:
+          #     cc: error: unrecognized command-line option '-arch'
+          # Confirmed in every invocation of run 40388982459.
+          #
+          # mig.sh:74 is `if [ -z "${MIGCC}" ]`, so exporting MIGCC is the
+          # supported substitution point -- mig.sh is not patched.
+          #
+          # Built with printf rather than a heredoc: a heredoc body at
+          # column 0 would terminate the YAML block scalar and break the
+          # whole workflow. Arrays, never eval: a quoting bug in a compiler
+          # wrapper produces errors that read like source errors.
+          # ===============================================================
+          SHIM="$RUNNER_TEMP/cross/bin/migcc-shim"
+          {
+            echo '#!/bin/bash'
+            echo '# Strip Darwin-only "-arch <value>"; pass "-target <value>" through.'
+            echo 'args=(); dropped=""'
+            echo 'while [ $# -gt 0 ]; do'
+            echo '  case "$1" in'
+            echo '    -arch) dropped="$dropped $1 $2"; shift 2 ;;'
+            echo '    *)     args+=("$1"); shift ;;'
+            echo '  esac'
+            echo 'done'
+            echo 'if [ ! -f "${MIGCC_SHIM_MARK:-/tmp/.migcc_mark}" ]; then'
+            echo '  { echo "MIGCC SHIM first invocation"'
+            echo '    echo "  DROPPED:$dropped"'
+            echo '    echo "  argc now: ${#args[@]}"'
+            echo '    echo "  exec: /usr/bin/cc ${args[*]}"'
+            echo '  } | tee "${MIGCC_SHIM_MARK:-/tmp/.migcc_mark}"'
+            echo 'fi'
+            echo 'exec /usr/bin/cc "${args[@]}"'
+          } > "$SHIM"
+          chmod +x "$SHIM"
+          MIGCC_SHIM_MARK="$RUNNER_TEMP/migcc_mark"; rm -f "$MIGCC_SHIM_MARK"; export MIGCC_SHIM_MARK
+          echo "int main(void){return 0;}" > "$RUNNER_TEMP/shimprobe.c"
+          if "$SHIM" -E -arch x86_64 "$RUNNER_TEMP/shimprobe.c" >/dev/null 2>"$RUNNER_TEMP/shim.err"; then
+            echo "  shim PROBE: -arch stripped, cpp exit 0"
+          else
+            echo "::error::shim PROBE failed: $(head -2 "$RUNNER_TEMP/shim.err" | tr '\n' ' ')"
+          fi
+          export MIGCC="$SHIM"
+
           echo "=== INSTALL: Debian mig-x86-64-gnu ==="
           MIGPKG="$RUNNER_TEMP/migpkg"; rm -rf "$MIGPKG"; mkdir -p "$MIGPKG"
           MIG_DEB_URL="http://deb.debian.org/debian/pool/main/m/mig/mig-x86-64-gnu_1.8+git20231217-8_amd64.deb"
@@ -2257,7 +2326,14 @@ jobs:
           LOCKD_DEFS="$GITHUB_WORKSPACE/dxb/xnu/osfmk/lockd/lockd_mach.defs"
           probe_flag() {
             pname="$1"; shift
-            printf 'subsystem\nKernelUser\nprobe_test 9999;\n' > "$ACCT/p.defs"
+            # Syntax taken from the Debian mig source package's own test
+            # suite (tests/generate-only/subsystem-user.defs):
+            #     subsystem KernelUser user 100;
+            # i.e. single-line, `subsystem <Name> <id>;`. The previous probe
+            # used `subsystem` then `KernelUser` on separate lines, which is
+            # not valid -- that produced "bad argument" for every row and made
+            # three of them meaningless. Read the grammar, do not iterate.
+            printf 'subsystem KernelUser probe 100;\n' > "$ACCT/p.defs"
             out="$ACCT/probe.h"; errlog="$ACCT/probe.err"; rm -f "$out" "$errlog"
             if "$RUNNER_TEMP/cross/bin/migcom" -header "$out" "$@" "$ACCT/p.defs" \
                  >/dev/null 2>"$errlog"; then
@@ -2300,7 +2376,9 @@ jobs:
             # never to migcom. Verified: the Debian binary's option set is
             # -header -iheader -user -server -sheader -list -prefix
             # -subrprefix, with no -I.
-            if "$RUNNER_TEMP/cross/bin/mig" \
+            if MIGCC="$RUNNER_TEMP/cross/bin/migcc-shim" \
+               MIGCOM="$RUNNER_TEMP/cross/bin/migcom" \
+               "$RUNNER_TEMP/cross/bin/mig" \
                  -D__MACH30__ -DMACH_KERNEL_PRIVATE -DKERNEL_USER=1 "$@" \
                  -user "$wd/$gbase.c" -header "$wd/$gbase.h" \
                  -server /dev/null -sheader /dev/null \
@@ -2312,6 +2390,28 @@ jobs:
             if [ ! -s "$wd/$gbase.h" ]; then
               echo "  $gbase.h: NOT PRODUCED"
               head -6 "$wd/mig.err" 2>/dev/null || true
+              # Was migcom fed garbage, or did it reject real input? Reproduce
+              # the preprocess step mig.sh would have run and show what migcom
+              # actually received. This settles "no SubSystem declaration"
+              # (symptom of empty input) versus a genuine .defs problem,
+              # instead of theorising about a file we cannot read locally.
+              MIGCC="$RUNNER_TEMP/cross/bin/migcc-shim"
+              pp="$wd/preprocessed.c"
+              if "$MIGCC" -E -D__MACH30__ -DMACH_KERNEL_PRIVATE -DKERNEL_USER=1 \
+                   -I "$(dirname "$gdefs")" -I "$GITHUB_WORKSPACE/dxb/xnu/osfmk" \
+                   -I "$GITHUB_WORKSPACE/dxb/xnu/EXTERNAL_HEADERS" -I "$MIGPKG" \
+                   "$gdefs" > "$pp" 2>"$wd/pp.err"; then
+                echo "  PREPROCESSED: exit 0, $(wc -l < "$pp") lines"
+                echo "  --- first 30 lines of preprocessed $gbase ---"
+                head -30 "$pp"
+                echo "  --- SubSystem/ServerSubsystem lines in preprocessed ---"
+                grep -n -E '^[A-Za-z_]*[Ss]ubsystem|^SubSystem' "$pp" | head -5 || echo "    (none)"
+              else
+                echo "  PREPROCESSED: FAILED exit $?"
+                head -8 "$wd/pp.err"
+                echo "  --- preprocessed captures: $( [ -s "$pp" ] && wc -l < "$pp" || echo 0 ) lines ---"
+                head -30 "$pp" 2>/dev/null
+              fi
               return 0
             fi
             echo "  $gbase.h: $(wc -l < "$wd/$gbase.h") lines"
@@ -2335,7 +2435,10 @@ jobs:
               head -14 "$wd/cc.err"
             fi
           }
-          gen_and_compile lockd "$LOCKD_DEFS" lockd_mach -maxonstack 1024
+          # -maxonstack is NOT passed: run 40388982459 proved Hurd migcom
+          # rejects it outright ("mig: fatal: unknown flag: '-maxonstack'").
+          # One named flag, one stated reason, per the no-blind-stripping rule.
+          gen_and_compile lockd "$LOCKD_DEFS" lockd_mach
           gen_and_compile task "$GITHUB_WORKSPACE/dxb/xnu/osfmk/mach/task.defs" task
           echo "=== END ACCEPTANCE ==="
 
