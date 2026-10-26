@@ -1020,6 +1020,19 @@ jobs:
           for d in i386 ppc arm; do
             [ -d "$FOREIGN/$d" ] && ln -sfn "$FOREIGN/$d" "$CCTOOLS_FOREIGN_INCLUDE/$d"
           done
+          # osfmk/mach/port.h:181 does `#include <sys/_types.h>`, so the
+          # foreign `sys` tree has to be reachable from machinc too. It was
+          # NOT: Stage 1c's own `ls` of machinc showed
+          #   Availability.h AvailabilityMacros.h TargetConditionals.h
+          #   architecture arm i386 libkern mach machine ppc
+          # with no `sys` entry, which is why mig died with
+          #   ../../dxb/xnu/osfmk/mach/port.h:181:10: fatal error:
+          #       'sys/_types.h' file not found        (run 40377933004)
+          # An earlier version of this file symlinked foreign/sys but placed
+          # it somewhere other than machinc, so the include never resolved.
+          for d in sys; do
+            [ -d "$FOREIGN/$d" ] && ln -sfn "$FOREIGN/$d" "$CCTOOLS_FOREIGN_INCLUDE/$d"
+          done
           # Availability.h/AvailabilityMacros.h are pulled in by swap.h too;
           # they are plain macro headers with no libc content.
           for h in Availability.h AvailabilityMacros.h; do
@@ -1356,6 +1369,20 @@ jobs:
           # so machinc must be at the ROOT of the search path. -isystem keeps
           # it out of the way of -I so Darwin headers never override host ones.
           INC="$INC -isystem $CCTOOLS_FOREIGN_INCLUDE"
+          # Neutralise Apple's compiler-supplied kext annotation.
+          # osfmk/mach/{i386,arm}/vm_types.h use `__kernel_ptr_semantics` on
+          # five typedefs, but nothing in xnu defines it -- not
+          # i386/vm_types.h, arm/vm_types.h, machine/vm_types.h, nor
+          # EXTERNAL_HEADERS/sys/cdefs.h. It is supplied by Apple's compiler
+          # driver, so clang-on-Linux sees a stray identifier and errors at
+          # each use:
+          #     osfmk/mach/i386/vm_types.h:103:44: error: expected ';'
+          #         after top level declarator
+          #     103 | typedef uintptr_t vm_offset_t __kernel_ptr_semantics;
+          #         (same at 126, 127, 130, 131)
+          # Defining it empty restores plain typedefs. mig only consumes type
+          # names, so dropping the annotation cannot change its behaviour.
+          INC="$INC -D__kernel_ptr_semantics="
           # Free pre-dispatch check: print what machinc/i386/_types.h itself
           # includes. Darwins's copy is NOT self-contained in general -- it may
           # want <sys/cdefs.h>, __darwin_* types or machine/_types.h, none of
@@ -1371,6 +1398,21 @@ jobs:
             echo "(self-contained: no #include directives)"
           echo '--- size ---'
           wc -l "$CCTOOLS_FOREIGN_INCLUDE/i386/_types.h" || true
+          # Same instrumented check for Darwin's sys/_types.h, which
+          # osfmk/mach/port.h:181 needs and which the machine/ directory alone
+          # cannot supply. foreign/sys exists (upstream: _types.h + attr.h)
+          # and is symlinked in Stage 1c; still print what it pulls in, since
+          # this one is also Darwin-only and may want __darwin_* or
+          # machine/_types.h.
+          echo '--- machinc/sys/_types.h: resolved path ---'
+          ls -la "$CCTOOLS_FOREIGN_INCLUDE/sys/_types.h" || \
+            echo "WARNING: sys/_types.h is not reachable via machinc"
+          echo '--- its #include directives ---'
+          grep -nE '^[[:space:]]*#[[:space:]]*include' \
+            "$CCTOOLS_FOREIGN_INCLUDE/sys/_types.h" || \
+            echo "(self-contained: no #include directives)"
+          echo '--- size ---'
+          wc -l "$CCTOOLS_FOREIGN_INCLUDE/sys/_types.h" || true
           # migcom needs the BSD scalar types (u_int and friends) that glibc
           # hides behind __USE_MISC. Stage 1b's compat.h defines them and is
           # safe to force-include here: its host-tool half is gated on
