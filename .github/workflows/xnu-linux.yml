@@ -157,8 +157,28 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive timeout 480 apt-get install -y --no-install-recommends $APT_OPTS \
             build-essential libssl-dev libbz2-dev liblzma-dev zlib1g-dev libncurses-dev \
             uuid-dev libcap-dev bison flex libblocksruntime-dev \
-            libc++abi-dev \
+            libc++abi-dev unifdef \
             libedit-dev libelf-dev python3 jq cmake ccache || true
+          # unifdef: Stage 6's first wall. installhdrs ran, got past
+          # build_setup (all six SETUP tools present), and then died with
+          #     /bin/sh: 1: unifdef: not found
+          #     make[1]: *** [MakeInc.top:425: build_exporthdrs_mi_bootstrap...] Error 2
+          # It is invoked by INSTALLHDRS_RULE_template (MakeInc.rule:74,78):
+          #     $$(UNIFDEF) $(4) $$< > ./$(3)/$$*.unifdef.$$$$$$$$
+          # i.e. exactly once per exported header. We already pass
+          # UNIFDEF=unifdef on the make command line but never installed it.
+          # Ubuntu ships it as `unifdef` (noble: 2.12-1, universe).
+          echo '=== header-install toolchain ==='
+          for t in unifdef decomment replacecontents installfile unifdef; do
+            printf '  %-16s %s\n' "$t" "$(command -v "$t" || echo '(not a PATH tool)')"
+          done
+          if command -v unifdef >/dev/null; then
+            echo "unifdef: $(command -v unifdef)"
+            unifdef -V 2>&1 | head -2 || true
+          else
+            echo "::error::unifdef is not installed; installhdrs cannot run"
+            exit 1
+          fi
           # libc++abi-dev is separate from the runtime package: Ubuntu ships
           # libc++abi.so.1 always, but the unversioned libc++abi.so that
           # `-lc++abi` needs only comes with the -dev package. kextsymboltool
@@ -2113,6 +2133,28 @@ jobs:
           # into a bare `y -d ...` (that is what run 40359414251 hit).
           # HOST_OS_VERSION was also empty, producing -mmacosx-version-min=
           # with no value.
+
+          # ---------------------------------------------------------------
+          # Preflight: print every host tool installhdrs can reach, resolved
+          # or not, BEFORE make runs. Visibility only -- no behaviour change.
+          #
+          # The header chain is INSTALLHDRS_RULE_template (MakeInc.rule:63-88)
+          #     $$(UNIFDEF) $(4) $$< > ...unifdef.$$$$; then
+          #     $$(DECOMMENT) ...unifdef.$$$$ r > ...strip.$$$$; then
+          #     $$(INSTALL) ...
+          # plus REPLACECONTENTS for the .UNIFDEF_FLAGS stamp (MakeInc.rule:74).
+          # unifdef was missing and cost a round trip; this line makes the
+          # next missing one visible for free instead of an hour later.
+          # ---------------------------------------------------------------
+          echo '=== installhdrs host tools (preflight) ==='
+          for t in unifdef sed awk grep cpp m4 bison flex perl python3 \
+                   nm strip otool lipo install_name_tool codesign_allocate; do
+            printf '  %-18s %s\n' "$t" "$(command -v "$t" 2>/dev/null || echo MISSING)"
+          done
+          for t in decomment installfile replacecontents setsegname kextsymboltool config; do
+            printf '  %-18s %s\n' "$t" "$([ -x "$OBJROOT/SETUP/$t/$t" ] && echo "$OBJROOT/SETUP/$t/$t" || echo MISSING)"
+          done
+          echo "  UNIFDEF=unifdef is passed on the make line: $(command -v unifdef || echo 'BUT NOT INSTALLED')"
 
           make_flags=(
             SDKROOT=macosx HOST_SDKROOT=macosx
