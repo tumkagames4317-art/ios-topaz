@@ -1,0 +1,44 @@
+From: Sweet port <sweet@localhost>
+Subject: [PATCH] ufs: look up "sweet-ufs" without a leading slash
+
+SecureDTLookupEntry resolves a path from the root and rejects a leading
+slash: upstream calls it as "chosen/memory-map", never "/chosen/memory-map".
+sweet_ufs_init asked for "/sweet-ufs", so the lookup failed with
+kErrorNotFound even though the node was present in the ADT, and every boot
+died in
+
+    panic: IOFindBSDRoot: SWEET UFS root ufsroot0 unavailable: 6
+
+6 is ENXIO, from the "no node in the device tree" branch. QEMU instruction
+tracing confirmed the driver body never executed: the only PCs inside its
+address range were memcpy, and _sweet_ufs_rootdev itself was never entered,
+which is what a clean early return looks like.
+
+Found by disassembling _sweet_ufs_rootdev, which at +0x80 calls
+SecureDTLookupEntry and branches to its ENXIO return at +0x198 when the
+result is not kSuccess. The node was independently verified present in the
+payload's ADT, so the tree was fine and only the path string was wrong.
+
+This is deliberately a separate patch applied after the ufs series rather
+than an edit to 0028: 0030, 0034, 0047, 0054, 0060, 0069, 0072, 0077 and
+others carry line-numbered hunks into bsd/dev/sweet_ufs.c, and shifting the
+file inside 0028 made 18 later patches fail to apply.
+
+---
+ bsd/dev/sweet_ufs.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -480,8 +480,8 @@ sweet_ufs_init(void)
+ 	int error;
+ 
+-	if (SecureDTLookupEntry(NULL, "/sweet-ufs", &node) != kSuccess ||
++	if (SecureDTLookupEntry(NULL, "sweet-ufs", &node) != kSuccess ||
+ 	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
+ 	    size < 2 * sizeof(uintptr_t)) {
+-		printf("SWEET UFS: no /sweet-ufs node in the device tree\n");
++		printf("SWEET UFS: no sweet-ufs node in the device tree\n");
+ 		return ENXIO;
+ 	}

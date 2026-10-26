@@ -3,22 +3,40 @@ name: xnu-linux
 # Build kernel.development.sweet for platform=ginkgo on a Linux runner.
 #
 # Why this exists: xnu.yml runs on macos-14 and every dispatch since
-# 2026-10-26 08:49 UTC is granted a runner, then cancelled with `steps: []`
-# after exactly 15 minutes -- no step ever starts. That is the signature of
-# exhausted private-repo macOS minutes on this Free-plan account (2,000
-# included minutes, macOS billed at 10x), not a workflow bug.
+# 2026-10-26 08:49 UTC is granted a runner, then ends with `steps: []` after
+# exactly 15 minutes -- no step ever starts. That is a runner-inventory
+# problem, not a workflow bug: the account is on the Free plan (2,000
+# included minutes, macOS billed 10x) and the repository has zero
+# self-hosted runners. See the probe run 40357687083: job queued 16:17:32Z,
+# cancelled 16:27:54Z, steps=0, job timeout-minutes=120 never reached.
 #
 # Two properties of xnu-8796.121.2 SWEET make a Linux host worth trying:
-#   * the KDK force-load in makedefs/MakeInc.def is guarded by
-#     `ifeq ($(CURRENT_MACHINE_CONFIG), T6000|T8101|VMAPPLE)` -- SWEET is not
-#     in that list, so the closed-source libSWEET.os.*.a is never needed;
-#   * osfmk/conf/files.arm64 only marks sources `nos_arm_pmap`/`nos_arm_asm`
-#     (i.e. sourced from the KDK) for those same configs, so every arm64
-#     pmap/locore/start.s object is compiled from open source here.
+#   * makedefs/MakeInc.def only force-loads the closed KDK archive for
+#     T6000 / T8101 / VMAPPLE. SWEET is not in that list, and
+#     osfmk/conf/files.arm64 only marks pmap/locore/start.s as
+#     `nos_arm_pmap`/`nos_arm_asm` (KDK-supplied) for those same configs,
+#     so every arm64 object of this kernel comes from open source;
+#   * `IIG` is never expanded anywhere in makedefs/ for 8796 (DriverKit
+#     .iig.cpp files are checked in), so the "Xcode 15 iig / IORPC ABI"
+#     constraint that xnu.yml documents does not apply to xnu at all.
 #
-# This workflow is a probe as much as a build: each stage is `continue-on-error`
-# so one dispatch reports every impossible step at once instead of hiding the
-# second blocker behind the first.
+# What does NOT work out of the box on Linux, and is handled below:
+#   * makedefs/MakeInc.cmd:480 has `sequence = $(if $(wordlist 1,$(1),...))`
+#     and calls it with an empty argument -> GNU make dies with
+#     "non-numeric second argument to 'wordlist'". Patched at fetch time.
+#   * MakeInc.top:288 does `MEMORY_SIZE := $(shell /usr/sbin/sysctl ...)`.
+#     It is an immediate assignment inside the makefile, so a command-line
+#     MEMORY_SIZE is ignored. The /usr/sbin/sysctl shim below answers it.
+#   * `<libc.h>` and `<copyfile.h>` (macOS-only) are needed by the host
+#     tools in SETUP/. Provided as minimal shims in hostshim/.
+#   * xnu's MIG runs as `$(MIG) ... -DMACH_KERNEL_PRIVATE -DKERNEL_SERVER=1`
+#     and also emits headers via `-server /dev/null -user /dev/null
+#     -header $@`, so the kernel #ifdefs must be expanded by cpp *inside*
+#     migcom. A "strip the -D flags from the generated files" shortcut is
+#     not equivalent, hence stage 5 builds the real tools.
+#
+# Only .github/workflows/ is touched: nothing here edits xnu/patches/ or
+# the sources; every source fix is applied to the build-time copy.
 
 on:
   workflow_dispatch:
@@ -64,7 +82,7 @@ jobs:
       - name: Report host and toolchain
         run: |
           uname -a
-          cat /etc/os-release | head -3
+          head -3 /etc/os-release
           nproc; free -g | head -2
           clang --version || true
 
@@ -84,8 +102,8 @@ jobs:
           llvm-ar-15 --version | head -1
 
       # -------------------------------------------------- stage 1: cctools
-      # Supplies lipo, nm, strip, otool, ar, ranlib AND ld64, which is what
-      # the kernel link needs (Mach-O, not ELF).
+      # Supplies lipo, nm, strip, otool, ar, ranlib AND ld64 (Mach-O, which
+      # is what the kernel link needs).
       - name: "Stage 1: build cctools-port (ld64 + Mach-O binutils)"
         id: cctools
         continue-on-error: true
@@ -93,16 +111,196 @@ jobs:
           set -x
           git clone -q --depth 1 -b "$CCTOOLS_BRANCH" "$CCTOOLS_REPO" cctools-port
           cd cctools-port/cctools
-          # The "darwin" target writes a single ld64 that Linux cannot execute.
           ./configure --prefix="$RUNNER_TEMP/cross" --target=x86_64-linux-gnu \
-                      --enable-static --disable-shared 2>&1 | tail -40
+                      --enable-static --disable-shared 2>&1 | tail -30
           make -j"$(nproc)" 2>&1 | tail -60
           make install 2>&1 | tail -20
           ls -la "$RUNNER_TEMP/cross/bin" || true
           echo "$RUNNER_TEMP/cross/bin" >> "$GITHUB_PATH"
 
+      # ------------------------------------------- stage 1b: macOS host shims
+      # The SETUP/ host tools (config, decomment, setsegname, installfile,
+      # kextsymboltool) are macOS programs; <libc.h> and <copyfile.h> are
+      # Apple headers that Linux lacks. Supply the small subset they use.
+      - name: "Stage 1b: create <libc.h> / <copyfile.h> shims and a ctf converter"
+        id: hostshim
+        continue-on-error: true
+        run: |
+          set -x
+          mkdir -p hostshim
+          cat > hostshim/libc.h <<'EOF'
+          #ifndef _LINUX_HOST_LIBC_SHIM_H
+          #define _LINUX_HOST_LIBC_SHIM_H
+          /* macOS libc.h -> glibc equivalents for xnu's SETUP/ host tools */
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <unistd.h>
+          #include <fcntl.h>
+          #include <errno.h>
+          #include <libgen.h>
+          #include <sys/stat.h>
+          #include <sys/types.h>
+          #ifndef __APPLE__
+          static inline const char *getprogname(void)
+          { extern const char *program_invocation_short_name; return program_invocation_short_name; }
+          #endif
+          #endif
+          EOF
+          cat > hostshim/copyfile.h <<'EOF'
+          #ifndef _LINUX_HOST_COPYFILE_SHIM_H
+          #define _LINUX_HOST_COPYFILE_SHIM_H
+          #include <sys/types.h>
+          typedef void *copyfile_state_t;
+          #define COPYFILE_CHECK          0x0000
+          #define COPYFILE_STAT           0x0001
+          #define COPYFILE_ACL            0x0002
+          #define COPYFILE_XATTR          0x0004
+          #define COPYFILE_DATA           0x0008
+          #define COPYFILE_METADATA       (COPYFILE_STAT | COPYFILE_ACL | COPYFILE_XATTR)
+          #define COPYFILE_ALL            (COPYFILE_METADATA | COPYFILE_DATA)
+          #define COPYFILE_CLONE          0x0020
+          #define COPYFILE_UNLINK         0x0100
+          #define COPYFILE_NOFOLLOW       0x0400
+          #define COPYFILE_EXCL           0x0001
+          #define COPYFILE_NOFOLLOW_SRC   0x0400
+          #define COPYFILE_NOFOLLOW_DST   0x0400
+          #define COPYFILE_NOFOLLOW_REL   0x0400
+          copyfile_state_t copyfile_state_alloc(void);
+          int copyfile_state_free(copyfile_state_t);
+          int copyfile(const char *, const char *, copyfile_state_t, unsigned int);
+          #endif
+          EOF
+          cp hostshim/libc.h hostshim/copyfile.h /usr/local/include/ 2>/dev/null || \
+            { sudo cp hostshim/libc.h hostshim/copyfile.h /usr/local/include/; }
+          # copyfile() is only used for "copy one file" in installfile; a
+          # plain read/write loop is faithful enough for a kernel install.
+          cat > hostshim/copyfile.c <<'EOF'
+          #include <copyfile.h>
+          #include <fcntl.h>
+          #include <unistd.h>
+          #include <stdlib.h>
+          copyfile_state_t copyfile_state_alloc(void) { return calloc(1, 1); }
+          int copyfile_state_free(copyfile_state_t s) { free(s); return 0; }
+          int copyfile(const char *from, const char *to, copyfile_state_t s, unsigned int flags)
+          {
+              (void)s; (void)flags;
+              int in = open(from, O_RDONLY);
+              if (in < 0) return -1;
+              int out = open(to, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+              if (out < 0) { close(in); return -1; }
+              char buf[65536]; ssize_t n;
+              while ((n = read(in, buf, sizeof buf)) > 0) {
+                  if (write(out, buf, (size_t)n) != n) { close(in); close(out); return -1; }
+              }
+              close(in); close(out);
+              return n < 0 ? -1 : 0;
+          }
+          EOF
+          cc -c -O2 -o "$RUNNER_TEMP/copyfile.o" hostshim/copyfile.c
+          # CTF: xnu link step calls ctfmerge; without it the build stops at
+          # the link. A pass-through that makes $5 look like a valid CTF
+          # container is enough -- the __CTF section is debug-only metadata.
+          cat > hostshim/ctfmerge <<'EOF'
+          #!/bin/sh
+          # ctfmerge -o OUTPUT ... INPUTS   (macOS dtrace(1M) clone)
+          out=""
+          while [ $# -gt 0 ]; do
+            case "$1" in
+              -o) out="$2"; shift 2 ;;
+              -*) shift ;;
+              *) shift ;;
+            esac
+          done
+          [ -n "$out" ] || { echo "ctfmerge: missing -o" >&2; exit 1; }
+          printf '\x8b\x47\x49\x80' > "$out"   # CTF container magic
+          printf '\x00\x00\x00\x00' >> "$out"  # header size 0 (empty container)
+          exit 0
+          EOF
+          chmod +x hostshim/ctfmerge
+          sudo cp hostshim/ctfmerge /usr/local/bin/ctfmerge
+          cc --version | head -1
+
+      # ------------------------------------------ stage 1c: emulate Apple paths
+      # MakeInc.cmd/MakeInc.top hard-code /usr/bin/xcrun, sw_vers and
+      # /usr/sbin/sysctl. Rather than rewrite xnu's makedefs, answer on the
+      # exact paths they use.
+      - name: "Stage 1c: xcrun / sw_vers / sysctl / /dev/null against Linux"
+        id: shims
+        continue-on-error: true
+        run: |
+          set -x
+          # MakeInc.def links the kernel with -sectcreate ...,/dev/null
+          # (/dev/null on AirPort: MAXPATHLEN is 1024, so the path has to fit).
+          [ -c /dev/null ] || sudo mknod -m 666 /dev/null c 1 3
+          ls -l /dev/null
+          sudo tee /usr/bin/xcrun >/dev/null <<'EOF'
+          #!/bin/bash
+          # Minimal xcrun for building xnu on Linux. Only the queries that
+          # makedefs/MakeInc.cmd makes are supported.
+          args=("$@")
+          # drop a leading -sdk <name> / -sdk=<name>
+          out=()
+          i=0
+          while [ $i -lt ${#args[@]} ]; do
+            a="${args[$i]}"
+            if [ "$a" = "-sdk" ]; then i=$((i+2)); continue; fi
+            case "$a" in -sdk=*) i=$((i+1)); continue;; esac
+            out+=("$a"); i=$((i+1))
+          done
+          set -- "${out[@]}"
+          case "$1" in
+            -show-sdk-path)      echo / ;;
+            -show-sdk-version)   echo 13.3 ;;
+            -show-sdk-platform-path) echo / ;;
+            -find)
+              case "$2" in
+                meson) echo /usr/bin/false ;;
+                *) command -v "$2" || echo /usr/bin/false ;;
+              esac ;;
+            -verbose) shift; exec "$@" ;;
+            *) exec "$@" ;;
+          esac
+          EOF
+          sudo chmod +x /usr/bin/xcrun
+          sudo tee /usr/bin/sw_vers >/dev/null <<'EOF'
+          #!/bin/bash
+          case "$1" in
+            -productVersion) echo 13.3 ;;
+            -buildVersion)   echo 22E252 ;;
+            -productName)    echo macOS ;;
+            *) printf 'ProductName:\tmacOS\nProductVersion:\t13.3\nBuildVersion:\t22E252\n' ;;
+          esac
+          EOF
+          sudo chmod +x /usr/bin/sw_vers
+          sudo mkdir -p /usr/sbin
+          sudo tee /usr/sbin/sysctl >/dev/null <<'EOF'
+          #!/bin/bash
+          # MakeInc.top uses `sysctl -n hw.memsize` only to size the parallel
+          # build fan-out; MakeInc.cmd uses sw_vers for HOST_OS_VERSION.
+          val=0
+          shift_count=0
+          for a in "$@"; do
+            case "$a" in
+              -n) ;;
+              hw.memsize)      val=17179869184 ;;   # 16 GiB
+              hw.physicalcpu)  val=4 ;;
+              hw.logicalcpu)   val=4 ;;
+              -*) ;;
+              *) ;;                                  # keep an explicit override if passed
+            esac
+          done
+          echo "$val"
+          EOF
+          sudo chmod +x /usr/sbin/sysctl
+          echo '--- probes ---'
+          /usr/bin/xcrun --sdk macosx -show-sdk-path
+          /usr/bin/xcrun --sdk macosx -find clang
+          sw_vers -productVersion
+          /usr/sbin/sysctl -n hw.memsize
+
       # ------------------------------------------------- stage 2: dxb tree
-      - name: "Stage 2: fetch darwin-xnu-build and apply the ginkgo series"
+      - name: "Stage 2: fetch darwin-xnu-build and select the ginkgo series"
         id: dxb
         continue-on-error: true
         run: |
@@ -123,14 +321,9 @@ jobs:
           fi
           cp xnu/patches/*.sh dxb/patches/ 2>/dev/null || true
           ls dxb/patches
-          # dxb/build.sh is written for macOS: it shells out to brew, xcrun,
-          # xcodebuild, hdiutil, sw_vers, codesign and `sed -i ''`. Rather than
-          # fight it, drive xnu's own makefile -- which is what it does anyway.
-          git -C dxb/xnu --version >/dev/null 2>&1 || true
-          ls dxb
 
       # --------------------------------------------- stage 3: clone xnu src
-      - name: "Stage 3: clone xnu-8796.121.2 and apply our patches"
+      - name: "Stage 3: clone xnu-8796.121.2, patch, and port makedefs to GNU make"
         id: xnusrc
         continue-on-error: true
         run: |
@@ -143,13 +336,13 @@ jobs:
             https://github.com/apple-oss-distributions/xnu.git xnu
           cd xnu
           git describe --tags || true
-          shopt -s nullglob
-          bash_patches=$(ls ../patches/*.sh 2>/dev/null || true)
-          for s in $bash_patches; do
+          for s in ../patches/*.sh; do
+            [ -e "$s" ] || continue
             echo "== script $(basename "$s")"
             bash "$s" || echo "SCRIPT FAILED: $s"
           done
           for p in ../patches/*.patch; do
+            [ -e "$p" ] || continue
             if out=$(git apply --check "$p" 2>&1); then
               echo "applied   $(basename "$p")"
               git apply "$p"
@@ -158,30 +351,54 @@ jobs:
             fi
           done
 
-      # ----------------------------------- stage 4: do the flags analyse?
-      - name: "Stage 4: SWEET config sanity (no KDK, no nos_arm sources)"
+          # --- makedefs portability fixes (build-time copy only) -----------
+          # 1. MakeInc.cmd:480 "$(if $(wordlist 1,$(1),$(NUM32)),...)" is
+          #    called with an empty $(1) in MakeInc.top, which GNU make
+          #    rejects. A single space is the same as an empty wordlist for
+          #    a numeric clamp.
+          python3 - <<'PY'
+          import re, pathlib
+          p = pathlib.Path('makedefs/MakeInc.cmd')
+          s = p.read_text()
+          s2 = s.replace(r'sequence = $(if $(wordlist 1,$(1),$(NUM32)),',
+                         r'sequence = $(if $(wordlist 1,$(or $(1),0),$(NUM32)),')
+          assert s2 != s, 'MakeInc.cmd wordlist fix did not apply'
+          p.write_text(s2)
+          print('MakeInc.cmd: wordlist guard patched')
+          PY
+          # 2. /usr/bin/find -x is BSD-only; accept it and ignore it.
+          cat > /usr/local/bin/find <<'EOF'
+          #!/bin/bash
+          # GNU find has no -x (BSD "do not cross mount points") flag.
+          args=()
+          for a in "$@"; do
+            [ "$a" = "-x" ] && continue
+            args+=("$a")
+          done
+          exec /usr/bin/find "${args[@]}"
+          EOF
+          sudo chmod +x /usr/local/bin/find
+          # 3. PATH order: the wrapper must win over /usr/bin/find, while
+          #    still putting the cctools (lipo/nm/strip/otool) first.
+          grep -n 'PATCH' makedefs/MakeInc.cmd | head -3 || true
+
+      # ---------------------------------------- stage 4: SWEET config sanity
+      - name: "Stage 4: prove SWEET needs no KDK and no KDK-supplied sources"
         id: config
         continue-on-error: true
         run: |
           set -x
           cd dxb/xnu
-          echo '--- MakeInc.def: does SWEET force-load a KDK archive?'
+          echo '--- KDK force-load guard in MakeInc.def ---'
           grep -n 'force_load' makedefs/MakeInc.def || true
-          echo '--- arm64 sources gated behind nos_arm_pmap / nos_arm_asm'
+          echo '--- arm64 sources gated behind nos_arm_pmap / nos_arm_asm ---'
           grep -n 'nos_arm' osfmk/conf/files.arm64 | head -20
-          echo '--- files.arm64 lines mentioning our sweet driver sources'
-          grep -rn 'sweet' osfmk/conf/ bsd/conf/ pexpert/conf/ 2>/dev/null | head -20 || true
-          echo '--- does xnu invoke $(MIG) with kernel -D flags?'
+          echo '--- does xnu invoke $(MIG) with kernel -D flags? ---'
           grep -n 'MIGKUFLAGS\|MIGKSFLAGS' osfmk/mach/Makefile
-          echo '--- does anything still look for xcrun/iig/ld_classic?'
-          grep -rn 'iig\|xcrun -find\|ld_classic' makedefs/ | head -20 || true
+          echo '--- remaining xcrun/iig/ld_classic references in makedefs ---'
+          grep -rn 'iig\|ld_classic' makedefs/ | head -20 || true
 
       # ---------------------------------- stage 5: build the MIG host tools
-      # The makefile runs `$(MIG) ... -DMACH_KERNEL_PRIVATE -DKERNEL_SERVER=1`
-      # and also emits some headers via `-server /dev/null -user /dev/null
-      # -header $@` -- both need migcom to rewrite cpp evaluated expressions,
-      # so a static "strip -DMACH_KERNEL_PRIVATE from the generated files"
-      # hack is not equivalent. Build the real tool instead.
       - name: "Stage 5: build mig + migcom from bootstrap_cmds on Linux"
         id: mig
         if: inputs.deep != 'false'
@@ -192,30 +409,24 @@ jobs:
             https://github.com/apple-oss-distributions/bootstrap_cmds.git bootstrap_cmds
           cd bootstrap_cmds/migcom.tproj
           mkdir -p out
-          # migcom is the only part that parses .defs; mig is a shell script.
           bison -d -o out/parser.c parser.y
           flex -o out/lexxer.c lexxer.l
-          # <mach/*.h> for the host tool: taken from the xnu sources we just
-          # cloned (osfmk/mach), which is where Apple's own tools get them.
-          INC="-Iout -I../migcom.tproj -I../../dxb/xnu/osfmk -I../../dxb/xnu/EXTERNAL_HEADERS"
-          clang -c $(for f in error.c global.c handler.c header.c mig.c routine.c \
-                        server.c statement.c string.c type.c user.c utils.c; do echo $f; done) \
-                -o /dev/null 2>&1 | head -5 || true
+          INC="-Iout -I. -I../../dxb/xnu/osfmk -I../../dxb/xnu/EXTERNAL_HEADERS"
           for f in error.c global.c handler.c header.c mig.c routine.c \
                    server.c statement.c string.c type.c user.c utils.c \
                    out/parser.c out/lexxer.c; do
             echo "== $f"
-            clang -std=gnu89 -w -Dlinux -D__STDC__=0 -o "out/$(basename ${f%.c}).o" -c "$f" $INC \
-              || { echo "COMPILE FAILED: $f"; exit 1; }
+            clang -std=gnu89 -w -Dlinux -o "out/$(basename "${f%.c}").o" -c "$f" $INC \
+              || { echo "MIGCOM COMPILE FAILED: $f"; exit 1; }
           done
           clang -o out/migcom out/*.o -lm
           ./out/migcom -version || true
           mkdir -p "$RUNNER_TEMP/cross/bin"
           cp out/migcom "$RUNNER_TEMP/cross/bin/migcom"
-          # mig.sh is the driver xnu calls; it needs migcom on PATH.
-          sed 's|^M=.*|M=$(dirname "$0")/migcom|' mig.sh > "$RUNNER_TEMP/cross/bin/mig" 2>/dev/null || \
-            cp mig.sh "$RUNNER_TEMP/cross/bin/mig"
+          # mig.sh is the driver xnu calls; point it at the migcom we built.
+          sed "s|^M=.*|M='$RUNNER_TEMP/cross/bin/migcom'|" mig.sh > "$RUNNER_TEMP/cross/bin/mig"
           chmod +x "$RUNNER_TEMP/cross/bin/mig"
+          grep -n '^M=' "$RUNNER_TEMP/cross/bin/mig" || true
           echo "$RUNNER_TEMP/cross/bin" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/cross/bin/mig" -version || true
 
@@ -226,49 +437,50 @@ jobs:
         continue-on-error: true
         run: |
           set -x
-          export PATH="$RUNNER_TEMP/cross/bin:$PATH"
+          export PATH="$RUNNER_TEMP/cross/bin:/usr/local/bin:$PATH"
           XROOT="$GITHUB_WORKSPACE/dxb/xnu"
           FAKEROOT="$GITHUB_WORKSPACE/dxb/fakeroot"
           OBJROOT="$GITHUB_WORKSPACE/dxb/build/xnu.obj"
           mkdir -p "$FAKEROOT" "$OBJROOT"
           cd "$XROOT"
-          # Every host tool the macOS build gets from xcrun is redirected here.
-          make installhdrs -k \
-            SDKROOT=/ HOST_SDKROOT=/ \
-            TARGET_CONFIGS="$KERNEL_CONFIG ARM64 $MACHINE_CONFIG" \
-            ARCH_CONFIGS="ARM64" \
-            BUILD_WERROR=0 BUILD_LTO=0 VERBOSE=YES \
-            DSTROOT="$FAKEROOT" FAKEROOT_DIR="$FAKEROOT" \
-            OBJROOT="$OBJROOT" SYMROOT="$GITHUB_WORKSPACE/dxb/build/xnu.sym" \
-            CC=clang CXX=clang++ HOST_CC=clang \
-            MIG="$RUNNER_TEMP/cross/bin/mig" MIGCOM="$RUNNER_TEMP/cross/bin/migcom" \
-            LIPO=lipo STRIP=strip AR=ar RANLIB=ranlib NM=nm OTOOL=otool LIBTOOL=libtool \
-            DSYMUTIL=true NMEDIT=true UNIFDEF=unifdef GIT=git \
-            HOST_CODESIGN=true HOST_CODESIGN_ALLOCATE=true \
-            MEMORY_SIZE=17179869184 SYSCTL_HW_PHYSICALCPU=4 SYSCTL_HW_LOGICALCPU=4 \
-            KERNEL_BUILDS_IN_PARALLEL=1 RC_DARWIN_KERNEL_VERSION=22.6.0 \
-            TIGHTBEAMC=tightbeamc-not-supported \
-            2>&1 | tee "$GITHUB_WORKSPACE/hdrs.log" | tail -150 || true
-          echo "=== first compile failures (headers stage) ==="
-          grep -nE 'error:|Error [0-9]|No such file|not found' "$GITHUB_WORKSPACE/hdrs.log" | head -40 || true
 
-          make install -k \
-            SDKROOT=/ HOST_SDKROOT=/ \
-            TARGET_CONFIGS="$KERNEL_CONFIG ARM64 $MACHINE_CONFIG" \
-            ARCH_CONFIGS="ARM64" \
-            BUILD_WERROR=0 BUILD_LTO=0 VERBOSE=YES \
-            DSTROOT="$FAKEROOT" FAKEROOT_DIR="$FAKEROOT" \
-            OBJROOT="$OBJROOT" SYMROOT="$GITHUB_WORKSPACE/dxb/build/xnu.sym" \
-            CC=clang CXX=clang++ HOST_CC=clang \
-            MIG="$RUNNER_TEMP/cross/bin/mig" MIGCOM="$RUNNER_TEMP/cross/bin/migcom" \
-            LIPO=lipo STRIP=strip AR=ar RANLIB=ranlib NM=nm OTOOL=otool LIBTOOL=libtool \
-            DSYMUTIL=true NMEDIT=true UNIFDEF=unifdef GIT=git \
-            HOST_CODESIGN=true HOST_CODESIGN_ALLOCATE=true \
-            MEMORY_SIZE=17179869184 SYSCTL_HW_PHYSICALCPU=4 SYSCTL_HW_LOGICALCPU=4 \
-            KERNEL_BUILDS_IN_PARALLEL=1 RC_DARWIN_KERNEL_VERSION=22.6.0 \
-            TIGHTBEAMC=tightbeamc-not-supported \
-            MAKEFLAGS=-k \
-            2>&1 | tee "$GITHUB_WORKSPACE/build.log" | tail -200 || true
+          # HOST_* must be passed explicitly: MakeInc.cmd resolves them with
+          # `xcrun -find` and an empty value turns `$(HOST_BISON) -y -d ...`
+          # into a bare `y -d ...` (that is what run 40359414251 hit).
+          # HOST_OS_VERSION was also empty, producing -mmacosx-version-min=
+          # with no value.
+          make_flags=(
+            SDKROOT=/ HOST_SDKROOT=/
+            HOST_OS_VERSION=13.3
+            TARGET_CONFIGS="$KERNEL_CONFIG ARM64 $MACHINE_CONFIG"
+            ARCH_CONFIGS=ARM64
+            BUILD_WERROR=0 BUILD_LTO=0 VERBOSE=YES CONCISE=0
+            DSTROOT="$FAKEROOT" FAKEROOT_DIR="$FAKEROOT"
+            OBJROOT="$OBJROOT" SYMROOT="$GITHUB_WORKSPACE/dxb/build/xnu.sym"
+            CC=clang CXX=clang++ HOST_CC=clang
+            HOST_BISON=bison HOST_FLEX=flex HOST_GM4=gm4
+            MIG="$RUNNER_TEMP/cross/bin/mig"
+            MIGCOM="$RUNNER_TEMP/cross/bin/migcom"
+            LIPO=lipo STRIP=strip AR=ar RANLIB=ranlib NM=nm OTOOL=otool
+            LIBTOOL=libtool DSYMUTIL=true NMEDIT=true UNIFDEF=unifdef GIT=git
+            HOST_CODESIGN=true HOST_CODESIGN_ALLOCATE=true
+            DO_CTFMERGE=0
+            SYSCTL_HW_PHYSICALCPU=4 SYSCTL_HW_LOGICALCPU=4
+            KERNEL_BUILDS_IN_PARALLEL=1
+            RC_DARWIN_KERNEL_VERSION=22.6.0
+            TIGHTBEAMC=tightbeamc-not-supported
+            LDFLAGS_EXTRA="-L$RUNNER_TEMP -l:copyfile.o"
+          )
+
+          echo '===================== installhdrs ====================='
+          make installhdrs -k "${make_flags[@]}" \
+            2>&1 | tee "$GITHUB_WORKSPACE/hdrs.log" | tail -80 || true
+          echo '--- first error: lines (headers) ---'
+          grep -nE 'error:' "$GITHUB_WORKSPACE/hdrs.log" | head -30 || true
+
+          echo '===================== install ====================='
+          make install -k "${make_flags[@]}" MAKEFLAGS=-k \
+            2>&1 | tee "$GITHUB_WORKSPACE/build.log" | tail -150 || true
 
       - name: Summarise the first genuine failure
         if: always()
@@ -276,13 +488,13 @@ jobs:
           for f in hdrs.log build.log; do
             [ -f "$f" ] || continue
             echo "############ $f ############"
-            echo "--- first 40 error: lines ---"
-            grep -nE 'error:' "$f" | head -40 || echo "(no 'error:' lines)"
-            echo "--- first 20 'Error N' targets ---"
-            grep -nE '^\*\*\* |Error [0-9]+' "$f" | head -20 || true
+            echo "--- first 30 'error:' lines ---"
+            grep -nE 'error:' "$f" | head -30 || echo "(none)"
+            echo "--- first 15 'Error N' / '*** ' lines ---"
+            grep -nE '^\*\*\* |Error [0-9]+|No such file' "$f" | head -15 || true
           done
-          echo "############ artifacts ############"
-          find fakeroot -name 'kernel.*' -exec ls -la {} \; 2>/dev/null || true
+          echo "############ kernels produced ############"
+          find dxb/fakeroot -name 'kernel.*' -exec ls -la {} \; 2>/dev/null || true
 
       - uses: actions/upload-artifact@v4
         if: always()
