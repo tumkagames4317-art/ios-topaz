@@ -2493,11 +2493,19 @@ jobs:
                  "$gdefs" 2>"$wd/mig.err"; then
               echo "  MIG EXIT: 0"
             else
-              echo "  MIG EXIT: nonzero -- $(head -3 "$wd/mig.err" | tr '\n' ' ')"
+              echo "  MIG EXIT: nonzero -- $(grep -iE 'fatal|not defined|syntax|error' "$wd/mig.err" | head -5 | tr '\n' ' ')"
             fi
             if [ ! -s "$wd/$gbase.h" ]; then
               echo "  $gbase.h: NOT PRODUCED"
-              head -6 "$wd/mig.err" 2>/dev/null || true
+              # Print the lines that MATTER, not the first N. Run 40394250479 lost a whole
+            # run because head -3 returned three "overriding previous definition"
+            # warnings while the fatal error sat four lines further down. Any
+            # diagnostic that truncates from the top can hide the answer behind
+            # harmless noise; filter, then cap.
+            echo "  --- mig.err: fatal/not-defined lines ---"
+            grep -iE 'fatal|not defined|syntax|error' "$wd/mig.err" 2>/dev/null | head -12 || true
+            echo "  --- mig.err: full (last 15 lines) ---"
+            tail -15 "$wd/mig.err" 2>/dev/null || true
               # Was migcom fed garbage, or did it reject real input? Reproduce
               # the preprocess step mig.sh would have run and show what migcom
               # actually received. This settles "no SubSystem declaration"
@@ -2592,7 +2600,7 @@ jobs:
             echo "  routines emitted: $(grep -cE '^kern_return_t[[:space:]]+[a-zA-Z_]+[[:space:]]*\(' "$CTL/control.h" 2>/dev/null || echo 0)"
             head -20 "$CTL/control.h" 2>/dev/null || true
           else
-            echo "  CONTROL MIG EXIT: nonzero -- $(head -3 "$CTL/err" | tr '\n' ' ')"
+            echo "  CONTROL MIG EXIT: nonzero -- $(grep -iE 'fatal|not defined|syntax|error' "$CTL/err" | head -5 | tr '\n' ' ')"
           fi
           gen_and_compile task "$GITHUB_WORKSPACE/dxb/xnu/osfmk/mach/task.defs" task
           echo "=== END ACCEPTANCE ==="
