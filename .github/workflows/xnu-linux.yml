@@ -2513,7 +2513,7 @@ jobs:
             # __APPLE_API_UNSTABLE, not the arch macros -- KERNEL_SERVER.
             # It also selects the SERVERPAIRS/IsaKernelServer branches that
             # decide which generated files migcom produces.
-            KSW="-DKERNEL=1 -DKERNEL_PRIVATE=1 -DKERNEL_SERVER=1 -D__APPLE_API_UNSTABLE=1 -DPRIVATE=1 -DARCH_arm64=1 -DARM64=1"
+            KSW="-DKERNEL=1 -DKERNEL_PRIVATE=1 -DKERNEL_SERVER=1 -D__APPLE_API_UNSTABLE=1 -DPRIVATE=1 -DARCH_arm64=1 -DARM64=1 -D_MACH_MACHINE_MACHNINE_TYPES_DEFS=1 -D_MACH_MACHINE_MACHINE_TYPES_DEFS=1"
             # INCLUDE PATHS. A .defs is #include-ed by a driver of its own:
             #     lockd_mach.defs:30  #include <mach/std_types.defs>
             #     lockd_mach.defs:31  #include <mach/mach_types.defs>
