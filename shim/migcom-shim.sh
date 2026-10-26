@@ -72,8 +72,9 @@ done
 
 inp=$(mktemp)
 real_out=$(mktemp)
+real_out2=$(mktemp)
 hoisted=$(mktemp)
-trap 'rm -f "$inp" "$real_out" "$hoisted"' EXIT
+trap 'rm -f "$inp" "$real_out" "$real_out2" "$hoisted"' EXIT
 
 cat > "$inp"
 
@@ -89,9 +90,74 @@ else
   cp "$inp" "$real_out"
 fi
 
+# --- (3b) SameCount -> an explicit count argument --------------------------
+# Apple's mig accepts the marker `SameCount` on an out array parameter and
+# uses it to generate a count output. GNU mig has no such keyword: the
+# lexer (lexxer.l) knows routine/simpleroutine/in/out/inout/array/of/... and
+# nothing else, so `array_t, SameCount;` is a hard SYNTAX ERROR -- measured
+# in run 40395508631 at task.defs:278-280, 295-296.
+#
+# Dropping the marker is NOT a fix. It would make the marker vanish AND
+# silently delete the count parameter that Apple's mig generates from it.
+# The kernel proves the parameter is real -- osfmk/kern/task.h:
+#     extern kern_return_t task_get_exception_ports(
+#         task_t task, exception_mask_t exception_mask,
+#         exception_mask_array_t masks,
+#         mach_msg_type_number_t *CountCnt,      <-- generated, not in .defs
+#         exception_port_array_t ports,
+#         exception_behavior_array_t behaviors,
+#         thread_state_flavor_array_t flavors);
+# and ipc_tt.c:4824 calls it with seven arguments. A stub missing CountCnt
+# would fail to compile against that header.
+#
+# GNU mig has an exact equivalent: declaring the parameter yourself as
+# `out name : mach_msg_type_number_t`. So SameCount is REWRITTEN into that
+# form rather than removed. The emitted order then matches Apple's: Apple
+# puts the count immediately before the parameter carrying the marker, so
+# a count is inserted before the FIRST marked parameter of a routine and
+# later markers in the same routine are simply dropped.
+#
+# Name: CountCnt. It appears in the kernel but is not part of the Mach
+# message -- MIG's generated header uses the .defs name, and the external
+# ABI is positional. Chosen over a descriptive name (e.g.
+# old_handlers_count) precisely because it is not ABI.
+#
+# Applies to 24 markers across 8 routines in host_priv.defs, task.defs and
+# thread_act.defs. The generated stubs are kernel-side, so this is only
+# about compiling this tree; it is not a device ABI claim.
+n_sc=$(grep -c 'SameCount' "$real_out" || true)
+if [ "${n_sc:-0}" -gt 0 ]; then
+  awk '
+    function emit_count() {
+      print "  out\tCountCnt\t\t: mach_msg_type_number_t;"
+      inserted = 1
+    }
+    {
+      line = $0
+      trimmed = line
+      sub(/^[ \t]+/, "", trimmed)
+
+      # A new routine starts: this one has not had its count yet.
+      if (trimmed ~ /^(simple)?routine([ \t]|$)/) inserted = 0
+
+      if (trimmed !~ /SameCount/) { print line; next }
+
+      # Drop the marker, keeping the terminating ; or ) of the parameter.
+      had_paren = 0
+      if (line ~ /\)[ \t]*;[ \t]*$/) had_paren = 1
+      sub(/[ \t]*,[ \t]*SameCount/, "", line)
+      if (!inserted) emit_count()
+      print line
+    }
+  ' "$real_out" > "$real_out2"
+  echo "migcom-shim: converted $n_sc SameCount markers into explicit count parameters" >&2
+else
+  cp "$real_out" "$real_out2"
+fi
+
 # --- (4) hoist the subsystem statement to the top --------------------------
-if ! grep -qE '^[[:blank:]]*subsystem([[:blank:]]|$)' "$real_out"; then
-  exec "$real" "${args[@]}" < "$real_out"
+if ! grep -qE '^[[:blank:]]*subsystem([[:blank:]]|$)' "$real_out2"; then
+  exec "$real" "${args[@]}" < "$real_out2"
 fi
 
 awk '
@@ -114,12 +180,12 @@ awk '
     printf "%s", ss
     for (i = 1; i <= n; i++) print lines[i]
   }
-' "$real_out" > "$hoisted"
+' "$real_out2" > "$hoisted"
 
 awk_rc=$?
 if [ "$awk_rc" -ne 0 ]; then
   echo "migcom-shim: WARNING: could not hoist subsystem (awk rc=$awk_rc); passing through unchanged" >&2
-  exec "$real" "${args[@]}" < "$real_out"
+  exec "$real" "${args[@]}" < "$real_out2"
 fi
 
 echo "migcom-shim: hoisted subsystem statement to top of input" >&2
