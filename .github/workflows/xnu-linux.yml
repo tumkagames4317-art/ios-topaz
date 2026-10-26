@@ -2127,52 +2127,154 @@ jobs:
           # COMPILE it. If migcom's field assumptions are wrong the error
           # names the bad field; that is why this is safe to attempt.
           # ---------------------------------------------------------------
-          echo "=== ACCEPTANCE: lockd.defs -> lockd_mach.h ==="
-          acct="$RUNNER_TEMP/acct"; rm -rf "$acct"; mkdir -p "$acct"
-          lockd="$GITHUB_WORKSPACE/dxb/xnu/osfmk/lockd/lockd.defs"
-          if [ ! -f "$lockd" ]; then
-            echo "::warning::lockd.defs not found at $lockd; skipping acceptance test"
+          # ===============================================================
+          # PREBUILT migcom FROM DEBIAN
+          #
+          # Every previous attempt built migcom from Apple's bootstrap_cmds,
+          # whose published struct definitions are a stripped skeleton. That
+          # produced a refilling error queue: 11 closed, 19+ revealed, then
+          # clang stopped at -ferror-limit. handler.c is a COMPLETE modern
+          # writer compiled against INCOMPLETE headers, so every field we add
+          # exposes the next reader of a field that was removed.
+          #
+          # Debian ships a prebuilt amd64 migcom inside the `mig` SOURCE
+          # package, under a different BINARY name:
+          #     Package: mig-x86-64-gnu   (source: mig)
+          #     trixie 1.8+git20231217-8   sid 1.8+git20231217-11
+          #     Depends: libc6 (>= 2.34)     Installed-Size: 160
+          #     usr/bin/x86_64-gnu-mig
+          #     usr/lib/mig/x86_64-gnu-migcom   <- real x86-64 ELF, 125520 b
+          #
+          # It is Hurd-lineage: one consistent vintage, every translation
+          # unit built against the same struct set. Strings in the binary:
+          # mach_msg_type_t, mach_msg_type_long_t and MSG_TYPE_POLYMORPHIC
+          # PRESENT; rtMaxReplySize, argPuntNum, akbQuickCheck, argLongForm,
+          # IsCamelot and death_pill ABSENT -- it never read the fields that
+          # were stripped from Apple's public headers.
+          #
+          # Fetched as a .deb directly rather than adding a foreign apt suite:
+          # no pinning, no Release-file juggling, one verified artifact.
+          # ===============================================================
+          echo "=== INSTALL: Debian mig-x86-64-gnu ==="
+          MIGPKG="$RUNNER_TEMP/migpkg"; rm -rf "$MIGPKG"; mkdir -p "$MIGPKG"
+          MIG_DEB_URL="http://deb.debian.org/debian/pool/main/m/mig/mig-x86-64-gnu_1.8+git20231217-8_amd64.deb"
+          if curl -fsSL --retry 3 --max-time 180 -o "$MIGPKG/mig.deb" "$MIG_DEB_URL"; then
+            echo "  downloaded: mig-x86-64-gnu_1.8+git20231217-8_amd64.deb ($(stat -c%s "$MIGPKG/mig.deb") bytes)"
+            ( cd "$MIGPKG" && ar x mig.deb ) || echo "  ar x failed"
+            if [ -f "$MIGPKG/data.tar.xz" ]; then
+              tar -xJf "$MIGPKG/data.tar.xz" -C "$MIGPKG" && echo "  extracted data.tar.xz"
+            fi
+            MIGCOM_BIN="$MIGPKG/usr/lib/mig/x86_64-gnu-migcom"
+            MIG_SH_BIN="$MIGPKG/usr/bin/x86_64-gnu-mig"
+            ls -la "$MIG_SH_BIN" "$MIGCOM_BIN" 2>&1 || true
+            file "$MIGCOM_BIN" 2>/dev/null || true
+            if [ -x "$MIGCOM_BIN" ]; then
+              cp "$MIGCOM_BIN" "$RUNNER_TEMP/cross/bin/migcom-debian"
+              chmod +x "$RUNNER_TEMP/cross/bin/migcom-debian"
+              # Swap it in, keeping the source-built one for comparison.
+              if [ -x "$RUNNER_TEMP/cross/bin/migcom" ]; then
+                mv "$RUNNER_TEMP/cross/bin/migcom" "$RUNNER_TEMP/cross/bin/migcom-apple-src" || true
+              fi
+              cp "$RUNNER_TEMP/cross/bin/migcom-debian" "$RUNNER_TEMP/cross/bin/migcom"
+              echo "  INSTALL: prebuilt migcom in place at cross/bin/migcom"
+            else
+              echo "::error::INSTALL: prebuilt migcom missing after extraction"
+              find "$MIGPKG" -maxdepth 4 | head -30
+            fi
           else
-            echo "  source: $lockd ($(wc -l < "$lockd") lines)"
-            # The real invocation from osfmk/lockd/Makefile:46-51, with the
-            # subsystem's own MIGKUFLAGS.
+            echo "::error::INSTALL: could not download $MIG_DEB_URL"
+          fi
+
+          # ===============================================================
+          # FLAGS: which Apple-mig options does Hurd migcom accept?
+          # Verdict per flag, no blind stripping.
+          # ===============================================================
+          echo "=== FLAGS: Apple-mig option compatibility ==="
+          ACCT="$RUNNER_TEMP/acct"; rm -rf "$ACCT"; mkdir -p "$ACCT"
+          LOCKD_DEFS="$GITHUB_WORKSPACE/dxb/xnu/osfmk/lockd/lockd_mach.defs"
+          probe_flag() {
+            pname="$1"; shift
+            printf 'subsystem\nKernelUser\nprobe_test 9999;\n' > "$ACCT/p.defs"
+            out="$ACCT/probe.h"; errlog="$ACCT/probe.err"; rm -f "$out" "$errlog"
+            if "$RUNNER_TEMP/cross/bin/migcom" -header "$out" "$@" "$ACCT/p.defs" \
+                 >/dev/null 2>"$errlog"; then
+              echo "  $pname: ACCEPTED (exit 0)"
+            else
+              prc=$?
+              echo "  $pname: REJECTED (exit $prc) -- $(head -1 "$errlog")"
+            fi
+          }
+          probe_flag "baseline (no flag)"
+          probe_flag "-maxonstack 1024" -maxonstack 1024
+          probe_flag "-novouchers" -novouchers
+          probe_flag "-mach_msg2" -mach_msg2
+
+          # ===============================================================
+          # LOCKD + TASK: generate real headers and COMPILE them.
+          #
+          # There is NO oracle to diff against: xnu ships zero
+          # mig-generated headers. All 82 .defs were checked; none of the
+          # five same-named .h files carries mig's /* Module */ banner --
+          # they are hand-written parallel specs, not generator output.
+          #
+          # So the check is structural: a header that compiles against
+          # xnu's own mach/message.h, mach/port.h and kern_return.h has the
+          # right wire layout, because the compiler checks the LAYOUT and
+          # not a comment. A wrong mach_msg_type_t ordering, field width or
+          # __MACH30__ handling cannot pass this.
+          # ===============================================================
+          gen_and_compile() {
+            glabel="$1"; gdefs="$2"; gbase="$3"; shift 3
+            echo "--- $glabel: $gdefs ---"
+            if [ ! -f "$gdefs" ]; then
+              echo "  MISSING: $gdefs"; return 0
+            fi
+            wd="$ACCT/$glabel"; mkdir -p "$wd"
+            # NOTE on -I: it is a CPP flag, not a migcom option. mig.sh
+            # already passes `-I "${sourcedir}"` to the preprocessor
+            # (mig.sh:180,183) and routes any unrecognised -* into
+            # cppflags (mig.sh:129), so include paths must go to mig,
+            # never to migcom. Verified: the Debian binary's option set is
+            # -header -iheader -user -server -sheader -list -prefix
+            # -subrprefix, with no -I.
             if "$RUNNER_TEMP/cross/bin/mig" \
-                 -DMACH_KERNEL_PRIVATE -DKERNEL_USER=1 -maxonstack 1024 \
-                 -user    "$acct/lockd_mach.c" \
-                 -header  "$acct/lockd_mach.h" \
-                 -server  /dev/null \
-                 -sheader /dev/null \
-                 "$lockd" 2>&1; then
+                 -D__MACH30__ -DMACH_KERNEL_PRIVATE -DKERNEL_USER=1 "$@" \
+                 -user "$wd/$gbase.c" -header "$wd/$gbase.h" \
+                 -server /dev/null -sheader /dev/null \
+                 "$gdefs" 2>"$wd/mig.err"; then
               echo "  MIG EXIT: 0"
             else
-              echo "  MIG EXIT: nonzero (see errors above)"
+              echo "  MIG EXIT: nonzero -- $(head -3 "$wd/mig.err" | tr '\n' ' ')"
             fi
-            ls -la "$acct" || true
-            if [ -s "$acct/lockd_mach.h" ]; then
-              echo "  lockd_mach.h: $(wc -l < "$acct/lockd_mach.h") lines"
-              echo "--- first 12 lines ---"; head -12 "$acct/lockd_mach.h"
-              # OutBuf[0] is the tell-tale of the death-pill codegen firing
-              # on a routine that is not a death pillar. Expected 0 here.
-              # Reported, never fatal: it is information, not a blocker.
-              echo "  OutBuf[0] occurrences (expect 0 for lockd): $(grep -c 'OutBuf\[0\]' "$acct/lockd_mach.h" || true)"
-              # Compile it. This is the assertion that matters: wrong field
-              # assumptions surface as a compile error naming the field.
-              if clang -fsyntax-only -x c \
-                   -I"$acct" -I"$GITHUB_WORKSPACE/dxb/xnu/osfmk" \
-                   -I"$GITHUB_WORKSPACE/dxb/xnu/bsd" \
-                   -I"$GITHUB_WORKSPACE/dxb/xnu/libkern" \
-                   -I"$GITHUB_WORKSPACE/dxb/xnu/EXTERNAL_HEADERS" \
-                   -I"$CCTOOLS_FOREIGN_INCLUDE" \
-                   "$acct/lockd_mach.h" 2>"$acct/hdr.err"; then
-                echo "  ACCEPTANCE: lockd_mach.h COMPILES"
-              else
-                echo "  ACCEPTANCE: lockd_mach.h did NOT compile"
-                head -20 "$acct/hdr.err"
-              fi
+            if [ ! -s "$wd/$gbase.h" ]; then
+              echo "  $gbase.h: NOT PRODUCED"
+              head -6 "$wd/mig.err" 2>/dev/null || true
+              return 0
+            fi
+            echo "  $gbase.h: $(wc -l < "$wd/$gbase.h") lines"
+            echo "  OutBuf[0] occurrences: $(grep -c 'OutBuf\[0\]' "$wd/$gbase.h" || true)"
+            echo "  --- first 26 lines ---"
+            head -26 "$wd/$gbase.h"
+            if clang -fsyntax-only -x c -std=gnu99 -D__MACH30__ -DKERNEL -DPRIVATE \
+                 -DMACH_KERNEL_PRIVATE -DKERNEL_USER=1 \
+                 -I"$wd" \
+                 -I"$GITHUB_WORKSPACE/dxb/xnu/osfmk" \
+                 -I"$GITHUB_WORKSPACE/dxb/xnu/osfmk/machine" \
+                 -I"$GITHUB_WORKSPACE/dxb/xnu/bsd" \
+                 -I"$GITHUB_WORKSPACE/dxb/xnu/bsd/sys" \
+                 -I"$GITHUB_WORKSPACE/dxb/xnu/libkern" \
+                 -I"$GITHUB_WORKSPACE/dxb/xnu/EXTERNAL_HEADERS" \
+                 -I"$CCTOOLS_FOREIGN_INCLUDE" \
+                 "$wd/$gbase.h" 2>"$wd/cc.err"; then
+              echo "  RESULT: $gbase.h COMPILES against xnu headers"
             else
-              echo "  ACCEPTANCE: no lockd_mach.h produced"
+              echo "  RESULT: $gbase.h did not compile"
+              head -14 "$wd/cc.err"
             fi
-          fi
+          }
+          gen_and_compile lockd "$LOCKD_DEFS" lockd_mach -maxonstack 1024
+          gen_and_compile task "$GITHUB_WORKSPACE/dxb/xnu/osfmk/mach/task.defs" task
+          echo "=== END ACCEPTANCE ==="
 
       # ------------------------------------- stage 5b: SETUP host tools
       # kextsymboltool / setsegname / installfile need Apple's compat.h
