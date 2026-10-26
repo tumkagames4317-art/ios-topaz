@@ -74,8 +74,10 @@ inp=$(mktemp)
 real_out=$(mktemp)
 real_out2=$(mktemp)
 final=$(mktemp)
+dedup=$(mktemp)
+dedup_err=$(mktemp)
 hoisted=$(mktemp)
-trap 'rm -f "$inp" "$real_out" "$real_out2" "$hoisted" "$final"' EXIT
+trap 'rm -f "$inp" "$real_out" "$real_out2" "$hoisted" "$final" "$dedup" "$dedup.err"' EXIT
 
 cat > "$inp"
 
@@ -259,4 +261,75 @@ if ! grep -qE '^[[:blank:]]*type[[:blank:]]+mach_msg_type_number_t' "$hoisted"; 
   echo "migcom-shim: injected type mach_msg_type_number_t = MACH_MSG_TYPE_INTEGER_32 (Apple built-in; primitive, no .defs needed)" >&2
 fi
 
-exec "$real" "${args[@]}" < "$hoisted"
+# --- (6) de-duplicate `type` declarations ----------------------------------
+# THE LAST BLOCKER, AND THE ONE THAT EXPLAINS EVERY EARLIER SYMPTOM.
+# Runs 40397975034 and 40399174031 both ended with mig exit 1, NO `fatal:`
+# line, and NO output files at all -- not even a partial header. That
+# combination is only possible on one code path, read out of Debian mig:
+#
+#   error.c:64-74      void error(...) { ...; errors++; }
+#   parser.y:334-341   TypeDecl: if (itLookUp(name) != itNULL)
+#                                      error("overriding previous definition of %s", name);
+#   migcom.c:217-221   LookNormal(); (void) yyparse();
+#                      if (errors > 0) exit(1);      <-- before any fopen
+#   migcom.c:225       uheader = myfopen(UserHeaderFileName, "w");
+#
+# So a DUPLICATE `type` declaration is an error, not a warning, in GNU mig
+# (Apple's mig merely warns). `errors` ticks up, and main() exits 1 BEFORE
+# `more_global()` and before any output file is opened. Verified against the
+# run's own mig.err, which contained only these six lines and nothing else:
+#     std_types.defs, line 84: overriding previous definition of int64
+#     std_types.defs, line 90: overriding previous definition of char
+#     machine_types.defs, line 38: overriding previous definition of short
+#     machine_types.defs, line 39: overriding previous definition of int
+#     machine_types.defs, line 61: overriding previous definition of uintptr_t
+#     machine_types.defs, line 62: overriding previous definition of intptr_t
+#
+# WHERE THEY COME FROM. osfmk/mach/machine/machine_types.defs:36-37 has a
+# typo'd include guard:
+#     #ifndef _MACH_MACHINE_MACHNINE_TYPES_DEFS     <- MACHNINE, not MACHINE
+#     #define _MACH_MACHINE_MACHNINE_TYPES_DEFS
+# std_types.defs and mach_types.defs are guarded correctly; this one is not,
+# so reaching it twice re-declares short/int/unsigned/float/double/
+# intptr_t/uintptr_t every time.
+#
+# THE FIX: keep the first declaration of each type name, drop later exact
+# repeats. A repeat carries no information -- the first binding is the one
+# mig resolves -- so the emitted type table is unchanged. Only whole
+# `type <name> = <spec>;` statements are considered, and only a repeat with
+# the IDENTICAL right-hand side is dropped; a genuine conflicting
+# redefinition is passed through so migcom still reports it.
+#
+# This is the migcom-side equivalent of what Apple's mig does silently. It is
+# echoed, and the count is printed, so the transformation is never invisible.
+n_dup=$(grep -cE '^[[:blank:]]*type[[:blank:]]+[A-Za-z_][A-Za-z0-9_]*[[:blank:]]*=' "$final" || true)
+if [ "${n_dup:-0}" -gt 0 ]; then
+  awk '
+    /^[ \t]*type[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]*=/ {
+      # Normalise: type NAME = RHS;
+      line = $0
+      n = line
+      sub(/^[ \t]*type[ \t]+/, "", n)
+      name = n
+      sub(/[ \t]*=.*$/, "", name)
+      rhs = n
+      sub(/^[^=]*=[ \t]*/, "", rhs)
+      gsub(/[ \t]+$/, "", rhs)
+      if (name in seen) {
+        if (seen[name] == rhs) { dropped++; next }   # exact repeat -> drop
+      }
+      seen[name] = rhs
+    }
+    { print }
+    END { printf "%d", dropped+0 > "/dev/stderr" }
+  ' "$final" > "$dedup" 2>"$dedup.err"
+  d_count=$(cat "$dedup.err" 2>/dev/null || echo 0)
+  if [ -s "$dedup" ]; then
+    cp "$dedup" "$final"
+    echo "migcom-shim: dropped ${d_count} duplicate type declarations (GNU mig treats repeats as fatal)" >&2
+  else
+    echo "migcom-shim: WARNING: dedup produced no output; passing through unchanged" >&2
+  fi
+fi
+
+exec "$real" "${args[@]}" < "$final"
