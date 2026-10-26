@@ -314,7 +314,8 @@ jobs:
            * one regular file. */
           int fcopyfile(int, int, void *, unsigned int);
           #endif /* !KERNEL && !_KERNEL */
-          #endif
+          #endif /* !__APPLE__ */
+          #endif /* _LINUX_HOST_COMPAT_SHIM_H */
           EOF
           cat > hostshim/bsdcompat.c <<'EOF'
           /* _GNU_SOURCE must precede every include: glibc only declares
