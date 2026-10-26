@@ -181,19 +181,19 @@ jobs:
           # from fatal to a warning.
           for f in configure configure.ac; do
             [ -f "$f" ] || continue
-            python3 - "$f" <<'PYEOF'
-import io, re, sys
-p = sys.argv[1]
-s = io.open(p, encoding='utf-8', errors='surrogateescape').read()
-orig = s
-s = s.replace('Required library libdispatch not installed',
-              'libdispatch not found, continuing (not needed by ld64)')
-s = re.sub(r'AC_MSG_ERROR\(\[Required library libdispatch not installed\]\)',
-           'AC_MSG_WARN([libdispatch not found, continuing])', s)
-if s != orig:
-    io.open(p, 'w', encoding='utf-8', errors='surrogateescape').write(s)
-    print('patched', p)
-PYEOF
+            cp "$f" "$f.orig"
+            sed -i \
+              -e 's/as_fn_error \$? "Required library libdispatch not installed" "\$LINENO" 5/echo "libdispatch not found, continuing"/' \
+              -e 's/Required library libdispatch not installed/libdispatch not found, continuing/' \
+              -e 's/AC_MSG_ERROR(\[Required library libdispatch not installed\])/AC_MSG_WARN([libdispatch not found, continuing])/' \
+              "$f"
+            if ! cmp -s "$f" "$f.orig"; then
+              echo "patched $f"
+              grep -n 'libdispatch' "$f" | head -6 || true
+            else
+              echo "WARNING: no libdispatch fatal check matched in $f"
+              grep -n 'libdispatch' "$f" | head -6 || true
+            fi
           done
           ./configure --prefix="$RUNNER_TEMP/cross" --target=x86_64-linux-gnu \
                       --enable-static --disable-shared 2>&1 | tail -30
