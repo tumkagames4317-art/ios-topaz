@@ -170,11 +170,41 @@ jobs:
           set -x
           git clone -q --depth 1 -b "$CCTOOLS_BRANCH" "$CCTOOLS_REPO" cctools-port
           cd cctools-port/cctools
+          # cctools' configure hard-requires libdispatch, and Ubuntu ships no
+          # such library (libblocksruntime is a different thing). Run
+          # 40369846814 died here:
+          #     checking for dispatch_once in -ldispatch... no
+          #     checking for dispatch_once in -lc... no
+          #     Required library libdispatch not installed
+          # which is also why nothing downstream had Mach-O headers. ld64 and
+          # the binutils we need never call dispatch_*, so demote the check
+          # from fatal to a warning.
+          for f in configure configure.ac; do
+            [ -f "$f" ] || continue
+            python3 - "$f" <<'PYEOF'
+import io, re, sys
+p = sys.argv[1]
+s = io.open(p, encoding='utf-8', errors='surrogateescape').read()
+orig = s
+s = s.replace('Required library libdispatch not installed',
+              'libdispatch not found, continuing (not needed by ld64)')
+s = re.sub(r'AC_MSG_ERROR\(\[Required library libdispatch not installed\]\)',
+           'AC_MSG_WARN([libdispatch not found, continuing])', s)
+if s != orig:
+    io.open(p, 'w', encoding='utf-8', errors='surrogateescape').write(s)
+    print('patched', p)
+PYEOF
+          done
           ./configure --prefix="$RUNNER_TEMP/cross" --target=x86_64-linux-gnu \
                       --enable-static --disable-shared 2>&1 | tail -30
           make -j"$(nproc)" 2>&1 | tail -60
           make install 2>&1 | tail -20
           ls -la "$RUNNER_TEMP/cross/bin" || true
+          echo "=== did we get what the build actually needs? ==="
+          test -x "$RUNNER_TEMP/cross/bin/ld64" && echo "ld64: OK" || echo "ld64: MISSING"
+          test -x "$RUNNER_TEMP/cross/bin/nm"   && echo "nm:   OK" || echo "nm:   MISSING"
+          test -d include/mach-o                && echo "include/mach-o: OK" || echo "include/mach-o: MISSING"
+          ls -d include/* 2>/dev/null | head -20 || true
           echo "$RUNNER_TEMP/cross/bin" >> "$GITHUB_PATH"
 
       # ------------------------------------------- stage 1b: macOS host shims
