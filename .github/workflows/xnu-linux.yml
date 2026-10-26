@@ -1715,17 +1715,91 @@ jobs:
           #     keeping the call is impossible since the fields do not exist.
           # Both edits are verified below so this cannot silently no-op.
           cp handler.c handler.c.orig
-          sed -i 's/^  WriteStaticDecl(file, itRetCodeType, .*"RetCodeType");$/  \/* WriteStaticDecl: unavailable in public bootstrap_cmds. *\//' handler.c
-          # The two OTHER call sites (itDummyType, itTidType) sit inside
-          # `if (IsCamelot)` and are discarded by -DIsCamelot=0, so only the
-          # unconditional RetCodeType call must be gone. Checking for any
-          # remaining call would be wrong: it matches those two.
-          if grep -qE '^  WriteStaticDecl\(file, itRetCodeType,' handler.c; then
-            echo "::error::the unconditional WriteStaticDecl call survives in handler.c"
+          python3 - <<'MIGFIX'
+          # Every edit below is a defect in the PUBLISHED bootstrap_cmds
+          # sources, not a Linux portability issue. Verified identical in
+          # bootstrap_cmds-86, -99.260.1, -133.140.1 and today's HEAD.
+          #
+          # Text replacement (not sed) because the reasoning is easier to
+          # audit and line endings are normalised first, so this behaves the
+          # same on a CRLF checkout as on CI's LF one.
+          import io, sys
+
+          p = 'handler.c'
+          with io.open(p, encoding='utf-8', errors='surrogateescape',
+                       newline='') as f:
+              s = f.read()
+          orig = s
+          s = s.replace('\r\n', '\n')
+
+          edits = [
+              # 1. WriteStaticDecl / WritePackMsgType are CALLED but defined
+              #    nowhere in the project (0 definitions for 7 call sites).
+              #    Remove only the unconditional RetCodeType calls; the others
+              #    sit inside `if (IsCamelot)` and are folded by
+              #    -DIsCamelot=0.
+              ('  WriteStaticDecl(file, itRetCodeType, itRetCodeType->itDeallocate, itRetCodeType->itLongForm, "RetCodeType");',
+               '  /* WriteStaticDecl: not defined in public bootstrap_cmds. */'),
+              ('  WritePackMsgType(file, itRetCodeType, itRetCodeType->itDeallocate, itRetCodeType->itLongForm, "OutP->RetCodeType", "RetCodeType");',
+               '  /* WritePackMsgType: not defined in public bootstrap_cmds. */'),
+              # 2. handler.c:97 is missing the comma before statement_t, while
+              #    the same function in server.c has it. clang reports the
+              #    consequence at the call sites instead:
+              #      handler.c:235:29: error: too many arguments to function
+              #        call, expected single argument 'file', have 2 arguments
+              ('WriteSymTabEntries(FILE *file  statement_t *stats)',
+               'WriteSymTabEntries(FILE *file, statement_t *stats)'),
+              # 3. rtServerReturn is referenced 4 times and declared in no
+              #    header; routine.h has no such member. With no server-return
+              #    concept in the public headers there is never one, so
+              #    HandlerSideType() answers "void" and the guarded block is
+              #    disabled outright rather than dereferencing nothing.
+              ('  if (rt->rtServerReturn == argNULL)\n    return "void";\n  else\n    return rt->rtServerReturn->argType->itTransType;\n',
+               '  /* rtServerReturn does not exist in public routine.h. */\n  (void)rt;\n  return "void";\n'),
+              ('  if (rt->rtServerReturn != argNULL) {\n    argument_t *arg = rt->rtServerReturn;',
+               '  if (0) { /* rtServerReturn does not exist in public routine.h */\n    argument_t *arg = argNULL;'),
+          ]
+
+          applied = []
+          for old, new in edits:
+              if old in s:
+                  s = s.replace(old, new)
+                  applied.append(old.split('(')[0].strip()[:40])
+              elif new in s:
+                  applied.append('already ' + old.split('(')[0].strip()[:30])
+              else:
+                  print('::error::mig handler.c: pattern not found and not applied:',
+                        old.split('(')[0].strip()[:50])
+                  sys.exit(1)
+
+          if s == orig:
+              print('::error::mig handler.c: no edit applied, refusing to continue')
+              sys.exit(1)
+
+          with io.open(p, 'w', encoding='utf-8', errors='surrogateescape',
+                       newline='') as f:
+              f.write(s)
+          print('handler.c edits applied:', applied)
+          MIGFIX
+          # Assert the result, so a silent no-op cannot reach the build.
+          if grep -qE 'WriteStaticDecl\(file, itRetCodeType,' handler.c; then
+            echo "::error::unconditional WriteStaticDecl call survives"
             exit 1
           fi
-          echo "=== handler.c: uncond WriteStaticDecl gone, Camelot ones folded by -DIsCamelot=0 ==="
-          grep -n 'WriteStaticDecl' handler.c || echo "(no references left at all)"
+          if grep -qE 'WritePackMsgType\(file, itRetCodeType,' handler.c; then
+            echo "::error::unconditional WritePackMsgType call survives"
+            exit 1
+          fi
+          if grep -qE 'WriteSymTabEntries\(FILE \*file  statement_t' handler.c; then
+            echo "::error::handler.c:97 still lacks the comma before statement_t"
+            exit 1
+          fi
+          if grep -qE 'rt->rtServerReturn' handler.c; then
+            echo "::error::handler.c still dereferences rtServerReturn"
+            exit 1
+          fi
+          echo "=== handler.c: remaining Camelot-only references (folded by -DIsCamelot=0) ==="
+          grep -nE 'itDeallocate|itLongForm|IsCamelot' handler.c | head -8 || true
           INC="$INC -DIsCamelot=0"
           echo "mig handler.c fixups: applied and verified"
           if [ ! -f /usr/local/include/compat.h ]; then
@@ -1755,12 +1829,37 @@ jobs:
           clang -o out/migcom out/*.o -lm
           ./out/migcom -version || true
           test -x out/migcom || { echo "::error::migcom was not produced"; exit 1; }
-          mkdir -p "$RUNNER_TEMP/cross/bin"
+          mkdir -p "$RUNNER_TEMP/cross/bin" "$RUNNER_TEMP/cross/libexec"
           cp out/migcom "$RUNNER_TEMP/cross/bin/migcom"
-          # mig.sh is the driver xnu calls; point it at the migcom we built.
-          sed "s|^M=.*|M='$RUNNER_TEMP/cross/bin/migcom'|" mig.sh > "$RUNNER_TEMP/cross/bin/mig"
+          # mig.sh is the driver xnu calls. Install it UNMODIFIED:
+          #   mig.sh:84  M=${MIGCOM-${migcomPath}}
+          # Already honours a MIGCOM environment variable, and Stage 6 passes
+          # MIGCOM="$RUNNER_TEMP/cross/bin/migcom" on the make command line
+          # (MakeInc.cmd exports it), so the driver will find our migcom with
+          # no edit at all. An earlier version `sed`-replaced that line with a
+          # hardcoded path, which would have *broken* the ${MIGCOM-} override
+          # instead of using it. Do not patch what already works.
+          cp mig.sh "$RUNNER_TEMP/cross/bin/mig"
           chmod +x "$RUNNER_TEMP/cross/bin/mig"
-          grep -n '^M=' "$RUNNER_TEMP/cross/bin/mig" || true
+          # mig.sh:68 resolves its fallback as
+          #   migcomPath=$(realpath "${scriptRoot}/../libexec/migcom")
+          # i.e. a libexec/ SIBLING of bin/, not bin/migcom. Satisfy that too
+          # so the driver works even if MIGCOM is ever unset. Free belt.
+          ln -sf "$RUNNER_TEMP/cross/bin/migcom" "$RUNNER_TEMP/cross/libexec/migcom"
+          echo '--- mig driver installed ---'
+          ls -la "$RUNNER_TEMP/cross/bin/mig" "$RUNNER_TEMP/cross/bin/migcom" \
+                 "$RUNNER_TEMP/cross/libexec/migcom" || true
+          grep -n 'M=${MIGCOM-' "$RUNNER_TEMP/cross/bin/mig" \
+            || echo "::warning::mig.sh no longer has the \${MIGCOM-} line"
+          # /usr/bin/arch exists on Linux and prints x86_64, but Darwin's
+          # `clang -arch x86_64` is not a Linux flag. Print what mig will pass
+          # so a later -arch failure is recognisable rather than mysterious.
+          echo "  /usr/bin/arch -> $(/usr/bin/arch 2>/dev/null || echo 'absent')"
+          echo "  clang -arch probe: $(clang -arch x86_64 -E -x c /dev/null >/dev/null 2>&1 && echo 'accepted' || echo 'REJECTED (Darwin-only flag)')"
+          # Ask the driver for its version. It delegates to migcom
+          # (mig.sh:86-89), so this is a real end-to-end check of the pair.
+          "$RUNNER_TEMP/cross/bin/mig" -version 2>&1 | head -3 || \
+            echo "  mig -version: driver ran but migcom is not usable yet"
           echo "$RUNNER_TEMP/cross/bin" >> "$GITHUB_PATH"
           # Earlier runs died with a bare "exit code 1" and no visible cause
           # because `|| true` hid both the failure and its message. Report
