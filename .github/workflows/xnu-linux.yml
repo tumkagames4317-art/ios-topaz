@@ -3258,9 +3258,10 @@ jobs:
           # The plain <label>.stream files are captured EARLIER, before the
           # mach_msg_type_number_t injection rewrites $hoisted, so they are a
           # different document. Globbing *.stream mixed the two.
-          for f in "$RUNNER_TEMP"/migcom-streams/*.*_*.stream; do
+          for f in "$MIGCOM_SHIM_DUMP"/*.*_*.stream; do
             [ -f "$f" ] || continue
             echo "-- $(basename "$f") ($(wc -l < "$f") lines)"
+            echo "   (stream file: $(basename "$f"), $(wc -l < "$f") lines)"
             echo "   MACHNINE guard occurrences: $(grep -c 'MACHNINE_TYPES_DEFS' "$f" || true)   (2 = ifndef+define, expect 2)"
             echo "   type short  declarations:   $(grep -cE '^[[:blank:]]*type[[:blank:]]+short[[:blank:]]*=' "$f" || true)   (2 => cpp emitted twice)"
             echo "   type int    declarations:   $(grep -cE '^[[:blank:]]*type[[:blank:]]+int[[:blank:]]*=' "$f" || true)"
