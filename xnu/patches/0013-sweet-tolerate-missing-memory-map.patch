@@ -1,0 +1,29 @@
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1281,11 +1281,25 @@
+ 	// Trust Caches portion of EXTRADATA
+ 	{
+ 		DTMemoryMapRange const *trustCacheRange;
+ 		unsigned int trustCacheRangeSize;
+ 
+ 		err = SecureDTLookupEntry(NULL, "chosen/memory-map", &memory_map);
+-		assert(err == kSuccess);
++#if defined(SWEET)
++	/*
++	 * ginkgo: the ADT this port boots with does not resolve chosen/memory-map
++	 * through the lookup. Upstream asserts here, which turns a missing optional
++	 * map into a dead kernel. Say so and continue: every property read below is
++	 * already optional (TrustCache is guarded by its own err check, AuxKC jumps
++	 * to noAuxKC), so an absent map is survivable.
++	 */
++	if (err != kSuccess) {
++		printf("arm_vm_init: no chosen/memory-map (err %d), continuing\n", (int)err);
++		memory_map = NULL;
++	}
++#else
++	assert(err == kSuccess);
++#endif
+ 
+ 		err = SecureDTGetProperty(memory_map, "TrustCache", (void const **)&trustCacheRange, &trustCacheRangeSize);
+ 		if (err == kSuccess) {
+ 			if (trustCacheRangeSize != sizeof(DTMemoryMapRange)) {
