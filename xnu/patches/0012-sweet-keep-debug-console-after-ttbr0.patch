@@ -7,29 +7,58 @@ diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
  
 +#if defined(SWEET)
 +/*
-+ * The reserved low-globals/kernel region is excluded from VM allocation.
-+ * Use the otherwise empty 32MB block above low globals and below gVirtBase
-+ * for a Normal-NC framebuffer alias that survives bootstrap TTBR0 teardown.
++ * Place one 32MB Normal-NC framebuffer alias so the early console keeps
++ * working after arm_vm_init tears down the bootstrap TTBR0 mapping.
++ *
++ * The upstream formulation (VM_MIN_KERNEL_ADDRESS + ARM_TT_L2_SIZE) assumed
++ * gVirtBase sat far above VM_MIN_KERNEL_ADDRESS. Here the two coincide, so
++ * that block landed well past the end of the window.
++ *
++ * Rather than hardcode another offset, walk the kernel window downward from
++ * gVirtBase and take the first L2 slot that is genuinely empty. Nothing is
++ * asserted: an early-boot diagnostic must never be the thing that panics.
++ * On failure it simply leaves early_fb pointing at the old alias, and the
++ * console stops -- exactly the previous behaviour.
 + */
-+#define SWEET_EARLY_FB_VA (VM_MIN_KERNEL_ADDRESS + ARM_TT_L2_SIZE)
++static vm_map_address_t
++sweet_early_fb_slot(void)
++{
++	vm_map_address_t end = gVirtBase & ~(vm_map_address_t)(ARM_TT_L2_SIZE - 1);
++
++	for (vm_map_address_t va = end - ARM_TT_L2_SIZE;
++	    va >= (gVirtBase - ARM_TT_L1_SIZE); va -= ARM_TT_L2_SIZE) {
++		tt_entry_t l1 = cpu_tte[(va & ARM_TT_L1_INDEX_MASK) >> ARM_TT_L1_SHIFT];
++		if ((l1 & (ARM_TTE_VALID | ARM_TTE_TYPE_MASK)) !=
++		    (ARM_TTE_VALID | ARM_TTE_TYPE_TABLE)) {
++			continue;
++		}
++		tt_entry_t *l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
++		if (l2[(va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT] == ARM_TTE_EMPTY) {
++			return va;
++		}
++	}
++	return 0;
++}
++
++static vm_map_address_t sweet_early_fb_va;
 +
 +static void
 +sweet_early_map_final(void)
 +{
-+	const vm_map_address_t va = SWEET_EARLY_FB_VA;
-+	assert(va + ARM_TT_L2_SIZE <= gVirtBase);
++	vm_map_address_t va = sweet_early_fb_slot();
++	if (va == 0) {
++		return;
++	}
 +	tt_entry_t l1 = cpu_tte[(va & ARM_TT_L1_INDEX_MASK) >> ARM_TT_L1_SHIFT];
-+	assert((l1 & (ARM_TTE_VALID | ARM_TTE_TYPE_MASK)) == (ARM_TTE_VALID | ARM_TTE_TYPE_TABLE));
 +	tt_entry_t *l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
-+	tt_entry_t *slot = &l2[(va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
-+	assert(*slot == ARM_TTE_EMPTY);
-+	*slot = 0x5c000000ULL | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
++	l2[(va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT] =
++	    0x5c000000ULL | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
 +	    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
 +	    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
 +	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
 +	__asm__ volatile("dsb ishst" ::: "memory");
++	sweet_early_fb_va = va;
 +}
-+#endif
 +
  void
  arm_vm_init(uint64_t memory_size, boot_args * args)
@@ -51,7 +80,7 @@ diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
 -	sweet_early_disable();
 +#if defined(SWEET)
 +	/* The final TTBR1 is live; leave the outgoing VA=PA framebuffer alias. */
-+	sweet_early_relocate(SWEET_EARLY_FB_VA);
++	sweet_early_relocate(sweet_early_fb_va);
 +#endif
  	set_mmu_ttb(invalid_ttep & TTBR_BADDR_MASK);
  
@@ -139,6 +168,12 @@ diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
 +sweet_early_relocate(uint64_t base)
 +{
 +	sweet_early_mark(8, "leaving bootstrap TTBR0");
++	if (base == 0) {
++		/* No free kernel VA block: keep the old alias and stop drawing. */
++		early_disabled = 1;
++		__asm__ volatile("dsb sy" ::: "memory");
++		return;
++	}
 +	early_fb = (volatile uint32_t *)(uintptr_t)base;
 +	__asm__ volatile("dsb sy" ::: "memory");
 +	sweet_early_mark(9, "kernel framebuffer VA live");
