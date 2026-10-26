@@ -2333,29 +2333,25 @@ jobs:
               #   -maxonstack   server-side stack hints, in server code this
               #                 profile does not compile (-server /dev/null).
               # Each drop is ECHOED once, so this is never silent.
-              {
-                echo '#!/bin/bash'
-                echo '# migcom shim: drop Apple-only switches GNU migcom rejects.'
-                echo '# Real binary: '"$RUNNER_TEMP"'/cross/bin/migcom-debian'
-                echo 'real="'"$RUNNER_TEMP"'/cross/bin/migcom-debian"'
-                echo 'args=(); dropped=""'
-                echo 'while [ $# -gt 0 ]; do'
-                echo '  case "$1" in'
-                echo '    -novouchers|-mach_msg2|-split)'
-                echo '      dropped="$dropped $1"; shift ;;'
-                echo '    -maxonstack|-max_descrs|-max_reply_descrs)'
-                echo '      dropped="$dropped $1 $2"; shift 2 ;;'
-                echo '    *) args+=("$1"); shift ;;'
-                echo '  esac'
-                echo 'done'
-                echo 'if [ -n "$dropped" ]; then'
-                echo '  echo "migcom-shim: dropped:$dropped" >&2'
-                echo 'fi'
-                echo 'exec "$real" "${args[@]}"'
-              } > "$RUNNER_TEMP/cross/bin/migcom"
-              chmod +x "$RUNNER_TEMP/cross/bin/migcom"
-              echo "  INSTALL: prebuilt migcom in place at cross/bin/migcom (with Apple-flag shim)"
-              echo "  INSTALL: raw binary at cross/bin/migcom-debian"
+            # The shim is a CHECKED-IN FILE, not generated here.
+            # Generating an awk program through a YAML block scalar meant two
+            # layers of quoting and produced invalid bash three times tonight.
+            # shim/migcom-shim.sh is the single source of truth; only the real
+            # binary path is substituted, so nothing inside it needs escaping.
+            MIGSHIM="$RUNNER_TEMP/cross/bin/migcom"
+            cp "$GITHUB_WORKSPACE/shim/migcom-shim.sh" "$MIGSHIM"
+            sed -i "s|__MIGCOM_REAL__|$RUNNER_TEMP/cross/bin/migcom-debian|" "$MIGSHIM"
+            chmod +x "$MIGSHIM"
+            if bash -n "$MIGSHIM"; then
+              echo "  shim: syntax OK ($MIGSHIM)"
+            else
+              echo "::error::migcom shim has a bash syntax error"
+            fi
+            if grep -q "__MIGCOM_REAL__" "$MIGSHIM"; then
+              echo "::error::shim still contains the __MIGCOM_REAL__ placeholder"
+            fi
+            echo "  INSTALL: migcom in place at cross/bin/migcom (drop-flags + hoist-subsystem shim)"
+            echo "  INSTALL: raw binary at cross/bin/migcom-debian"
             else
               echo "::error::INSTALL: prebuilt migcom missing after extraction"
               find "$MIGPKG" -maxdepth 4 | head -30
