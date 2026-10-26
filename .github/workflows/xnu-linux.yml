@@ -3538,6 +3538,7 @@ jobs:
           mkdir -p "$(dirname "$CC_SHIM")"
           {
             echo '#!/bin/bash'
+            echo '_c="${0}.calls"; echo $(( $(cat "$_c" 2>/dev/null || echo 0) + 1 )) > "$_c" 2>/dev/null || true'
             echo 'args=()'
             echo 'while [ $# -gt 0 ]; do'
             echo '  case "$1" in'
@@ -3750,13 +3751,19 @@ jobs:
           find "$OBJROOT/SETUP" -maxdepth 2 -type f -executable | sort || true
           echo '--- VERBATIM argv the compiler wrapper received (first 40) ---'
           cat "$XTOOL_DUMP/argv.txt" 2>/dev/null | head -40 || echo "(no argv captured)"
-          echo '--- $(origin AS) / $(origin CXX) as make sees them ---'
-          make -s --no-print-directory -f /dev/stdin <<'MKE' 2>&1 | head -6 || true
-          AS_SOFTWARE := $(origin AS)
-          CXX_SOFTWARE := $(origin CXX)
-          CC_SOFTWARE := $(origin CC)
-          $(info origin AS=$(origin AS) CXX=$(origin CXX) CC=$(origin CC))
-          MKE
+          # Which compiler the build actually reached, for CC/CXX/AS, is a FACT
+          # we can record rather than infer: each shim logs its own basename on
+          # first use. $(origin ...) inside a throwaway makefile would say
+          # "default" no matter what the kernel build sees -- a probe that
+          # cannot fail. This one goes silent if a path is never used, and the
+          # counts differ per compiler, so an AS that bypassed the wrapper
+          # shows up as a missing line rather than a clean one.
+          echo '--- who actually compiled (shim invocation counts) ---'
+          for _t in cc-shim cxx-shim; do
+            _p="$RUNNER_TEMP/cross/bin/$_t"
+            printf '  %-10s calls=%s\n' "$_t" "$(cat "${_p}.calls" 2>/dev/null || echo 0)"
+          done
+          echo '  (a compiler absent from this list bypassed the wrapper)' 
           echo '--- first real error, in order ---' 
           # Widen beyond 'error:': the first real failures tonight were
           # "Error 127" (missing interpreter) and "No such file", neither of
