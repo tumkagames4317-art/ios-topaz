@@ -1758,6 +1758,34 @@ jobs:
                '  /* rtServerReturn does not exist in public routine.h. */\n  (void)rt;\n  return "void";\n'),
               ('  if (rt->rtServerReturn != argNULL) {\n    argument_t *arg = rt->rtServerReturn;',
                '  if (0) { /* rtServerReturn does not exist in public routine.h */\n    argument_t *arg = argNULL;'),
+               # 4. handler.c:46 declares a STATIC one-parameter WriteIncludes,
+               #    while write.h:72 declares a 3-parameter non-static one and
+               #    the call at handler.c:93 passes 1 argument:
+               #      handler.c:46:1: error: static declaration of
+               #        'WriteIncludes' follows non-static declaration
+               #      handler.c:93:21: error: too few arguments to function
+               #        call, expected 3, have 1
+               #    The definition writes the SERVER header's prolog, so the
+               #    equivalent of write.c's call is (user=FALSE, is_def=FALSE).
+               #    Give it the two extra parameters rather than deleting it.
+               ('static void\nWriteIncludes(FILE *file)\n',
+                'static void\nWriteIncludes(FILE *file, boolean_t isuser, boolean_t is_def)\n'),
+               ('  WriteIncludes(file);\n',
+                '  WriteIncludes(file, FALSE, FALSE); /* server header prolog */\n'),
+               # 5. IsKernel is read at handler.c:75 and defined nowhere.
+               #    handler.c:73 states "Reply message locations aren't
+               #    dependent on IsKernel", so FALSE is the documented
+               #    behaviour, not a guess.
+               ('  if (IsKernel)\n',
+                '  if (FALSE) /* IsKernel: not defined in public bootstrap_cmds */\n'),
+               # 6. ServerProcName is used at handler.c:154 as a %s inside
+               #    generated text and defined NOWHERE (0 hits in mig.c,
+               #    global.c, global.h; 1 hit total = the use site). The
+               #    generated line is `kern_return_t <name> (`, so a wrong
+               #    value is a compile error in the generated .h and never
+               #    silent corruption.
+               ('fprintf(file, "kern_return_t %s (\\n", ServerProcName);',
+                'fprintf(file, "kern_return_t %s (\\n", "mig_server_proc"); /* ServerProcName: undefined upstream */'),
           ]
 
           applied = []
@@ -1802,6 +1830,116 @@ jobs:
           grep -nE 'itDeallocate|itLongForm|IsCamelot' handler.c | head -8 || true
           INC="$INC -DIsCamelot=0"
           echo "mig handler.c fixups: applied and verified"
+
+          # ---------------------------------------------------------------
+          # type.h / routine.h field additions.
+          #
+          # These are NOT portability shims. Each one is a field that
+          # bootstrap_cmds' own .c files read and its own .h files fail to
+          # declare -- defects in the published sources. All four were
+          # verified against the openmach tree, which is a different vintage
+          # of mig, so only the ones that are byte-identical in intent are
+          # taken from it.
+          # ---------------------------------------------------------------
+          python3 - <<'MIGFIELDS'
+          import io, sys
+
+          def patch(path, edits):
+              with io.open(path, encoding='utf-8', errors='surrogateescape',
+                           newline='') as f:
+                  s = f.read()
+              orig = s
+              s = s.replace('\r\n', '\n')
+              done = []
+              for old, new in edits:
+                  if old in s:
+                      if s.count(old) != 1:
+                          print('::error::%s: pattern occurs %d times, refusing'
+                                % (path, s.count(old)))
+                          sys.exit(1)
+                      s = s.replace(old, new)
+                      done.append(old.strip().split('\n')[0][:38])
+                  elif new in s:
+                      done.append('already ' + old.strip()[:26])
+                  else:
+                      print('::error::%s: pattern not found: %r' % (path, old[:60]))
+                      sys.exit(1)
+              if s == orig:
+                  print('::error::%s: no change made' % path)
+                  sys.exit(1)
+              with io.open(path, 'w', encoding='utf-8', errors='surrogateescape',
+                           newline='') as f:
+                  f.write(s)
+              print('%s field edits applied: %s' % (path, done))
+
+          # --- routine.h -------------------------------------------------
+          # rtMaxReplySize: read at handler.c:148,149,322; written nowhere
+          #   in the tree. Added and left unset, which is exactly Apple's
+          #   own behaviour. Its value is NOT invented.
+          # rtReplySize: read at handler.c:320; does not exist in Apple's
+          #   routine.h at all (openmach has it; Apple retired it). Adding
+          #   it beats repointing :320, which would silently change the
+          #   generated msg_size.
+          patch('routine.h', [
+              ('    u_int rtMaxReplyPos;        /* maximum of argReplyPos */\n',
+               '    u_int rtMaxReplyPos;        /* maximum of argReplyPos */\n'
+               '    u_int rtMaxReplySize;       /* max reply size; read by handler.c,\n'
+               '                                   never written upstream -- left 0 */\n'
+               '    u_int rtReplySize;          /* declared by handler.c:320;\n'
+               '                                   absent from Apple routine.h */\n'),
+          ])
+
+          # --- type.h ----------------------------------------------------
+          # itLongForm / itDeallocate are read throughout handler.c but are
+          # absent from Apple's struct ipc_type. openmach type.h:147-148 has
+          # them immediately after itInLine, and its type.c:106-108
+          # initialises them FALSE and d_NO.
+          #
+          # dealloc_t is NOT added here: Apple's type.h:79-83 already defines
+          # it with exactly d_NO / d_YES / d_MAYBE, and
+          # type.h:86 already has strdealloc(d). Inserting openmach's four
+          # enumerators (which include d_NONE) would have been a duplicate
+          # typedef -- a compile error. Only the two missing fields are added.
+          #
+          # CRITICAL: type.c:116 `itAlloc` is a POSITIONAL initialiser whose
+          # trailing comments name each field in order. Inserting fields into
+          # the struct without inserting matching entries there would shift
+          # every later value onto the wrong member -- FALSE meant for
+          # itMigInLine landing on itLongForm, TRUE meant for itStruct landing
+          # on itInNameStr and so on. That compiles cleanly and is silently
+          # wrong, which is precisely the failure mode we refuse. So the
+          # struct and the initialiser are edited TOGETHER, in one entry pair
+          # at the same position, keeping the two lists aligned.
+          patch('type.h', [
+              ('    boolean_t itInLine;\n',
+               '    boolean_t itInLine;\n'
+               '    boolean_t itLongForm;\n'
+               '    dealloc_t itDeallocate;\n'),
+          ])
+          patch('type.c', [
+              ('    TRUE,     /* boolean_t itInLine */\n',
+               '    TRUE,     /* boolean_t itInLine */\n'
+               '    FALSE,    /* boolean_t itLongForm */\n'
+               '    d_NO,     /* dealloc_t itDeallocate */\n'),
+          ])
+          MIGFIELDS
+
+          # Assert the fields landed, so a silent no-op cannot reach the build.
+          # dealloc_t is deliberately NOT asserted: Apple's type.h already
+          # defines it, so a grep for it would pass whether or not we edited.
+          for pair in 'routine.h:rtMaxReplySize' 'routine.h:rtReplySize' \
+                      'type.h:itLongForm' 'type.h:itDeallocate'; do
+            f="${pair%%:*}"; sym="${pair##*:}"
+            n=$(grep -c "\b${sym}\b" "$f" || true)
+            if [ "${n:-0}" -ge 1 ]; then
+              echo "  $f declares $sym: $n occurrence(s)"
+            else
+              echo "::error::$f does not declare $sym"
+              exit 1
+            fi
+          done
+          echo "  type.h dealloc_t (pre-existing, not added): $(grep -c '\bdealloc_t\b' type.h) occurrence(s)"
+          echo "mig type.h/routine.h field additions: verified"
           if [ ! -f /usr/local/include/compat.h ]; then
             echo "::error::compat.h missing; Stage 1b must run before Stage 5"
             exit 1
@@ -1826,11 +1964,22 @@ jobs:
                 exit 1
               }
           done
-          clang -o out/migcom out/*.o -lm
+          clang -o out/migcom out/*.o -lm || echo "MIGCOM LINK FAILED"
           ./out/migcom -version || true
-          test -x out/migcom || { echo "::error::migcom was not produced"; exit 1; }
+          # Do NOT exit here on a missing migcom. The mig driver below must be
+          # installed even when migcom fails to build, or the very run that
+          # needs the driver is the run that skips installing it. Run
+          # 40385098993 did exactly that: handler.c failed at the compile loop
+          # above, the script exited, and the -arch probe, /usr/bin/arch,
+          # mig -version and all three driver paths never printed.
+          # Install unconditionally, then judge, then exit.
+          if [ ! -x out/migcom ]; then
+            echo "::warning::migcom was not produced; installing the mig driver anyway"
+          fi
           mkdir -p "$RUNNER_TEMP/cross/bin" "$RUNNER_TEMP/cross/libexec"
-          cp out/migcom "$RUNNER_TEMP/cross/bin/migcom"
+          if [ -x out/migcom ]; then
+            cp out/migcom "$RUNNER_TEMP/cross/bin/migcom"
+          fi
           # mig.sh is the driver xnu calls. Install it UNMODIFIED:
           #   mig.sh:84  M=${MIGCOM-${migcomPath}}
           # Already honours a MIGCOM environment variable, and Stage 6 passes
@@ -1848,7 +1997,7 @@ jobs:
           ln -sf "$RUNNER_TEMP/cross/bin/migcom" "$RUNNER_TEMP/cross/libexec/migcom"
           echo '--- mig driver installed ---'
           ls -la "$RUNNER_TEMP/cross/bin/mig" "$RUNNER_TEMP/cross/bin/migcom" \
-                 "$RUNNER_TEMP/cross/libexec/migcom" || true
+                 "$RUNNER_TEMP/cross/libexec/migcom" 2>&1 || true
           grep -n 'M=${MIGCOM-' "$RUNNER_TEMP/cross/bin/mig" \
             || echo "::warning::mig.sh no longer has the \${MIGCOM-} line"
           # /usr/bin/arch exists on Linux and prints x86_64, but Darwin's
@@ -1861,15 +2010,72 @@ jobs:
           "$RUNNER_TEMP/cross/bin/mig" -version 2>&1 | head -3 || \
             echo "  mig -version: driver ran but migcom is not usable yet"
           echo "$RUNNER_TEMP/cross/bin" >> "$GITHUB_PATH"
-          # Earlier runs died with a bare "exit code 1" and no visible cause
-          # because `|| true` hid both the failure and its message. Report
-          # the real verdict instead: migcom must exist and answer -version.
+          # Now judge. Earlier runs died with a bare "exit code 1" and no
+          # visible cause because `|| true` hid both the failure and its
+          # message. Report the real verdict instead: migcom must exist and
+          # answer -version.
           echo "=== mig verdict ==="
-          if "$RUNNER_TEMP/cross/bin/migcom" -version; then
+          if [ -x "$RUNNER_TEMP/cross/bin/migcom" ] && "$RUNNER_TEMP/cross/bin/migcom" -version; then
             echo "migcom: OK"
           else
-            echo "::error::migcom built but failed its -version probe"
+            echo "::error::migcom was not produced or failed its -version probe"
             exit 1
+          fi
+
+          # ---------------------------------------------------------------
+          # ACCEPTANCE TEST: one .defs file, end to end.
+          #
+          # lockd.defs is the file Stage 6 actually asked for (it is what
+          # osfmk/lockd/Makefile:46 runs mig on), and lockd is NOT a
+          # death-pill subsystem. Generate the header with our migcom, then
+          # COMPILE it. If migcom's field assumptions are wrong the error
+          # names the bad field; that is why this is safe to attempt.
+          # ---------------------------------------------------------------
+          echo "=== ACCEPTANCE: lockd.defs -> lockd_mach.h ==="
+          acct="$RUNNER_TEMP/acct"; rm -rf "$acct"; mkdir -p "$acct"
+          lockd="$GITHUB_WORKSPACE/dxb/xnu/osfmk/lockd/lockd.defs"
+          if [ ! -f "$lockd" ]; then
+            echo "::warning::lockd.defs not found at $lockd; skipping acceptance test"
+          else
+            echo "  source: $lockd ($(wc -l < "$lockd") lines)"
+            # The real invocation from osfmk/lockd/Makefile:46-51, with the
+            # subsystem's own MIGKUFLAGS.
+            if "$RUNNER_TEMP/cross/bin/mig" \
+                 -DMACH_KERNEL_PRIVATE -DKERNEL_USER=1 -maxonstack 1024 \
+                 -user    "$acct/lockd_mach.c" \
+                 -header  "$acct/lockd_mach.h" \
+                 -server  /dev/null \
+                 -sheader /dev/null \
+                 "$lockd" 2>&1; then
+              echo "  MIG EXIT: 0"
+            else
+              echo "  MIG EXIT: nonzero (see errors above)"
+            fi
+            ls -la "$acct" || true
+            if [ -s "$acct/lockd_mach.h" ]; then
+              echo "  lockd_mach.h: $(wc -l < "$acct/lockd_mach.h") lines"
+              echo "--- first 12 lines ---"; head -12 "$acct/lockd_mach.h"
+              # OutBuf[0] is the tell-tale of the death-pill codegen firing
+              # on a routine that is not a death pillar. Expected 0 here.
+              # Reported, never fatal: it is information, not a blocker.
+              echo "  OutBuf[0] occurrences (expect 0 for lockd): $(grep -c 'OutBuf\[0\]' "$acct/lockd_mach.h" || true)"
+              # Compile it. This is the assertion that matters: wrong field
+              # assumptions surface as a compile error naming the field.
+              if clang -fsyntax-only -x c \
+                   -I"$acct" -I"$GITHUB_WORKSPACE/dxb/xnu/osfmk" \
+                   -I"$GITHUB_WORKSPACE/dxb/xnu/bsd" \
+                   -I"$GITHUB_WORKSPACE/dxb/xnu/libkern" \
+                   -I"$GITHUB_WORKSPACE/dxb/xnu/EXTERNAL_HEADERS" \
+                   -I"$CCTOOLS_FOREIGN_INCLUDE" \
+                   "$acct/lockd_mach.h" 2>"$acct/hdr.err"; then
+                echo "  ACCEPTANCE: lockd_mach.h COMPILES"
+              else
+                echo "  ACCEPTANCE: lockd_mach.h did NOT compile"
+                head -20 "$acct/hdr.err"
+              fi
+            else
+              echo "  ACCEPTANCE: no lockd_mach.h produced"
+            fi
           fi
 
       # ------------------------------------- stage 5b: SETUP host tools
