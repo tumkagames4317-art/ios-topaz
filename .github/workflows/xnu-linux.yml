@@ -404,9 +404,15 @@ jobs:
           # (/dev/null on AirPort: MAXPATHLEN is 1024, so the path has to fit).
           [ -c /dev/null ] || sudo mknod -m 666 /dev/null c 1 3
           ls -l /dev/null
+          # An empty tree that mimics the shape of an Xcode SDK so the paths
+          # makedefs derives from `xcrun` look the way its sed/notdir expects.
+          FAKE_PLATFORMS=/opt/xcodeshim/Platforms
+          sudo mkdir -p "$FAKE_PLATFORMS/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
+          sudo chmod -R 0777 /opt/xcodeshim
           sudo tee /usr/bin/xcrun >/dev/null <<'EOF'
           #!/bin/bash
           # Minimal xcrun for building xnu on Linux.
+          FAKE_PLATFORMS=${FAKE_PLATFORMS:-/opt/xcodeshim/Platforms}
           #
           # MakeInc.cmd also calls xcrun as a *wrapper*, i.e.
           #   $(shell $(XCRUN) -sdk $(SDKROOT) -find clang)
@@ -424,9 +430,17 @@ jobs:
             esac
           done
           case "${rest[0]:-}" in
-            -show-sdk-path)          echo / ;;
-            -show-sdk-version)       echo 13.3 ;;
-            -show-sdk-platform-path) echo / ;;
+            # MakeInc.cmd:144 derives PLATFORM by seds'ing the .platform
+            # directory name out of this path:
+            #     PLATFORM := $(shell echo $(PLATFORMPATH) | sed 's,^.*/\([^/]*\)\.platform$$,\1,')
+            # Answering "/" makes that sed fall through and PLATFORM becomes
+            # "/", then MakeInc.kernel:26 dies with
+            #     *** Unsupported PLATFORM /.  Stop.
+            # So the default must look like a real platform directory.
+            -show-sdk-platform-path) echo "$FAKE_PLATFORMS/MacOSX.platform" ;;
+            # Answered as the fake root; -isysroot and DSTROOT use it.
+            -show-sdk-path)          echo "$FAKE_PLATFORMS/MacOSX.platform/Developer/SDKs/MacOSX.sdk" ;;
+            -show-sdk-version|--show-sdk-version) echo 13.3 ;;
             -show-sdk-build-version) echo 22E252 ;;
             -find)
               case "${rest[1]:-}" in
@@ -473,6 +487,12 @@ jobs:
           /usr/bin/xcrun --sdk macosx -find clang
           sw_vers -productVersion
           /usr/sbin/sysctl -n hw.memsize
+          echo '--- the exact expression MakeInc.cmd:145 uses to derive PLATFORM ---'
+          PLATFORMPATH=$(/usr/bin/xcrun --sdk macosx -show-sdk-platform-path)
+          PLATFORM=$(echo "$PLATFORMPATH" | sed 's,^.*/\([^/]*\)\.platform$,\1,')
+          echo "PLATFORMPATH=$PLATFORMPATH"
+          echo "PLATFORM=$PLATFORM"
+          test "$PLATFORM" = MacOSX
 
       # ------------------------------------------------- stage 2: dxb tree
       - name: "Stage 2: fetch darwin-xnu-build and select the ginkgo series"
@@ -705,7 +725,7 @@ jobs:
           # HOST_OS_VERSION was also empty, producing -mmacosx-version-min=
           # with no value.
           make_flags=(
-            SDKROOT=/ HOST_SDKROOT=/
+            SDKROOT=macosx HOST_SDKROOT=macosx
             HOST_OS_VERSION=13.3
             TARGET_CONFIGS="$KERNEL_CONFIG ARM64 $MACHINE_CONFIG"
             ARCH_CONFIGS=ARM64
