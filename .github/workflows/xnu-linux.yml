@@ -1417,17 +1417,19 @@ jobs:
           git init -q dxb
           git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
           git -C dxb checkout -q FETCH_HEAD
-          if [ "$PLATFORM" = "ginkgo" ]; then
-            for p in xnu/patches/*.patch; do
-              case "$(basename "$p")" in
-                *-topaz-*) echo "skip $(basename "$p")"; continue ;;
-              esac
-              cp "$p" dxb/patches/
-            done
-          else
-            cp xnu/patches/*.patch dxb/patches/
-          fi
+          # ------------------------------------------------------------------
+          # PATCH SELECTION -- copy ALL patches. Application and its failure
+          # policy live in Stage 3, which is where the xnu tree exists.
+          #
+          # This block used to drop every `*-topaz-*` patch for platform=ginkgo
+          # with a bare `echo skip <name>` that went to the STEP log only, never
+          # to build.log -- the artefact we actually analyse. 50 patches were
+          # filtered that way, including all of topaz-framebuffer, topaz-touch
+          # and topaz-modem.
+          # ------------------------------------------------------------------
+          cp xnu/patches/*.patch dxb/patches/
           cp xnu/patches/*.sh dxb/patches/ 2>/dev/null || true
+          echo "patches copied: $(ls dxb/patches/*.patch 2>/dev/null | wc -l)"
           ls dxb/patches
 
       # --------------------------------------------- stage 3: clone xnu src
@@ -1449,15 +1451,81 @@ jobs:
             echo "== script $(basename "$s")"
             bash "$s" || echo "SCRIPT FAILED: $s"
           done
+
+          # ------------------------------------------------------------------
+          # PATCH APPLICATION -- a failed patch is a HARD FAILURE.
+          #
+          # Until now a conflict printed `SKIPPED <name>` into the STEP log and
+          # carried on. The step log is not build.log; build.log is the artefact
+          # we analyse, and it contained ZERO patch-status lines. So the absence
+          # read as a clean bill of health.
+          #
+          # Measured consequence: 17 conflicted patches, including SEVEN touching
+          # bsd/dev/sweet_ufs.c, and 0056/0067/0079 touching
+          # iokit/Kernel/arm/SweetFramebuffer.cpp -- the display path. The build
+          # was compiling a tree missing those changes, and the falling error
+          # count was measured over a shrinking file set.
+          #
+          # A skip that is allowed is a decision and is printed with its reason.
+          # A skip that is silent is a lie.
+          # ------------------------------------------------------------------
+          PATCH_REPORT="$GITHUB_WORKSPACE/patch-report.txt"
+          : > "$PATCH_REPORT"
+
+          # Known-inapplicable to this tree, with the reason. Bump this list
+          # ONLY with a reason, one entry at a time, never as a bulk tail.
+          ALLOW_SKIP=" TrustCache.patch iobuffermemd_monterey.patch skywalk_sonoma.patch syntax_checker_sonoma.patch "
+          echo "patch allow-skip list (a skip here is a deliberate decision):" >> "$PATCH_REPORT"
+          for a in $ALLOW_SKIP; do
+            echo "  ALLOW-SKIP  $a" >> "$PATCH_REPORT"
+          done
+
+          n_ok=0; n_3way=0; n_skip=0
           for p in ../patches/*.patch; do
             [ -e "$p" ] || continue
-            if out=$(git apply --check "$p" 2>&1); then
-              echo "applied   $(basename "$p")"
+            name=$(basename "$p")
+            if git apply --check "$p" >/dev/null 2>&1; then
               git apply "$p"
-            else
-              echo "SKIPPED   $(basename "$p"): $out"
+              n_ok=$((n_ok+1))
+              echo "applied     $name" >> "$PATCH_REPORT"
+              continue
             fi
+            # Three-way, and TEST THE EXIT STATUS. Do not infer success from an
+            # empty conflict index: `git apply --3way` can fail without ever
+            # creating an unmerged entry (it falls back to direct application
+            # and fails there), so conflating the two reports a broken patch as
+            # merged. Proven locally with a patch whose context does not exist:
+            #   error: repository lacks the necessary blob to perform 3-way merge.
+            #   Falling back to direct application...
+            #   error: bsd/dev/sweet_ufs.c: patch does not apply
+            if git apply --3way "$p" >> "$PATCH_REPORT" 2>&1 \
+               && [ -z "$(git ls-files -u)" ] \
+               && [ -z "$(git diff --name-only --diff-filter=U)" ]; then
+              n_3way=$((n_3way+1))
+              echo "applied-3way $name" >> "$PATCH_REPORT"
+              continue
+            fi
+            git checkout -- . 2>/dev/null || true
+            git reset -q 2>/dev/null || true
+            case " $ALLOW_SKIP " in
+              *" $name "*)
+                n_skip=$((n_skip+1))
+                echo "allowed-skip $name" >> "$PATCH_REPORT"
+                continue ;;
+            esac
+            files=$(grep -E '^\+\+\+ b/' "$p" | sed 's|^+++ b/||' | paste -sd, -)
+            {
+              echo "::error::PATCH FAILED $name -- it edits: $files"
+              echo "Refusing to continue: the build would report a shrinking"
+              echo "error count over a tree that silently lost this change."
+            } >> "$PATCH_REPORT"
+            cat "$PATCH_REPORT" >> "$GITHUB_WORKSPACE/build.log"
+            cat "$PATCH_REPORT"
+            exit 1
           done
+          echo "patch summary: $n_ok clean, $n_3way three-way, $n_skip allowed-skip, 0 silent" >> "$PATCH_REPORT"
+          cat "$PATCH_REPORT" >> "$GITHUB_WORKSPACE/build.log"
+          cat "$PATCH_REPORT"
 
           # --- makedefs portability fixes (build-time copy only) -----------
           # 1. MakeInc.cmd:480 "$(if $(wordlist 1,$(1),$(NUM32)),...)" is
