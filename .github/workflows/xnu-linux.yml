@@ -669,6 +669,37 @@ jobs:
           #define TARGET_RT_64_BIT            1
           #endif /* __TARGETCONDITIONALS__ */
           TCEOF
+          # libkern/_OSByteOrder.h includes <sys/_types.h> purely for the
+          # Apple spelling of the fixed-width types (__uint32_t and friends).
+          # glibc has <sys/types.h> but no <sys/_types.h>, and run 40371757506
+          # stopped at
+          #   machinc/libkern/_OSByteOrder.h:40:10: fatal error:
+          #   'sys/_types.h' file not found
+          # Only the typedefs that the cctools Mach-O headers use are needed,
+          # and real glibc <sys/types.h> is untouched: this file is reachable
+          # only through machinc, and machinc is only on the host-tool path.
+          mkdir -p "$CCTOOLS_FOREIGN_INCLUDE/sys"
+          cat > "$CCTOOLS_FOREIGN_INCLUDE/sys/_types.h" <<'SYSTEOF'
+          #ifndef _MACHINC_SYS__TYPES_H
+          #define _MACHINC_SYS__TYPES_H
+          #include <stdint.h>
+          #include <stddef.h>
+          typedef int8_t           __int8_t;
+          typedef int16_t          __int16_t;
+          typedef int32_t          __int32_t;
+          typedef int64_t          __int64_t;
+          typedef uint8_t          __uint8_t;
+          typedef uint16_t         __uint16_t;
+          typedef uint32_t         __uint32_t;
+          typedef uint64_t         __uint64_t;
+          typedef intptr_t         __darwin_intptr_t;
+          typedef unsigned long    __darwin_size_t;
+          typedef unsigned int     __darwin_useconds_t;
+          typedef int64_t          __darwin_off_t;
+          typedef long             __darwin_time_t;
+          typedef unsigned char    __darwin_uuid_t[16];
+          #endif /* _MACHINC_SYS__TYPES_H */
+          SYSTEOF
           ls -la "$CCTOOLS_FOREIGN_INCLUDE"
           echo '--- probes ---'
           /usr/bin/xcrun --sdk macosx -show-sdk-path
