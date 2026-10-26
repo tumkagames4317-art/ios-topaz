@@ -258,7 +258,7 @@ diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
  #include <pexpert/arm/protos.h>
  #include <kern/sched_prim.h>
  #if HIBERNATION
-@@ -833,8 +834,10 @@
+@@ -833,7 +834,9 @@
  	if (!fbcon_width || !fbcon_height || fbcon_stride < fbcon_width * 4) {
  		return;
  	}

@@ -1,3 +1,49 @@
+## 08:45 MSK 2026-10-26 -- why stage 9 never appears, and two self-inflicted wounds
+
+### The stage-9 panic is arithmetic, not a hardware quirk
+
+`patch 0012` reserves a 32MB Normal-NC alias for the framebuffer so the console
+survives the TTBR0 teardown:
+
+    #define SWEET_EARLY_FB_VA (VM_MIN_KERNEL_ADDRESS + ARM_TT_L2_SIZE)
+    assert(va + ARM_TT_L2_SIZE <= gVirtBase);
+
+On this build:
+
+    __TEXT (= gVirtBase)     0xfffffe0007004000
+    VM_MIN_KERNEL_ADDRESS    0xfffffe0007004000      <- identical
+    SWEET_EARLY_FB_VA       0xfffffe0009004000
+    va + 32MB               0xfffffe000b004000      <- 64MB ABOVE gVirtBase
+
+So the very first assert fires and the kernel panics exactly where stage 9
+should be drawn. The offset only ever worked when `gVirtBase` sat far above
+`VM_MIN_KERNEL_ADDRESS`; here they are the same address and the block lands
+outside the window.
+
+Replacement (in 0012): walk down from `gVirtBase` and take the first genuinely
+empty L2 slot in the kernel window, with no asserts on the path at all -- the
+early console must never be the thing that panics. If no slot is found the
+console switches itself off, i.e. the old behaviour.
+
+### Two mistakes I made today, both worth remembering
+
+1. The payload header's `virt_base` is `0xfffffe0006000000` while `__TEXT` is
+   at `0xfffffe0007004000`. Do not trust `virt_base` as `gVirtBase`; read the
+   Mach-O segment addresses.
+2. Editing a hunk body without recounting the `@@ -a,b +c,d @@` line counts
+   makes `git apply` fail with `corrupt patch at line N`, and CI only logs
+   `Skipping patch ... (already upstream, previously applied, or malformed)`
+   as a **warning** -- the build then succeeds and ships a kernel silently
+   missing that patch's entire contents. Symptom: a kernel that lost
+   `kernel framebuffer VA live` / `TTBR0 off; TLB flushed`. Always grep the
+   CI log for `Skipping patch` before believing an artifact.
+
+### Next
+
+The current build (commit `891b9aa`) restores 0012 and moves the alias below
+`gVirtBase`. When the artifact appears, run it in QEMU with
+`work/tools/qrun.py` and read the screen with `work/tools/fbshow.py`. Success
+looks like a ninth banner: `Google Inc. SWEET EARLY 9: kernel framebuffer VA live`.
 ### 00:55 MSK 2026-10-26 -- the eight stages are not the end: patch 0012 adds 9..14
 
 Re-reading patch `0012-sweet-keep-debug-console-after-ttbr0.patch` changes the
