@@ -816,7 +816,12 @@ jobs:
           mkdir -p "$CCTOOLS_FOREIGN_INCLUDE/libkern"
           if [ -d "$FOREIGN/libkern" ]; then
             for x in "$FOREIGN/libkern"/*; do
-              ln -s "$x" "$CCTOOLS_FOREIGN_INCLUDE/libkern/$(basename "$x")"
+              n=$(basename "$x")
+              # _OSByteOrder.h gets a self-contained replacement below.
+              # Linking it first and then `cat >`-ing it would follow the
+              # symlink and overwrite cctools' original in the checkout.
+              [ "$n" = "_OSByteOrder.h" ] && continue
+              ln -s "$x" "$CCTOOLS_FOREIGN_INCLUDE/libkern/$n"
             done
           else
             echo "WARNING: $FOREIGN/libkern missing"
