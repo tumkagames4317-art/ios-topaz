@@ -2465,6 +2465,18 @@ jobs:
                     export CC="$HOSTCC" LD=/usr/bin/ld AR=/usr/bin/ar RANLIB=/usr/bin/ranlib
                     export CFLAGS="-O1 -w" LDFLAGS=""
                     unset CPATH C_INCLUDE_PATH LIBRARY_PATH FAKE_PLATFORMS 2>/dev/null || true
+                    # cpu.symo is a generated source that includes
+                    # <mach/message.h>; this tree does not ship Mach headers
+                    # system-wide, so point cpp at the XNU checkout we already
+                    # have. Without this the build dies at the first object:
+                    #   cpu.symc:1:10: fatal error: mach/message.h: No such file
+                    XNUMACH="$GITHUB_WORKSPACE/dxb/xnu/osfmk"
+                    if [ -d "$XNUMACH/mach" ]; then
+                      export CFLAGS="${CFLAGS} -I$XNUMACH"
+                      echo "  mach headers: -I$XNUMACH ($(ls "$XNUMACH/mach"/*.h 2>/dev/null | wc -l) headers)"
+                    else
+                      echo "  ::warning::no $XNUMACH/mach; cpu.symo will fail to find mach/message.h"
+                    fi
                     [ -f Makefile ] || { echo "  running configure"; sh ./configure 2>&1 | tail -25; }
                     make -j"$(nproc)" migcom 2>&1 | tail -45
                     exit "${PIPESTATUS[0]}"
