@@ -1,0 +1,49 @@
+# Normalise line endings in the repository, not in anyone's editor.
+#
+# The workflow file went nine commits as CRLF without anyone noticing,
+# because GitHub's YAML parser tolerates it. It cost three exchanges
+# between two people each holding half the truth: one of us measured the
+# blob correctly and the other measured a PowerShell-re-encoded copy.
+# A file attribute cannot be forgotten, mis-measured, or re-encoded by a
+# shell redirect, so this is the structural fix rather than a discipline.
+#
+# Everything text in this repo is LF, on checkout as well as in the blob.
+
+* text=auto eol=lf
+
+# Workflow definitions: a trailing CR inside a `run: |` block can change
+# shell behaviour (case patterns, literal string comparisons) and is
+# invisible in review.
+*.yml  text eol=lf
+*.yaml text eol=lf
+
+# Shell fragments and Markdown.
+*.sh   text eol=lf
+*.bash text eol=lf
+*.md   text eol=lf
+
+# The xnu patch series must never be silently re-encoded: a stray CR turns
+# a hunk into a failed hunk, and the associated context is expensive to
+# recover. `diff` and `-p1` both care about these bytes literally.
+*.patch text eol=lf
+*.diff  text eol=lf
+
+# Source we edit in the workflow but do not own.
+*.c    text eol=lf
+*.h    text eol=lf
+*.py   text eol=lf
+
+# Binary artifacts must be untouched.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.gz   binary
+*.bz2  binary
+*.xz   binary
+*.zst  binary
+*.zip  binary
+*.img  binary
+*.dtb  binary
+*.ko   binary
