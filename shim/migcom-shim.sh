@@ -173,6 +173,38 @@ else
   cp "$real_out" "$real_out2"
 fi
 
+# --- (3c) ServerAuditToken -> in ------------------------------------------
+# Apple marks a parameter carrying the caller's audit token with the direction
+# keyword `ServerAuditToken`:
+#     task_access.defs:50   ServerAuditToken  caller_cred : audit_token_t);
+#     task_access.defs:65   ServerAuditToken  caller_cred : audit_token_t);
+# GNU mig has no such token -- zero occurrences of "AuditToken" in lexxer.l,
+# parser.y or any .c file in the GNU mig 1.8 tree. Its Direction production
+# (parser.y:653-656) admits only:
+#     /* empty */ | syIn | syOut | syInOut | ...
+# so `ServerAuditToken` lands where a direction must be and is a syntax error:
+#     task_access.defs, line 64: syntax error      (run 40403082377)
+#
+# Mapping to `in` is the faithful translation, not a workaround:
+#   - the parameter IS an input (a credential handed to the server),
+#   - Apple's special behaviour is that the SERVER receives the token even
+#     though the client did not send it explicitly,
+#   - and we generate no server code at all (Stage 6 invokes mig with
+#     -server /dev/null -sheader <name>), so that server-side behaviour is
+#     never emitted.
+# The user-side declaration keeps its name and its audit_token_t type, so the
+# generated header's parameter list is unchanged.
+#
+# ServerSecToken is the same shape (security_token_t instead of
+# audit_token_t) and is absent from the GNU lexer for the same reason, so it
+# gets the same treatment rather than being left to cascade into the
+# parameter list that follows it.
+n_sat=$(grep -cE '\b(ServerAuditToken|ServerSecToken)\b' "$real_out2" || true)
+if [ "${n_sat:-0}" -gt 0 ]; then
+  sed -i -E 's/^([[:space:]]*)(ServerAuditToken|ServerSecToken)([[:space:]])/\1in\3/' "$real_out2"
+  echo "migcom-shim: rewrote $n_sat ServerAuditToken/ServerSecToken -> in (Apple-only direction; no server code generated)" >&2
+fi
+
 # --- (4) hoist the subsystem statement to the top --------------------------
 if ! grep -qE '^[[:blank:]]*subsystem([[:blank:]]|$)' "$real_out2"; then
   exec "$real" "${args[@]}" < "$real_out2"
