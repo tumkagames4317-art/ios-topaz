@@ -3072,6 +3072,18 @@ jobs:
         run: |
           set -x
           export PATH="$RUNNER_TEMP/cross/bin:/usr/local/bin:$PATH"
+
+          # Re-state the capture directory HERE, not only in Stage 5. `export`
+          # does not survive across steps, and Stage 5's value never reached
+          # this one -- which is why run 40406236502 wrote its captures to
+          # $RUNNER_TEMP/migcom-streams (a path the shim inherited only
+          # indirectly, from a .defs file) and never uploaded them. Stage 6 is
+          # the step whose mig calls actually fail, so its streams are the
+          # ones worth keeping.
+          export MIGCOM_SHIM_DUMP="$GITHUB_WORKSPACE/migcom-streams"
+          mkdir -p "$MIGCOM_SHIM_DUMP"
+          echo "MIGCOM_SHIM_DUMP=$MIGCOM_SHIM_DUMP"
+
           XROOT="$GITHUB_WORKSPACE/dxb/xnu"
           FAKEROOT="$GITHUB_WORKSPACE/dxb/fakeroot"
           OBJROOT="$GITHUB_WORKSPACE/dxb/build/xnu.obj"
@@ -3244,7 +3256,12 @@ jobs:
           # duplicated them internally. These counts decide which, and they
           # decide it from the bytes rather than from reasoning about guards.
           echo '===================== MIGCOM STREAM CENSUS ====================='
-          for f in "$RUNNER_TEMP"/migcom-streams/*.stream; do
+          # ONLY the ${name}.$$_${seq}.stream files are the stream migcom
+          # actually receives: they are written immediately before `exec`.
+          # The plain <label>.stream files are captured EARLIER, before the
+          # mach_msg_type_number_t injection rewrites $hoisted, so they are a
+          # different document. Globbing *.stream mixed the two.
+          for f in "$RUNNER_TEMP"/migcom-streams/*.*_*.stream; do
             [ -f "$f" ] || continue
             echo "-- $(basename "$f") ($(wc -l < "$f") lines)"
             echo "   MACHNINE guard occurrences: $(grep -c 'MACHNINE_TYPES_DEFS' "$f" || true)   (2 = ifndef+define, expect 2)"
@@ -3252,6 +3269,10 @@ jobs:
             echo "   type int    declarations:   $(grep -cE '^[[:blank:]]*type[[:blank:]]+int[[:blank:]]*=' "$f" || true)"
             echo "   type natural_t declarations:$(grep -cE '^[[:blank:]]*type[[:blank:]]+natural_t[[:blank:]]*=' "$f" || true)   (0 => guard fired on FIRST entry)"
             echo "   type int64  declarations:   $(grep -cE '^[[:blank:]]*type[[:blank:]]+int64[[:blank:]]*=' "$f" || true)"
+            echo "   EVERY int64/char declaration line, verbatim:"
+            grep -nE '^[[:blank:]]*type[[:blank:]]+(int64|char)[[:blank:]]*=' "$f" | sed 's/^/      /' || echo "      (none)"
+            echo "   any line CONTAINING int64 (not just declarations):"
+            grep -n 'int64' "$f" | head -8 | sed 's/^/      /' || echo "      (none)"
             echo "   file-opening #line markers (first 12):"
             grep -nE '^[[:blank:]]*# *[0-9]+ "' "$f" | head -12 | sed 's/^/      /'
           done

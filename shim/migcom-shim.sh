@@ -155,23 +155,62 @@ fi
 # Provenance note: the streams were proving clean (one declaration of each,
 # MACHNINE guards 0, natural_t present once) while mig still errored -- which
 # is what pointed at the process's own table rather than at the text.
-# `char` is deliberately NOT in this list. lexxer.l has BOTH
-#     lexxer.l:170  "MACH_MSG_TYPE_CHAR"     TRETURN(MACH_MSG_TYPE_CHAR,     8);
-#     lexxer.l:172  "MACH_MSG_TYPE_INTEGER_8" TRETURN(MACH_MSG_TYPE_INTEGER_8, 8);
-# Two DIFFERENT 8-bit type names, and mig emits different C for them. The .defs
-# says `type char = MACH_MSG_TYPE_CHAR;` while init_type's built-in char is
-# INTEGER_8, so dropping that line would silently change generated signatures.
-# It stays, and so does its duplicate error, until it can be handled exactly.
+# --- (3a2) drop the Apple-only `, const` parameter qualifier -----------------
+# mach_exc.defs:99   code      : mach_exception_data_t, const;
+# mach_exc.defs:101  old_state : thread_state_t, const;
+# `const` is NOT a token in GNU mig's lexer. lexxer.l's IPCFlags set is exactly
+#     lexxer.l:154-160  islong isnotlong dealloc notdealloc servercopy
+#                       countinout retcode
+# (FRETURN -> parser.y IPCFlags), and the string "const" does not occur in
+# lexxer.l at all. So `, const` lexes as a comma plus a bare identifier where
+# IPCFlags is expected -> syntax error, reported at mach_exc.defs:98-101.
+#
+# Dropping it is safe for header generation and does NOT change the wire
+# format: in MIG, `const` on a parameter is a codegen hint that the server does
+# not modify the pointed-to data. It carries no IPC type name and no size, so
+# the message layout is identical. That is unlike `MACH_MSG_TYPE_CHAR` vs
+# `MACH_MSG_TYPE_INTEGER_8` (see the builtin note above), where the IPC name
+# itself differs and dropping would change generated C.
+#
+# Word-bounded and anchored so that `constant`, `const_foo`, and a leading
+# `const` (as opposed to a trailing `, const` qualifier) are all untouched.
+n_const=$(grep -cE ',[[:blank:]]*const([[:blank:]]*[;,)])' "$real_out" || true)
+if [ "${n_const:-0}" -gt 0 ]; then
+  sed -i -E 's/,[[:blank:]]*const([[:blank:]]*[;,)]|$)/\1/g' "$real_out"
+  echo "migcom-shim: dropped $n_const Apple-only ', const' parameter qualifier(s) (not a GNU mig IPCFlag; no wire-format effect)" >&2
+fi
+
+# `char` IS in this list, and the earlier version of this comment had the
+# reasoning backwards. It said init_type's built-in `char` is INTEGER_8 while
+# the .defs says MACH_MSG_TYPE_CHAR, so dropping the line would change
+# generated signatures. Read type.c rather than the lexer:
+#
+#     type.c:977  itInsert("char", itCIntTypeDecl("char", sizeof_char));
+#     type.c:789  itCIntTypeDecl(const_string_t ctype, const size_t size)
+#     type.c:792    switch (size) {
+#     type.c:793      case 1:
+#     type.c:794        it = itShortDecl(MACH_MSG_TYPE_CHAR, "MACH_MSG_TYPE_CHAR",
+#     type.c:795            MACH_MSG_TYPE_CHAR, "MACH_MSG_TYPE_CHAR", size * 8);
+#
+# sizeof(char) is 1, so the built-in registers char with in/out name
+# MACH_MSG_TYPE_CHAR -- byte-identical to `type char = MACH_MSG_TYPE_CHAR;`.
+# lexxer.l:170/172 having two distinct 8-bit tokens is a fact about the lexer,
+# not about what init_type puts in the table. Dropping the .defs line leaves
+# the table holding precisely the same entry, so generated C is unchanged.
+#
+# The built-in list is exactly type.c:977-985, and these names are the ones
+# mig reports as "overriding previous definition". Anything else that collides
+# is a genuine .defs problem and must not be silently deleted here.
 n_builtin=0
-for _t in short int uintptr_t intptr_t; do
+for _t in char short int uintptr_t intptr_t; do
   _c=$(grep -cE "^[[:blank:]]*type[[:blank:]]+${_t}[[:blank:]]*=" "$real_out" || true)
   [ "${_c:-0}" -gt 0 ] && n_builtin=$((n_builtin + _c))
 done
 if [ "${n_builtin:-0}" -gt 0 ]; then
   sed -i -E \
-    -e '/^[[:blank:]]*type[[:blank:]]+(short|int|uintptr_t|intptr_t)[[:blank:]]*=/d' \
+    -e '/^[[:blank:]]*type[[:blank:]]+(char|short|int|uintptr_t|intptr_t)[[:blank:]]*=/d' \
     "$real_out"
-  echo "migcom-shim: dropped $n_builtin re-declaration(s) of GNU mig built-in integer types (short/int/uintptr_t/intptr_t; type.c:977-985 already defines these with identical IPC names)" >&2
+  echo "migcom-shim: dropped $n_builtin re-declaration(s) of GNU mig built-in integer types (char/short/int/uintptr_t/intptr_t; type.c:977-985 already registers each with the identical IPC name)" >&2
 fi
 
 # --- (3b) SameCount -> an explicit count argument --------------------------
@@ -327,28 +366,6 @@ if [ "$awk_rc" -ne 0 ]; then
 fi
 
 echo "migcom-shim: hoisted subsystem statement to top of input" >&2
-
-# --- (4a) MIGCOM_SHIM_DUMP: capture the EXACT stream fed to migcom ----------
-# Off by default. When MIGCOM_SHIM_DUMP names a directory, write the hoisted
-# stream there as <label>.stream so the log can answer questions we keep
-# guessing at:
-#     grep -c 'MACHNINE_TYPES_DEFS' <label>.stream   expect 2 (ifndef+define)
-#     grep -cE '^[[:blank:]]*type[[:blank:]]+short[[:blank:]]*=' <label>.stream
-#                                                    2 => cpp emitted it twice
-#     grep -nE '^[[:blank:]]*# *[0-9]+ "' <label>.stream   which file each block opens
-# argv goes on line 1 in a comment so the file is self-describing.
-if [ -n "${MIGCOM_SHIM_DUMP:-}" ]; then
-  mkdir -p "$MIGCOM_SHIM_DUMP" 2>/dev/null || true
-  _lbl=$(printf '%s' "${args[*]}" | tr -c 'A-Za-z0-9._-' '_' | cut -c1-80)
-  [ -n "$_lbl" ] || _lbl="stream"
-  _dst="$MIGCOM_SHIM_DUMP/$_lbl.stream"
-  {
-    printf '# migcom-shim argv: %s\n' "${args[*]}"
-    printf '# MACHNINE in env: %s\n' "$(env | grep -c MACHNINE || true)"
-    cat "$hoisted"
-  } > "$_dst" 2>/dev/null || true
-  echo "migcom-shim: DUMP wrote $_dst ($(wc -l < "$hoisted") stream lines)" >&2
-fi
 
 # --- (4b) PROVENANCE for duplicate type declarations ------------------------
 # GNU mig treats a repeated `type X = ...` as FATAL (parser.y:339 calls
