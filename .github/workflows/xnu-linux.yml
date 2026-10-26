@@ -107,6 +107,13 @@ env:
   # at this line, which blocked dispatch entirely. $RUNNER_TEMP always points
   # at this path on the Ubuntu runner anyway.
   CCTOOLS_FOREIGN_INCLUDE: "/home/runner/work/_temp/machinc"
+  # Pinned at workflow level so EVERY stage sees the same checkout path.
+  # Stages 5b and 6 each set their own; Stage 5 did not, so
+  #     '[' -f "$XROOT/bsd/sys/_types/_mach_port_t.h" ']'
+  # expanded to '/bsd/sys/...' and silently took the fallback branch even
+  # though xnu's own headers were sitting in the tree. Defining it once
+  # here removes the class rather than the instance.
+  XNU_SRC_ROOT: "${{ github.workspace }}/dxb/xnu"
   LIBRARY_PATH: "/usr/local/lib"
   LD_LIBRARY_PATH: "/usr/local/lib"
 
@@ -1436,11 +1443,11 @@ jobs:
           # already checked out by Stage 3); fall back to synthesising the two
           # typedefs only if that directory is genuinely absent.
           mkdir -p "$RUNNER_TEMP/xnusys/types"
-          if [ -f "$XROOT/bsd/sys/_types/_mach_port_t.h" ]; then
+          if [ -f "$XNU_SRC_ROOT/bsd/sys/_types/_mach_port_t.h" ]; then
             echo "sys/_types source: xnu's own bsd/sys/_types"
-            cp -f "$XROOT/bsd/sys/_types/_mach_port_t.h" \
+            cp -f "$XNU_SRC_ROOT/bsd/sys/_types/_mach_port_t.h" \
                   "$RUNNER_TEMP/xnusys/types/" 2>/dev/null || true
-            cp -f "$XROOT/bsd/sys/_types/_uuid_t.h" \
+            cp -f "$XNU_SRC_ROOT/bsd/sys/_types/_uuid_t.h" \
                   "$RUNNER_TEMP/xnusys/types/" 2>/dev/null || true
           fi
           if [ ! -f "$RUNNER_TEMP/xnusys/types/_mach_port_t.h" ]; then
@@ -1501,6 +1508,70 @@ jobs:
               exit 1
             fi
           done
+          # ---------------------------------------------------------------
+          # Narrow <sys/...> closure for mig.
+          #
+          # Rather than discovering one missing osfmk->sys header per run
+          # (sys/_types.h, then sys/_types/_mach_port_t.h, then
+          # sys/appleapiopts.h, ...), resolve the set that mig's own
+          # translation units actually reach and stage ONLY those files.
+          #
+          # Deliberately NOT the whole of xnu/bsd/sys: that tree contains
+          # real kernel headers (sys/types.h, sys/stat.h, sys/mman.h,
+          # sys/param.h) which would fight glibc. We already paid for that
+          # lesson with compat.h and _OSByteOrder.h, where a Darwin header
+          # winning a name collision produced redefinition cascades far
+          # worse than a clean "file not found". Only these five are
+          # requested by mig's direct header set (message.h, port.h,
+          # std_types.h, boolean.h, kern_return.h, ndr.h, notify.h,
+          # mach_types.h, mig_errors.h, msg_type.h, rpc.h):
+          #     sys/_types.h
+          #     sys/_types/_mach_port_t.h
+          #     sys/_types/_uuid_t.h
+          #     sys/appleapiopts.h
+          #     sys/cdefs.h
+          # The first three come from cctools foreign/ + the graft above;
+          # the last two come from xnu's own bsd/sys/.
+          #
+          # miginc is appended AFTER the other -I paths so glibc and the
+          # cctools headers win every name we did not explicitly stage.
+          MIGINC="$RUNNER_TEMP/miginc"
+          rm -rf "$MIGINC"
+          mkdir -p "$MIGINC/sys/_types"
+          echo '--- staging xnu bsd/sys headers for mig ---'
+          STAGED=""
+          for rel in sys/appleapiopts.h sys/cdefs.h; do
+            src="$XNU_SRC_ROOT/bsd/$rel"
+            if [ -f "$src" ]; then
+              cp -f "$src" "$MIGINC/$rel"
+              STAGED="$STAGED $rel"
+              echo "  staged $rel ($(wc -l < "$src") lines) <- $src"
+            else
+              echo "  MISSING $rel (looked in $src)"
+            fi
+          done
+          # cctools' own sys/cdefs.h is the one the Mach headers are written
+          # against; prefer it when present, since it carries the
+          # availability macros xnu expects.
+          ncdefs=$(find "$GITHUB_WORKSPACE/cctools-port/cctools/include/foreign" \
+                     -name cdefs.h 2>/dev/null | head -1)
+          if [ -n "$ncdefs" ]; then
+            cp -f "$ncdefs" "$MIGINC/sys/cdefs.h"
+            echo "  staged sys/cdefs.h from cctools foreign ($ncdefs)"
+          fi
+          echo "closure staged:${STAGED:- <none>}"
+          echo '--- miginc tree ---'
+          find "$MIGINC" -type f | sort
+          echo "miginc file count: $(find "$MIGINC" -type f | wc -l)"
+          # The two headers that previously stopped the build by name must be
+          # present, or mig will fail on the same line again.
+          for need in sys/appleapiopts.h sys/cdefs.h; do
+            if [ ! -f "$MIGINC/$need" ]; then
+              echo "::error::mig closure is missing $need"
+              exit 1
+            fi
+          done
+          INC="$INC -I$MIGINC"
           # migcom needs the BSD scalar types (u_int and friends) that glibc
           # hides behind __USE_MISC. Stage 1b's compat.h defines them and is
           # safe to force-include here: its host-tool half is gated on
@@ -1655,6 +1726,30 @@ jobs:
           # straight against it. Prefer the .a, fall back to .la, and report
           # a missing archive loudly rather than letting the link fail
           # cryptically later.
+          # xnu's SETUP Makefiles hard-assign LDFLAGS with `=`, e.g.
+          #   SETUP/kextsymboltool/Makefile:15
+          #   LDFLAGS = -isysroot $(HOST_SDKROOT) -mmacosx-version-min=...
+          # A plain `=` in the makefile wins over a command-line variable
+          # unless it is `override`, so passing LDFLAGS on the make command
+          # line does nothing for these recipes -- confirmed by runs
+          # 40378282825 and 40379258308, where the kextsymboltool link still
+          # used only -L/usr/local/lib -lbsdcompat. Append $(LDFLAGS_EXTRA)
+          # instead, which the make command line does set.
+          for d in kextsymboltool setsegname installfile replacecontents config; do
+            mf="$GITHUB_WORKSPACE/dxb/xnu/SETUP/$d/Makefile"
+            [ -f "$mf" ] || continue
+            if grep -q 'LDFLAGS_EXTRA' "$mf"; then
+              echo "SETUP/$d: already references LDFLAGS_EXTRA"
+            else
+              sed -i.bak -E 's/^(LDFLAGS[[:space:]]*=.*)$/\1 $(LDFLAGS_EXTRA)/' "$mf"
+              if grep -q 'LDFLAGS_EXTRA' "$mf"; then
+                echo "SETUP/$d: $(grep -E '^LDFLAGS[[:space:]]*=' "$mf" | head -1)"
+              else
+                echo "::warning::SETUP/$d: could not append LDFLAGS_EXTRA"
+              fi
+            fi
+          done
+
           CT_ROOT="$GITHUB_WORKSPACE/cctools-port/cctools"
           CT_ARCHIVES=""
           CT_LIBS=""
@@ -1810,7 +1905,7 @@ jobs:
             KERNEL_BUILDS_IN_PARALLEL=1
             RC_DARWIN_KERNEL_VERSION=22.6.0
             TIGHTBEAMC=tightbeamc-not-supported
-            LDFLAGS_EXTRA="-L$RUNNER_TEMP -l:copyfile.o"
+            LDFLAGS_EXTRA="-L$RUNNER_TEMP -l:copyfile.o -L$RUNNER_TEMP/cross/lib -lmacho -lstuff -luuid"
           )
 
           echo '===================== installhdrs ====================='
