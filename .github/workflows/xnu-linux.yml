@@ -953,6 +953,15 @@ jobs:
           #     cctools/include/mach/machine.h:83:9: fatal error:
           #     'mach/machine/vm_types.h' file not found
           [ -d "$FOREIGN/mach" ] && ln -s "$FOREIGN/mach" "$CCTOOLS_FOREIGN_INCLUDE/mach"
+          # mach/i386/vm_types.h then wants plain <i386/_types.h>, and the ppc
+          # and arm variants do the same for themselves. cctools keeps those
+          # arch directories at the top of foreign/, outside mach/, so expose
+          # them as well -- they hold only Mach kernel types, no libc names:
+          #   machinc/mach/i386/vm_types.h:72:10: fatal error:
+          #   'i386/_types.h' file not found          (run 40375312365)
+          for d in i386 ppc arm; do
+            [ -d "$FOREIGN/$d" ] && ln -sfn "$FOREIGN/$d" "$CCTOOLS_FOREIGN_INCLUDE/$d"
+          done
           # Availability.h/AvailabilityMacros.h are pulled in by swap.h too;
           # they are plain macro headers with no libc content.
           for h in Availability.h AvailabilityMacros.h; do
