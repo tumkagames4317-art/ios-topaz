@@ -1545,18 +1545,38 @@ jobs:
           #     sys/_types/_mach_port_t.h
           #     sys/_types/_uuid_t.h
           #     sys/appleapiopts.h
-          #     sys/cdefs.h
-          # The first three come from cctools foreign/ + the graft above;
-          # the last two come from xnu's own bsd/sys/.
+          #     sys/appleapiopts.h
+          # and NOT sys/cdefs.h. See below for why that one is excluded.
+          # The _types/ entries come from cctools foreign/ + the graft above;
+          # sys/appleapiopts.h comes from xnu's own bsd/sys/.
           #
-          # miginc is appended AFTER the other -I paths so glibc and the
-          # cctools headers win every name we did not explicitly stage.
+          # miginc is appended AFTER the other -I paths, but that is not
+          # enough to stop it shadowing glibc: -I directories beat the system
+          # default directories in ENTIRELY DIFFERENT SEARCH TIERS, so an -I
+          # path always wins over /usr/include no matter what order it is in.
+          #
+          # That is exactly what broke run 40380579795. Staging xnu's
+          # bsd/sys/cdefs.h shadowed glibc's <sys/cdefs.h> FOR GLIBC ITSELF:
+          #     /usr/include/features.h:502 -> <sys/cdefs.h>
+          #       -> miginc/sys/cdefs.h:793  #include <sys/_symbol_aliasing.h>
+          #       -> fatal error: 'sys/_symbol_aliasing.h' file not found
+          # xnu's cdefs.h takes that branch whenever KERNEL is undefined
+          # (bsd/sys/cdefs.h:790), and _symbol_aliasing.h is generated into
+          # the Apple SDK and is not in xnu or cctools. error.c compiled
+          # cleanly on f64d578 and failed here, so this was damage added by
+          # the closure, not an earlier failure surfacing in file order.
+          #
+          # The rule, learned for the third time after compat.h and
+          # _OSByteOrder.h: NEVER stage a header whose name glibc also owns.
+          # A Darwin header winning that collision is far worse than a
+          # missing one. So sys/cdefs.h is deliberately NOT staged and the
+          # run asserts it stays absent.
           MIGINC="$RUNNER_TEMP/miginc"
           rm -rf "$MIGINC"
           mkdir -p "$MIGINC/sys/_types"
           echo '--- staging xnu bsd/sys headers for mig ---'
           STAGED=""
-          for rel in sys/appleapiopts.h sys/cdefs.h; do
+          for rel in sys/appleapiopts.h; do
             src="$XNU_SRC_ROOT/bsd/$rel"
             if [ -f "$src" ]; then
               cp -f "$src" "$MIGINC/$rel"
@@ -1566,27 +1586,39 @@ jobs:
               echo "  MISSING $rel (looked in $src)"
             fi
           done
-          # cctools' own sys/cdefs.h is the one the Mach headers are written
-          # against; prefer it when present, since it carries the
-          # availability macros xnu expects.
-          ncdefs=$(find "$GITHUB_WORKSPACE/cctools-port/cctools/include/foreign" \
-                     -name cdefs.h 2>/dev/null | head -1)
-          if [ -n "$ncdefs" ]; then
-            cp -f "$ncdefs" "$MIGINC/sys/cdefs.h"
-            echo "  staged sys/cdefs.h from cctools foreign ($ncdefs)"
-          fi
           echo "closure staged:${STAGED:- <none>}"
           echo '--- miginc tree ---'
           find "$MIGINC" -type f | sort
           echo "miginc file count: $(find "$MIGINC" -type f | wc -l)"
-          # The two headers that previously stopped the build by name must be
-          # present, or mig will fail on the same line again.
-          for need in sys/appleapiopts.h sys/cdefs.h; do
-            if [ ! -f "$MIGINC/$need" ]; then
-              echo "::error::mig closure is missing $need"
+          # appleapiopts.h must be present: nothing else provides it.
+          if [ ! -f "$MIGINC/sys/appleapiopts.h" ]; then
+            echo "::error::mig closure is missing sys/appleapiopts.h"
+            exit 1
+          fi
+          # NEGATIVE assertion, so the cdefs.h shadow cannot creep back in.
+          # Extended to the whole class of names glibc owns: an -I path is a
+          # different search tier from the system defaults, so ANY of these
+          # staged here would hijack glibc's own request for it.
+          for n in sys/cdefs.h sys/types.h sys/stat.h sys/param.h sys/mman.h \
+                   sys/time.h sys/unistd.h sys/signal.h sys/errno.h; do
+            if [ -e "$MIGINC/$n" ]; then
+              echo "::error::$n must never be staged -- it shadows glibc"
               exit 1
             fi
           done
+          echo "  glibc-owned names: none staged (checked 9)"
+          # Positive control for the negative assertion above: prove that
+          # glibc really does reach for <sys/cdefs.h>, so the assertion has
+          # a live reason. If this stops matching, re-examine it rather than
+          # silently keeping a rule that no longer protects anything.
+          if grep -rq '<sys/cdefs.h>' /usr/include/features.h 2>/dev/null; then
+            echo "  glibc features.h includes <sys/cdefs.h>: shadowing hazard is real"
+          else
+            echo "::warning::features.h does not include <sys/cdefs.h>; re-check why"
+          fi
+          echo '--- full miginc contents ---'
+          find "$MIGINC" -type f -printf '%p (%s bytes)\n' 2>/dev/null | sort || \
+            find "$MIGINC" -type f | sort
           INC="$INC -I$MIGINC"
           # migcom needs the BSD scalar types (u_int and friends) that glibc
           # hides behind __USE_MISC. Stage 1b's compat.h defines them and is
@@ -1645,7 +1677,19 @@ jobs:
             echo "== $f"
             clang -std=gnu89 -w -Dlinux -include /usr/local/include/compat.h \
               -o "out/$(basename "${f%.c}").o" -c "$f" $INC \
-              || { echo "MIGCOM COMPILE FAILED: $f"; exit 1; }
+              || {
+                echo "MIGCOM COMPILE FAILED: $f"
+                # -H prints every header actually opened, in order, with the
+                # path each resolved to. Without this we can only guess which
+                # header set is in play, which is precisely the error that
+                # cost run 40380579795: the shadowing header was reached via
+                # glibc's own include, not mig's.
+                echo "--- first 25 headers opened for $f (clang -H) ---"
+                clang -std=gnu89 -w -Dlinux -include /usr/local/include/compat.h \
+                  -H -fsyntax-only "$f" $INC 2>&1 \
+                  | grep -E '^\.+' | head -25 || true
+                exit 1
+              }
           done
           clang -o out/migcom out/*.o -lm
           ./out/migcom -version || true
@@ -1777,6 +1821,25 @@ jobs:
               CT_ARCHIVES="$RUNNER_TEMP/cross/lib"
               CT_LIBS="$CT_LIBS -l$lib"
               echo "cctools archive: lib$lib.a (staged)"
+              # Decide the ARCHIVE FORMAT, not just symbol presence. cctools is
+              # configured with an emulated Macintosh host CPU, so its static
+              # libraries can come out as Mach-O rather than ELF. GNU ld skips
+              # a Mach-O member WITHOUT any diagnostic: it reads the archive
+              # index, finds nothing it understands, and then blames the
+              # consumer's symbols. That matches what runs 40378282825 /
+              # 40379258308 / 40380273397 show -- -lmacho -lstuff was on the
+              # link line and nm found the symbols inside the .a, yet the
+              # linker still reported
+              #     undefined reference to `NXGetLocalArchInfo'
+              echo "--- $stage format ---"
+              file "$stage" 2>/dev/null || true
+              member=$(/usr/bin/ar t "$stage" 2>/dev/null | head -1)
+              if [ -n "$member" ]; then
+                tmpd=$(mktemp -d)
+                ( cd "$tmpd" && /usr/bin/ar x "$stage" "$member" >/dev/null 2>&1 \
+                  && echo "member $member:" && file "$member" ) || true
+                rm -rf "$tmpd"
+              fi
             else
               echo "::warning::lib$lib.a not found at $stage"
             fi
