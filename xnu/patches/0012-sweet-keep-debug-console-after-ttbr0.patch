@@ -1,7 +1,7 @@
 diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
 --- a/osfmk/arm64/arm_vm_init.c
 +++ b/osfmk/arm64/arm_vm_init.c
-@@ -1825,6 +1825,70 @@
+@@ -1825,6 +1825,77 @@
  #define ARM64_PHYSMAP_ALIGNMENT_PADDING (PTOV_TABLE_SIZE * ARM_TT_TWIG_SIZE)
  #endif
  
@@ -39,7 +39,14 @@ diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
 +		    (ARM_TTE_VALID | ARM_TTE_TYPE_TABLE)) {
 +			continue;
 +		}
-+		tt_entry_t *l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
++		/*
++		 * phystokv() is not usable here: arm_vm_physmap_init() has not run
++		 * yet and the physmap aperture does not exist. The bootstrap
++		 * tables were built with kernel VAs that are physical addresses
++		 * plus gVirtBase's offset, and at this point gVirtBase is still
++		 * zero, so the table address is already a usable VA.
++		 */
++		tt_entry_t *l2 = (tt_entry_t *)(l1 & ARM_TTE_TABLE_MASK);
 +		if (l2[(va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT] == ARM_TTE_EMPTY) {
 +			return va;
 +		}
@@ -72,19 +79,11 @@ diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
  void
  arm_vm_init(uint64_t memory_size, boot_args * args)
  {
-@@ -2153,20 +2179,35 @@
+@@ -2153,20 +2179,27 @@
  
  	arm_set_user_tbi();
  
-+#if defined(SWEET) && 0
-+	/*
-+	 * Disabled for diagnosis. sweet_early_map_final() calls phystokv()
-+	 * before arm_vm_physmap_init() has built the VA=PA aperture, so the
-+	 * table pointer it derives is not trustworthy at this point and the
-+	 * write it performs lands somewhere unknown. Everything below still
-+	 * runs, the console just loses its alias -- which is what happened on
-+	 * every build before this patch existed.
-+	 */
++#if defined(SWEET)
 +	sweet_early_map_final();
 +#endif
  	arm_vm_physmap_init(args);
