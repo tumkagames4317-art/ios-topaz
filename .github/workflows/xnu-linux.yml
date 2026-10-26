@@ -1857,6 +1857,22 @@ jobs:
               echo "::error::cctools archive does not define $sym"
             fi
           done
+          # Final, decisive probe: the question is not whether the symbol is
+          # in the archive (nm says yes) but whether the ELF linker can USE
+          # it. This link either succeeds or prints exactly why it cannot.
+          if [ -n "$CT_ARCHIVES" ]; then
+            probe=$(mktemp -d)
+            printf 'extern void swap_mach_header_64(void);\nint main(void){swap_mach_header_64();return 0;}\n' \
+              > "$probe/p.c"
+            if clang -o "$probe/p" "$probe/p.c" -L"$CT_ARCHIVES" -lstuff 2>"$probe/err"; then
+              echo "LINK PROBE: libstuff.a IS usable by the ELF linker"
+            else
+              echo "::error::LINK PROBE FAILED -- libstuff.a cannot satisfy an ELF link"
+              cat "$probe/err"
+              echo "--- this is the real reason kextsymboltool cannot link ---"
+            fi
+            rm -rf "$probe"
+          fi
 
           setup_failed=""
           for d in config kextsymboltool setsegname installfile replacecontents; do
