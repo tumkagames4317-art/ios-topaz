@@ -163,7 +163,29 @@ jobs:
             build-essential libssl-dev libbz2-dev liblzma-dev zlib1g-dev libncurses-dev \
             uuid-dev libcap-dev bison flex libblocksruntime-dev \
             libc++abi-dev unifdef \
-            libedit-dev libelf-dev python3 jq cmake ccache || true
+            libedit-dev libelf-dev python3 jq cmake ccache tcsh || true
+          # tcsh: SETUP/config/doconf is `#!/bin/csh -f`. csh does not exist on
+          # Ubuntu, so every generated subsystem Makefile died with
+          #
+          #     make[5]: .../dxb/xnu/SETUP/config/doconf: No such file or directory
+          #     make[5]: *** [.../bsd/conf/Makefile:26: .../DEVELOPMENT/Makefile] Error 127
+          #
+          # 127 is "command not found" -- the *interpreter*, not the script.
+          # bsd, security, iokit, osfmk, pexpert, libkern, libsa all failed the
+          # same way in run 40411280264, which is why `install` died at
+          # MakeInc.dir:85 while `installhdrs` had just succeeded for the first
+          # time. doconf is a 313-line csh script doing real argv parsing
+          # (switch/case/breaksw, $#argv, `...` command substitution), so it is
+          # not worth hand-porting to sh; tcsh provides /bin/csh and is the
+          # standard Ubuntu package for it.
+          echo '=== csh for SETUP/config/doconf ==='
+          ls -l /bin/csh 2>/dev/null || echo '  /bin/csh MISSING'
+          if [ -x /bin/csh ]; then
+            head -1 "$GITHUB_WORKSPACE/dxb/xnu/SETUP/config/doconf" 2>/dev/null || true
+            /bin/csh -f -c 'echo "  csh works"' || echo '  ::error::csh present but not functional'
+          else
+            echo '  ::error::/bin/csh missing; doconf cannot run and install will fail'
+          fi
           # unifdef: Stage 6's first wall. installhdrs ran, got past
           # build_setup (all six SETUP tools present), and then died with
           #     /bin/sh: 1: unifdef: not found
