@@ -338,6 +338,31 @@ if [ "${n_sat:-0}" -gt 0 ]; then
   echo "migcom-shim: rewrote $n_sat ServerAuditToken/ServerSecToken -> in (Apple-only direction; no server code generated)" >&2
 fi
 
+# --- (3d) drop `physicalcopy` and other Apple-only IPC flags --------------
+# device.defs reports 76 syntax errors, all of them this flag:
+#     out properties : io_buf_ptr_t, physicalcopy
+#     in  matching   : io_buf_ptr_t, physicalcopy;
+# GNU mig's IPCFlags (parser.y:518-533) accepts exactly
+#     islong isnotlong dealloc notdealloc servercopy countinout retcode
+# and `physicalcopy` is not among them -- an Apple-only hint with no GNU
+# equivalent. It is a hint only: dropping it does not change the wire layout,
+# because the type (io_buf_ptr_t) and the direction (in/out) already fix that.
+# Measured: 9 uses in device.defs, and no other unrecognised flag there
+# (', violate' / ', copy' are ordinary words inside comments).
+# The flag may be followed by ';', ',' or ')' (end of the argument) or by
+# end-of-line. Matching only end-of-line silently did nothing on
+# `io_buf_ptr_t, physicalcopy;` and `..., physicalcopy` inside a multi-line
+# routine -- a no-op that still printed a banner. Both shapes are covered here
+# and the count is what proves it fired.
+# The live document from (3b) onward is $real_out2, not $real_out: it is
+# copied at the SameCount step and the ServerAuditToken rewrite targets it.
+# Editing $real_out here made this block a no-op that still printed a banner.
+n_phys=$(grep -cE ',[[:blank:]]*physicalcopy\b' "$real_out2" || true)
+if [ "${n_phys:-0}" -gt 0 ]; then
+  sed -i -E 's/,[[:blank:]]*physicalcopy\b//g' "$real_out2"
+  echo "migcom-shim: dropped $n_phys 'physicalcopy' IPC flag(s) (Apple-only; not in GNU mig's IPCFlags parser.y:518-533)" >&2
+fi
+
 # --- (4) hoist the subsystem statement to the top --------------------------
 if ! grep -qE '^[[:blank:]]*subsystem([[:blank:]]|$)' "$real_out2"; then
   exec "$real" "${args[@]}" < "$real_out2"

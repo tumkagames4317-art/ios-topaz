@@ -1025,37 +1025,33 @@ jobs:
           # --target= is what actually makes clang emit arm64 Darwin objects;
           # the missing piece was simply that nobody had ever set it.
           sudo mkdir -p /usr/local/bin
-          for _x in clang clang++; do
-            sudo tee "/usr/local/bin/xtool-${_x}" >/dev/null <<'XTEOF'
+          sudo tee /usr/local/bin/xtool-clang >/dev/null <<'XTEOF'
           #!/bin/bash
-          # Ubuntu clang, forced to the Darwin arm64 target. Reached only via
-          # xcrun -find clang -> this path (MakeInc.cmd:184). The heredoc IS
-          # quoted ('XTEOF'). It was not in 40413292715, and that single
-          # missing pair of quotes broke the whole wrapper: the body expanded
-          # in the generating shell, where $#, $1 and $2 are empty, so the
-          # installed file read
-          #     while [  -gt 0 ]; do case "" in ... esac done
-          # and every invocation failed with
-          #     clang: error: no input files
-          # including the step's own control:
-          #     + /usr/local/bin/xtool-clang --version   -> clang: error: no input files
-          #     + /usr/local/bin/xtool-clang -arch arm64 -c /tmp/xt.c -o /tmp/xt.o
-          #                                              -> clang: error: no input files
-          # Because ${_x} was being used to pick /usr/bin/clang vs clang++, it
-          # is now derived from $0 inside the (literal) script instead.
+          # Ubuntu clang, forced to the Darwin arm64 target.
+          # Reached via: xcrun -find clang  (MakeInc.cmd:184)
+          #              -> /usr/local/bin/xtool-clang, and via cc-shim.
+          #
+          # HISTORY, because each of these cost a run:
+          #  * the heredoc was unquoted in 40413292715, so $#/$1/$2 expanded while
+          #    the file was being WRITTEN and the loop became  while [  -gt 0 ] --
+          #    every call died with 'clang: error: no input files'.
+          #  * the binary was then derived from $(basename "$0"), which for
+          #    /usr/local/bin/xtool-clang is "xtool-clang", so it exec'd
+          #    /usr/bin/xtool-clang -- nonexistent -- and every call died with
+          #    Error 127 (40414443571).
+          # A literal path is used now, exactly as the lead asked: no $0 arithmetic,
+          # no dependence on install location, and the two names cannot drift.
+          BIN=/usr/bin/clang
+          [ -x "$BIN" ] || { echo "xtool-clang: $BIN is missing or not executable" >&2; exit 127; }
           out=()
           while [ $# -gt 0 ]; do
             case "$1" in
-              # MakeInc.def:270  ARCH_FLAGS_ARM64 = -arch $(ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG)
-              # and the value comes from EMBEDDED_DEVICE_MAP, e.g.
-              #     -arch armv8.2-a+crypto
-              # That is a GCC-style CPU string, not an Apple -arch name. Passing
-              # it through makes clang read it as -mcpu and reject it with
-              #     error: unknown target CPU 'armv8.2-a+crypto'
-              # whose "valid values" note is an X86 list -- 627 times in
-              # 40413177461. So -arch is CONSUMED here and replaced by one
-              # canonical target; the CPU/march detail is re-added below as a
-              # flag clang for this triple actually understands.
+          # MakeInc.def:270 ARCH_FLAGS_ARM64 = -arch $(ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG)
+          # and the value comes from EMBEDDED_DEVICE_MAP, e.g. -arch armv8.2-a+crypto.
+          # That is a GCC-style CPU string, not an Apple -arch name: passed through,
+          # clang reads it as -mcpu and answers with an X86 list of valid CPUs.
+          # So -arch is CONSUMED and replaced by one canonical target; the CPU
+          # detail is re-added as -march=, which clang for this triple understands.
               -arch) shift 2 ;;
               -mcpu=*) out+=("$1"); shift ;;
               -mkernel|-msoft-float|-mno-soft-float|-fapple-kext) shift ;;
@@ -1063,10 +1059,8 @@ jobs:
               *) out+=("$1"); shift ;;
             esac
           done
-          # One-shot argv dump: the first N invocations are written verbatim so
-          # a "no input files" regression can be diagnosed from the artifact
-          # instead of from guesses about which argv shape broke it. Bounded so
-          # it cannot bloat the log.
+          # Bounded argv capture: lets a wrapper regression be diagnosed from the
+          # artifact instead of from guesses about argv shape.
           if [ -n "$XTOOL_DUMP" ] && [ -d "$XTOOL_DUMP" ]; then
             _seq=$(( $(cat "$XTOOL_DUMP/.seq" 2>/dev/null || echo 0) + 1 ))
             echo "$_seq" > "$XTOOL_DUMP/.seq"
@@ -1074,9 +1068,55 @@ jobs:
               printf 'ARGV[%d]: %s\n' "$_seq" "$*" >> "$XTOOL_DUMP/argv.txt"
             fi
           fi
-          exec /usr/bin/$(basename "$0") --target=aarch64-apple-darwin -march=armv8.2-a+crypto+crc "${out[@]}"
+          exec "$BIN" --target=aarch64-apple-darwin -march=armv8.2-a+crypto+crc "${out[@]}"
           XTEOF
-            sudo chmod +x "/usr/local/bin/xtool-${_x}"
+          sudo chmod +x /usr/local/bin/xtool-clang
+          
+          # The C++ wrapper is the same file with two literal differences: the binary
+          # and the guard's message. Generated from the file we just proved, by an
+          # exact-match sed, so the two cannot drift apart.
+          # The C++ wrapper is written out in FULL rather than generated from the C
+          # one by sed. A sed that produces a file which parses but execs the wrong
+          # binary is exactly the class of defect that has cost four runs tonight,
+          # so the two files differ only in literals and are each readable at a glance.
+          sudo tee /usr/local/bin/xtool-clang++ >/dev/null <<'XTEOF'
+          #!/bin/bash
+          # Ubuntu clang++, forced to the Darwin arm64 target.
+          # Reached via: xcrun -find clang++  (MakeInc.cmd:187)
+          #              -> /usr/local/bin/xtool-clang++, and via cxx-shim.
+          # Identical to xtool-clang except BIN. See that file for the history.
+          BIN=/usr/bin/clang++
+          [ -x "$BIN" ] || { echo "xtool-clang++: $BIN is missing or not executable" >&2; exit 127; }
+          out=()
+          while [ $# -gt 0 ]; do
+            case "$1" in
+              -arch) shift 2 ;;
+              -mcpu=*) out+=("$1"); shift ;;
+              -mkernel|-msoft-float|-mno-soft-float|-fapple-kext) shift ;;
+              -mmacosx-version-min=*|-miphoneos-version-min=*) shift ;;
+              *) out+=("$1"); shift ;;
+            esac
+          done
+          if [ -n "$XTOOL_DUMP" ] && [ -d "$XTOOL_DUMP" ]; then
+            _seq=$(( $(cat "$XTOOL_DUMP/.seq" 2>/dev/null || echo 0) + 1 ))
+            echo "$_seq" > "$XTOOL_DUMP/.seq"
+            if [ "$_seq" -le 40 ]; then
+              printf 'ARGV[%d]: %s\n' "$_seq" "$*" >> "$XTOOL_DUMP/argv.txt"
+            fi
+          fi
+          exec "$BIN" --target=aarch64-apple-darwin -march=armv8.2-a+crypto+crc "${out[@]}"
+          XTEOF
+          sudo chmod +x /usr/local/bin/xtool-clang++
+          # FIFTH PROPERTY (the check whose absence cost run 40414443571): the
+          # thing the wrapper finally executes must EXIST and be executable.
+          # Testing argv survival alone passed while the exec target did not
+          # exist at all -- two different properties, only one was tested.
+          for _w in /usr/local/bin/xtool-clang /usr/local/bin/xtool-clang++; do
+            _b=$(sed -n "s/^BIN=\(.*\)$/\1/p" "$_w" | head -1)
+            [ -n "$_b" ] || { echo "::error::$_w has no literal BIN= line"; exit 1; }
+            if [ -x "$_b" ]; then echo "  $_w -> $_b EXISTS"
+            else echo "::error::$_w execs $_b which does not exist"; exit 1; fi
+            bash -n "$_w" || { echo "::error::$_w is not valid bash"; exit 1; }
           done
           /usr/local/bin/xtool-clang --version | head -1 || true
           printf 'int main(void){return 0;}\n' > /tmp/xt.c
