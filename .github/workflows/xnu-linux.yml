@@ -2478,7 +2478,18 @@ jobs:
                       echo "  ::warning::no $XNUMACH/mach; cpu.symo will fail to find mach/message.h"
                     fi
                     [ -f Makefile ] || { echo "  running configure"; sh ./configure 2>&1 | tail -25; }
-                    make -j"$(nproc)" migcom 2>&1 | tail -45
+                    # cpu.symo is built by an IMPLICIT builtin rule
+                    # ("gcc -S -ffreestanding -x c"), which expands neither
+                    # $(CC) nor $(CFLAGS) from the environment. Measured in
+                    # run 40410234795: the command line was
+                    #     /usr/bin/gcc -S   -ffreestanding -x c -o cpu.symo cpu.symc
+                    # with the include absent even though CFLAGS carried it.
+                    # So pass the include on the MAKE command line, which
+                    # overrides the builtin rule's recipe variables.
+                    make -j"$(nproc)" migcom \
+                      CC="$HOSTCC" \
+                      CFLAGS="-O1 -w -I$XNUMACH" \
+                      CPPFLAGS="-I$XNUMACH" 2>&1 | tail -45
                     exit "${PIPESTATUS[0]}"
                   )
                   MIGMAKE_RC=$?
