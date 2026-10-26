@@ -5,58 +5,51 @@
 # mig.sh (Apple's driver, unmodified) forwards its switches straight to
 # migcom, and feeds it preprocessed .defs on STDIN.
 #
-# WHY THIS EXISTS -- each item below was measured from a CI run, not assumed.
+# WHY THIS EXISTS -- every item below was measured from a CI run or read out
+# of mig's own source, not assumed.
 #
 # 1. CALLING CONVENTION. migcom reads .defs from STDIN. It takes NO input
-#    path argument. mig.sh:183 pipes cpp output into "$M". Passing a path
-#    makes migcom exit with `bad argument: '<path>'`. Every direct migcom
-#    call in this project was wrong about this for many runs; the deleted
-#    FLAGS probe's "INCONCLUSIVE" rows were this and nothing else.
+#    path argument. mig.sh pipes cpp output into "$M". Passing a path makes
+#    migcom exit with `bad argument: '<path>'`.
 #
 # 2. APPLE-ONLY SWITCHES. mig.sh forwards -novouchers/-mach_msg2/-split/
 #    -maxonstack; GNU migcom rejects them with "fatal: unknown flag". Each
 #    drop is echoed so this is never a silent behaviour change.
 #
-# 3. MACHTYPE SPLIT. Apple's machine/machine_types.defs declares
+# 3. FLOATING POINT TYPES. Apple's machine/machine_types.defs:43-44 says
 #        type float  = MACH_MSG_TYPE_REAL_32;
 #        type double = MACH_MSG_TYPE_REAL_64;
-#    GNU migcom's built-in table (every MACH_MSG_TYPE_* string in the
-#    binary: 23 entries) has MACH_MSG_TYPE_REAL and NO _REAL_32/_REAL_64.
-#    Apple split REAL into 32/64; Hurd never did.
-#
-#    The rewrite targets MACH_MSG_TYPE_INTEGER_32 / _INTEGER_64, NOT
-#    MACH_MSG_TYPE_REAL. From Debian mig's lexxer.l:77-84, TRETURN's second
-#    argument is the byte width:
-#        <Normal>"MACH_MSG_TYPE_REAL"      TRETURN(MACH_MSG_TYPE_REAL,0);
-#        <Normal>"MACH_MSG_TYPE_INTEGER_8" TRETURN(MACH_MSG_TYPE_INTEGER_8,8);
-#    REAL's width is literally 0. A type with itSize 0 yields itTypeSize 0
-#    (type.c:169), which trips type.c:195 `sizeof(%s) == 0`. Mapping to REAL
-#    would therefore make every float/double a ZERO-WIDTH field in generated
-#    RPC stubs -- it would compile and then be wrong. INTEGER_32/_64 carry
-#    4/8 bytes, which is exactly what C float/double occupy.
-#
-#    Honest scope: no routine in this xnu passes float/double today (grep
-#    for `: float;` / `: double;` across all 55 .defs finds nothing), so
-#    this removes a latent trap rather than unblocking anything. It is here
-#    because the earlier mapping to MACH_MSG_TYPE_REAL was actively wrong,
-#    and wrong-but-silent is the worst outcome for a code generator.
+#    GNU mig's lexer (lexxer.l:173) has
+#        "MACH_MSG_TYPE_REAL"   TRETURN(MACH_MSG_TYPE_REAL, 0)
+#    -- size ZERO, like STRING/POLYMORPHIC/UNSTRUCTURED, which are markers
+#    rather than sized types. itShortDecl() (type.c:525) then fires
+#        error("must use full IPC type decl")
+#    because defsize == 0, and migcom dies on
+#        it->itAlignment > 0   (type.c:165, itCalculateSizeInfo)
+#    So MACH_MSG_TYPE_REAL is NOT a substitute for REAL_32. An earlier
+#    revision of this shim made exactly that substitution, and run
+#    40395401198 measured it to be wrong:
+#        machine_types.defs: must use full IPC type decl
+#        migcom-debian: ../type.c:165: itCalculateSizeInfo:
+#                       Assertion `it->itAlignment > 0' failed.
+#    GNU mig has no sized floating-point IPC type at all. The correct
+#    translation is a sized INTEGER type of the same width, which is what a
+#    Mach message carries on the wire (a bag of bits of a given size and
+#    alignment). The C-side type still comes from the header's `import`,
+#    so float/double stay float/double in the generated code.
+#        MACH_MSG_TYPE_REAL_32 -> MACH_MSG_TYPE_INTEGER_32
+#        MACH_MSG_TYPE_REAL_64 -> MACH_MSG_TYPE_INTEGER_64
+#    This is a real semantic mapping and is echoed loudly once.
 #
 # 4. SUBSYSTEM ORDERING. GNU mig resolves `type` declarations against the
-#    subsystem's basic-type table, which only exists once the `subsystem`
-#    statement has been seen. Apple's .defs put #includes FIRST and the
-#    subsystem statement AFTER:
-#        lockd_mach.defs:30  #include <mach/std_types.defs>
-#        lockd_mach.defs:43  subsystem
-#    so GNU mig fails with
-#        std_types.defs, line 69: Basic types not initialized when looking
-#        up type int8_t. Did you forget to define the subsystem?
-#    Run 40394250479 measured exactly that, AFTER fix (3) removed the
-#    earlier error -- so the error text itself names the remedy. The
-#    `subsystem ...;` statement is hoisted to the top. Nothing else is
+#    subsystem's basic-type table, which exists only after the `subsystem`
+#    statement is seen. Apple's .defs put #includes first and the subsystem
+#    statement after (lockd_mach.defs:30 vs :43), giving
+#        "Basic types not initialized when looking up type int8_t.
+#         Did you forget to define the subsystem?"
+#    The `subsystem ...;` statement is hoisted to the top. Nothing else is
 #    reordered, and #line directives are untouched so diagnostics still
 #    name real .defs lines.
-#    (An earlier revision carried this hoist, then dropped it when the
-#    blocking error was a type-table lookup instead. Restored on evidence.)
 # ============================================================================
 set -u
 
@@ -84,13 +77,14 @@ trap 'rm -f "$inp" "$real_out" "$hoisted"' EXIT
 
 cat > "$inp"
 
-# --- (3) MACH_MSG_TYPE_REAL_32/_64 -> MACH_MSG_TYPE_INTEGER_32/_64 ---------
+# --- (3) MACH_MSG_TYPE_REAL_32/_64 -> sized INTEGER equivalents -----------
+# Word-bounded so a hypothetical REAL_320 is never touched.
 n_real=$(grep -cE 'MACH_MSG_TYPE_REAL_(32|64)([^0-9_]|$)' "$inp" || true)
 if [ "${n_real:-0}" -gt 0 ]; then
-  sed -E -e 's/MACH_MSG_TYPE_REAL_32([^0-9_]|$)/MACH_MSG_TYPE_INTEGER_32\1/g' \
-         -e 's/MACH_MSG_TYPE_REAL_64([^0-9_]|$)/MACH_MSG_TYPE_INTEGER_64\1/g' \
-         "$inp" > "$real_out"
-  echo "migcom-shim: rewrote $n_real MACH_MSG_TYPE_REAL_{32,64} -> INTEGER_{32,64} (widths 4/8 bytes)" >&2
+  sed -e 's/MACH_MSG_TYPE_REAL_32\([^0-9_]\|$\)/MACH_MSG_TYPE_INTEGER_32\1/g' \
+      -e 's/MACH_MSG_TYPE_REAL_64\([^0-9_]\|$\)/MACH_MSG_TYPE_INTEGER_64\1/g' \
+      "$inp" > "$real_out"
+  echo "migcom-shim: mapped $n_real MACH_MSG_TYPE_REAL_{32,64} -> INTEGER_{32,64} (GNU mig has no sized REAL)" >&2
 else
   cp "$inp" "$real_out"
 fi
