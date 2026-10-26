@@ -1667,6 +1667,47 @@ jobs:
             exit 1
           fi
           echo "mig bool-parameter rename: applied and verified"
+          # ---- handler.c references symbols that upstream never defines ----
+          # This is not a Linux portability problem; the published
+          # bootstrap_cmds sources cannot compile on ANY platform, which is
+          # why every tag behaves the same. Verified against
+          # bootstrap_cmds-99.260.1, -133.140.1 and today's HEAD:
+          #
+          #   handler.c:168  WriteStaticDecl(file, itRetCodeType,
+          #                    itRetCodeType->itDeallocate,
+          #                    itRetCodeType->itLongForm, "RetCodeType");
+          #
+          # * WriteStaticDecl is not declared or defined in any file of the
+          #   project -- there are exactly 0 definitions for its 3 call sites;
+          # * struct ipc_type (type.h) has no itDeallocate and no itLongForm;
+          # * IsCamelot is not declared in global.h nor defined in global.c.
+          #
+          # Run 40382277711 died on all three:
+          #     handler.c:173:53: error: no member named 'itDeallocate'
+          #     handler.c:173:80: error: no member named 'itLongForm'
+          #     handler.c:190:7:  error: use of undeclared identifier 'IsCamelot'
+          # The Camelot code path is Apple-internal (cam/camelot_types.h does
+          # not exist publicly) and xnu never selects it, so:
+          #   * compile with -DIsCamelot=0 to fold away every Camelot branch;
+          #   * drop the one UNCONDITIONAL WriteStaticDecl call, which is the
+          #     only remaining reference. It writes a static declaration for
+          #     the RetCodeType helper; migcom still works without it, and
+          #     keeping the call is impossible since the fields do not exist.
+          # Both edits are verified below so this cannot silently no-op.
+          cp handler.c handler.c.orig
+          sed -i 's/^  WriteStaticDecl(file, itRetCodeType, .*"RetCodeType");$/  \/* WriteStaticDecl: unavailable in public bootstrap_cmds. *\//' handler.c
+          # The two OTHER call sites (itDummyType, itTidType) sit inside
+          # `if (IsCamelot)` and are discarded by -DIsCamelot=0, so only the
+          # unconditional RetCodeType call must be gone. Checking for any
+          # remaining call would be wrong: it matches those two.
+          if grep -qE '^  WriteStaticDecl\(file, itRetCodeType,' handler.c; then
+            echo "::error::the unconditional WriteStaticDecl call survives in handler.c"
+            exit 1
+          fi
+          echo "=== handler.c: uncond WriteStaticDecl gone, Camelot ones folded by -DIsCamelot=0 ==="
+          grep -n 'WriteStaticDecl' handler.c || echo "(no references left at all)"
+          INC="$INC -DIsCamelot=0"
+          echo "mig handler.c fixups: applied and verified"
           if [ ! -f /usr/local/include/compat.h ]; then
             echo "::error::compat.h missing; Stage 1b must run before Stage 5"
             exit 1
