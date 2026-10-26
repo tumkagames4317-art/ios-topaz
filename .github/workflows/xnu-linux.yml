@@ -96,7 +96,9 @@ env:
 jobs:
   linux-build:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    # Was 120. Every observed Linux run reaches its last step in well under an
+    # hour, so a wedged stage should fail loudly rather than hold a runner.
+    timeout-minutes: 75
     permissions:
       contents: write
     steps:
@@ -111,9 +113,20 @@ jobs:
 
       # ---------------------------------------------------------------- deps
       - name: Install clang-15 and build deps
+        timeout-minutes: 12
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          # Run 40364472111 sat inside this step for 16+ minutes and had to be
+          # cancelled by hand: the Azure apt mirror can stall mid-transfer.
+          # Bound every fetch so a wedged mirror costs minutes, not the run.
+          APT_OPTS="-o Acquire::Retries=3 -o Acquire::http::Timeout=15 \
+                    -o Acquire::https::Timeout=15 \
+                    -o Acquire::http::Pipeline-Depth=0 \
+                    -o Dpkg::Options::=--force-confdef \
+                    -o Dpkg::Options::=--force-confold"
+          sudo DEBIAN_FRONTEND=noninteractive timeout 180 apt-get update $APT_OPTS \
+            || sudo DEBIAN_FRONTEND=noninteractive apt-get update $APT_OPTS
+          sudo DEBIAN_FRONTEND=noninteractive timeout 600 \
+            apt-get install -y --no-install-recommends $APT_OPTS \
             build-essential llvm-15 clang-15 lld-15 \
             libssl-dev libbz2-dev liblzma-dev zlib1g-dev libncurses-dev \
             uuid-dev libcap-dev bison flex libblocksruntime-dev \
@@ -123,6 +136,12 @@ jobs:
           sudo update-alternatives --install /usr/bin/ld.lld   ld.lld   /usr/bin/ld.lld-15   100
           clang --version
           llvm-ar-15 --version | head -1
+          # The runner image ships several of these already; report what is
+          # actually available so a missing package is visible immediately.
+          for t in clang bison flex m4 perl git jq curl make; do
+            printf '%-8s %s\n' "$t" "$(command -v $t || echo MISSING)"
+          done
+          perl -MList::Util=pairs -e 'print "perl List::Util ok\n"'
 
       # -------------------------------------------------- stage 1: cctools
       # Supplies lipo, nm, strip, otool, ar, ranlib AND ld64 (Mach-O, which
