@@ -316,6 +316,14 @@ jobs:
           #endif
           EOF
           cat > hostshim/bsdcompat.c <<'EOF'
+          /* _GNU_SOURCE must precede every include: glibc only declares
+           * program_invocation_short_name in <errno.h> when it is set, and
+           * defining it after the first include is too late. compat.h defines
+           * it for the tools that include compat.h; this translation unit
+           * includes system headers directly, so it needs its own copy. */
+          #ifndef _GNU_SOURCE
+          #define _GNU_SOURCE 1
+          #endif
           #include <sys/types.h>
           #include <sys/stat.h>
           #include <stdlib.h>
