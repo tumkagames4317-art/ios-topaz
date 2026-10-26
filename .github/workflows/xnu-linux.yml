@@ -2484,28 +2484,40 @@ jobs:
               "$(grep -cE '^[[:space:]]*routine[[:space:]]|^[[:space:]]*simpleroutine[[:space:]]' "$gdefs" 2>/dev/null || echo 0)"
             echo "  --- preprocessor guards in $(basename "$gdefs") (first 12) ---"
             grep -nE '^[[:space:]]*#if' "$gdefs" 2>/dev/null | head -12 || echo "    (none)"
-            if MIGCC="$RUNNER_TEMP/cross/bin/migcc-shim" \
+            MIGCC="$RUNNER_TEMP/cross/bin/migcc-shim" \
                MIGCOM="$RUNNER_TEMP/cross/bin/migcom" \
                "$RUNNER_TEMP/cross/bin/mig" \
                  -D__MACH30__ -DMACH_KERNEL_PRIVATE -DKERNEL_USER=1 $KSW $GINCS "$@" \
                  -user "$wd/$gbase.c" -header "$wd/$gbase.h" \
                  -server /dev/null -sheader /dev/null \
-                 "$gdefs" 2>"$wd/mig.err"; then
-              echo "  MIG EXIT: 0"
-            else
-              echo "  MIG EXIT: nonzero -- $(grep -iE 'fatal|not defined|syntax|error' "$wd/mig.err" | head -5 | tr '\n' ' ')"
+                 "$gdefs" 2>"$wd/mig.err"
+            # CAPTURE THE NUMERIC EXIT CODE. The previous `if mig ...; then`
+            # form discarded it: run 40396010350 reported "MIG EXIT: nonzero"
+            # with an EMPTY message, because migcom produced no text matching
+            # the error filter -- and we could not say whether it exited 1, 2,
+            # or died from a signal. A status we cannot see is the same defect
+            # as a message we truncate: it manufactures a row that reads like
+            # data without being a verdict.
+            mig_rc=$?
+            echo "  MIG EXIT: $mig_rc"
+            # Print the lines that MATTER, not the first N. Run 40394250479
+            # lost a whole cycle because head -3 returned three "overriding
+            # previous definition" WARNINGS while the fatal error sat four
+            # lines further down. Filter, then cap; never truncate blind.
+            if [ "$mig_rc" -ne 0 ]; then
+              echo "  --- mig.err: fatal/not-defined lines ---"
+              grep -iE 'fatal|not defined|syntax|error|cannot|undefined|unknown' \
+                "$wd/mig.err" 2>/dev/null | head -12 || true
+              echo "  --- mig.err total lines: $(wc -l < "$wd/mig.err" 2>/dev/null || echo 0) ---"
             fi
             if [ ! -s "$wd/$gbase.h" ]; then
-              echo "  $gbase.h: NOT PRODUCED"
-              # Print the lines that MATTER, not the first N. Run 40394250479 lost a whole
-            # run because head -3 returned three "overriding previous definition"
-            # warnings while the fatal error sat four lines further down. Any
-            # diagnostic that truncates from the top can hide the answer behind
-            # harmless noise; filter, then cap.
-            echo "  --- mig.err: fatal/not-defined lines ---"
-            grep -iE 'fatal|not defined|syntax|error' "$wd/mig.err" 2>/dev/null | head -12 || true
-            echo "  --- mig.err: full (last 15 lines) ---"
-            tail -15 "$wd/mig.err" 2>/dev/null || true
+              echo "  $gbase.h: NOT PRODUCED (empty or absent)"
+              echo "  --- mig.err: last 15 lines ---"
+              tail -15 "$wd/mig.err" 2>/dev/null || true
+              # Which files DID appear: migcom may write some outputs and
+              # not others, and which ones tells us where it stopped.
+              echo "  --- files mig produced in $wd ---"
+              ls -la "$wd" 2>/dev/null | head -20 || true
               # Was migcom fed garbage, or did it reject real input? Reproduce
               # the preprocess step mig.sh would have run and show what migcom
               # actually received. This settles "no SubSystem declaration"
