@@ -3292,6 +3292,56 @@ jobs:
           # decide it from the bytes rather than from reasoning about guards.
 
           echo "Stage 6 verdict: installhdrs=$hdrs_rc install=$build_rc"
+
+          # --- REPLAY: feed a captured stream straight back to the real migcom
+          # The captures and migcom's own errors still disagree. Every stream we
+          # can inspect contains exactly ONE `type int64 = int64_t;`, and the
+          # census of that same stream prints "(no same-file:line duplicate)",
+          # yet migcom reports `std_types.defs line 84: overriding previous
+          # definition of int64` -- and error.c:69 prints lineno-1, so that is
+          # :85, the one and only int64 line.
+          #
+          # One of those two observations must be wrong. The only way to tell is
+          # to run the same bytes through the same migcom and look at what it
+          # does, instead of at the shim's opinion of them. Replay reproduces
+          # the error  -> the fault is in the bytes and the capture is faithful.
+          # Replay succeeds      -> migcom saw different bytes than we captured,
+          #                         and the capture is what needs fixing.
+          replay_dir="$GITHUB_WORKSPACE/migcom-streams"
+          replay_one=$(ls "$replay_dir"/*.stream 2>/dev/null | head -1 || true)
+          if [ -n "$replay_one" ]; then
+            echo "--- REPLAY of $(basename "$replay_one") ---"
+            # Drop the "# argv:" line; everything after it is byte-for-byte what
+            # migcom received on stdin.
+            tail -n +2 "$replay_one" > "$RUNNER_TEMP/replay.defs"
+            echo "replay input lines: $(wc -l < "$RUNNER_TEMP/replay.defs")"
+            n64=$(grep -cE '^type[[:space:]]+int64[[:space:]]*=' "$RUNNER_TEMP/replay.defs" || true)
+            nch=$(grep -cE '^type[[:space:]]+char[[:space:]]*=' "$RUNNER_TEMP/replay.defs" || true)
+            echo "type int64 decls in replay input: ${n64:-0}"
+            echo "type char  decls in replay input: ${nch:-0}"
+            # Bypass the shim entirely: hand the bytes to the REAL migcom, so
+            # nothing of ours can transform them a second time.
+            set +e
+            "$MIGCOM" -server /dev/null -user /dev/null \
+                      -header "$RUNNER_TEMP/rp.h" -sheader "$RUNNER_TEMP/rpS.h" \
+                      < "$RUNNER_TEMP/replay.defs" 2> "$RUNNER_TEMP/replay.err"
+            replay_rc=$?
+            set -e
+            echo "REPLAY raw migcom exit: $replay_rc"
+            echo "REPLAY stderr:"
+            sed -n '1,20p' "$RUNNER_TEMP/replay.err"
+            echo "REPLAY produced: $(ls -1 "$RUNNER_TEMP"/rp*.h 2>/dev/null | wc -l) header(s)"
+            if [ "$replay_rc" -eq 0 ]; then
+              echo "REPLAY VERDICT: migcom ACCEPTS the captured bytes."
+              echo "  The duplicates did not come from this stream."
+            else
+              echo "REPLAY VERDICT: migcom REJECTS the captured bytes."
+              echo "  The capture is faithful; the fault is in the stream."
+            fi
+          else
+            echo "REPLAY: no captured streams present, skipped"
+          fi
+
           if [ "$build_rc" != 0 ] || [ "$hdrs_rc" != 0 ]; then
             echo "::error::Stage 6 failed (installhdrs=$hdrs_rc install=$build_rc)"
             exit 1
