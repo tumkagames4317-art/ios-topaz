@@ -1726,6 +1726,17 @@ jobs:
           XROOT="$GITHUB_WORKSPACE/dxb/xnu"
           OBJROOT="$GITHUB_WORKSPACE/dxb/build/xnu.obj"
           CCT="$GITHUB_WORKSPACE/cctools-port/cctools"
+          # SINGLE SOURCE OF TRUTH for the SETUP tool set, defined BEFORE any
+          # loop reads it. There used to be three hardcoded copies of
+          # (nearly) this list in this step and none of them contained
+          # `decomment`, so Stage 6 failed with
+          #     clang: error: no such file or directory: 'decomment'
+          # which reads like a missing binary but actually meant we never
+          # asked for it to be built. Three copies of one list is the
+          # defect; fixing one copy would have left two live.
+          # xnu ships SEVEN SETUP dirs; json_compilation_db is excluded
+          # because it is a developer convenience, not a build input.
+          SETUP_DIRS="config decomment kextsymboltool setsegname installfile replacecontents"
           mkdir -p "$OBJROOT/SETUP/kextsymboltool" "$OBJROOT/SETUP/setsegname" \
                    "$OBJROOT/SETUP/installfile"
 
@@ -1795,7 +1806,7 @@ jobs:
           # 40378282825 and 40379258308, where the kextsymboltool link still
           # used only -L/usr/local/lib -lbsdcompat. Append $(LDFLAGS_EXTRA)
           # instead, which the make command line does set.
-          for d in kextsymboltool setsegname installfile replacecontents config; do
+          for d in $SETUP_DIRS; do
             mf="$GITHUB_WORKSPACE/dxb/xnu/SETUP/$d/Makefile"
             [ -f "$mf" ] || continue
             if grep -q 'LDFLAGS_EXTRA' "$mf"; then
@@ -1875,7 +1886,20 @@ jobs:
           fi
 
           setup_failed=""
-          for d in config kextsymboltool setsegname installfile replacecontents; do
+          # Single source of truth for the SETUP denominator. It was
+          # hardcoded as five in two loops and in several comments, while
+          # xnu actually ships SEVEN SETUP dirs:
+          #     config decomment installfile json_compilation_db
+          #     kextsymboltool replacecontents setsegname
+          # decomment was named in five comments but absent from the build
+          # list, so "4 of 5 SETUP tools built" was reported for many runs
+          # while decomment had never been attempted at all -- and it is
+          # the FIRST thing Stage 6 fails on:
+          #     clang: error: no such file or directory: 'decomment'
+          #     MakeInc.top:389: build_setup_bootstrap_... Error 2
+          # Never report "N of M" again without printing the list behind M.
+          echo "SETUP tools attempted ($(echo $SETUP_DIRS | wc -w)): $SETUP_DIRS"
+          for d in $SETUP_DIRS; do
             echo "== SETUP/$d"
             # Create the output dir HERE, per subdir. The earlier version
             # mkdir'd only three of the five once, so `config` and
@@ -1896,6 +1920,14 @@ jobs:
             # (run 40381388491). Generate the two files in place, in the
             # source dir, because main.c includes "parser.h" directly.
             if [ "$d" = config ]; then
+              # The Makefile's flex rule is
+              #     env M4=$(HOST_GM4) $(HOST_FLEX) --header-file=... -o $@ $<
+              # We call flex directly with --header-file, which bypasses that
+              # rule and so does not depend on HOST_GM4 being set in this
+              # subshell. Print where m4 lives anyway, so that if flex
+              # misbehaves we can rule m4 out instead of guessing at it.
+              echo "  m4: $(command -v m4 || echo 'NOT FOUND')  gm4: $(command -v gm4 || echo 'absent')"
+              echo "  bison: $(command -v bison || echo 'NOT FOUND')  flex: $(command -v flex || echo 'NOT FOUND')"
               ( cd "$XROOT/SETUP/config" \
                 && bison -y -d -d -o parser.c parser.y \
                 && flex --header-file=lexer.yy.h -o lexer.yy.c lexer.l ) \
@@ -1910,8 +1942,19 @@ jobs:
             #     externs.c:26:10: error: 'config.h' file not found with
             #         <angled> include; use "quotes" instead
             # so put the subdir itself on the include path.
+            #
+            # SETUP/config/Makefile also carries a subdir-specific flag:
+            #     CFLAGS += -DYY_NO_INPUT
+            # which omits the flex input()/yyunput() fallback path that
+            # references a `yyinput` prototype bison's skeleton does not
+            # provide. Without it lexer.yy.c fails to link. It is scoped to
+            # config so the other tools keep their original flags.
+            d_cflags="$CFLAGS"
+            if [ "$d" = config ]; then
+              d_cflags="$CFLAGS -DYY_NO_INPUT"
+            fi
             ( cd "$XROOT/SETUP/$d" && for f in *.c; do
-                clang $CFLAGS -I"$XROOT/SETUP/$d" -c \
+                clang $d_cflags -I"$XROOT/SETUP/$d" -c \
                   -o "$OBJROOT/SETUP/$d/${f%.c}.o" "$f" || exit 1
               done ) || { ok=0; echo "COMPILE FAILED: SETUP/$d"; setup_failed="$setup_failed $d(compile)"; }
             if [ "$ok" = 1 ] && ls "$OBJROOT/SETUP/$d"/*.o >/dev/null 2>&1; then
@@ -1980,7 +2023,7 @@ jobs:
             fi
           done
           echo '--- output dirs (a missing dir here explains a stub compile) ---'
-          for d in config kextsymboltool setsegname installfile replacecontents; do
+          for d in $SETUP_DIRS; do
             if [ -d "$OBJROOT/SETUP/$d" ]; then
               echo "  $d: $(ls -1 "$OBJROOT/SETUP/$d" | tr '\n' ' ')"
             else
@@ -1989,6 +2032,21 @@ jobs:
           done
           echo '--- which tools got built ---'
           find "$OBJROOT/SETUP" -maxdepth 2 -type f -executable -exec ls -la {} \; || true
+          # Report N of M with M printed and its source stated, so the
+          # denominator can never silently be wrong again. Each tool counts
+          # as built only if an executable of that name exists in its dir.
+          built=0; total=0; built_list=""; missing_list=""
+          for d in $SETUP_DIRS; do
+            total=$((total + 1))
+            if [ -x "$OBJROOT/SETUP/$d/$d" ]; then
+              built=$((built + 1)); built_list="$built_list $d"
+            else
+              missing_list="$missing_list $d"
+            fi
+          done
+          echo "SETUP built: $built of $total (list: $SETUP_DIRS)"
+          echo "  built:${built_list:- <none>}"
+          echo "  missing:${missing_list:- <none>}"
           echo "Stage 5b verdict:${setup_failed:- all SETUP tools built}"
           if [ -n "$setup_failed" ]; then
             echo "::error::Stage 5b could not build:$setup_failed"
