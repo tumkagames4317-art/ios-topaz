@@ -243,7 +243,8 @@ jobs:
           exit 0
           EOF
           chmod +x hostshim/ctfmerge
-          sudo cp hostshim/ctfmerge /usr/local/bin/ctfmerge
+          cp hostshim/ctfmerge /usr/local/bin/ctfmerge 2>/dev/null || \
+            sudo cp hostshim/ctfmerge /usr/local/bin/ctfmerge
           cc --version | head -1
 
           # BSD helpers the SETUP/ sources use but glibc does not provide.
@@ -378,8 +379,15 @@ jobs:
           EOF
           cc -c -O2 -o hostshim/bsdcompat.o hostshim/bsdcompat.c
           ar rcs hostshim/libbsdcompat.a hostshim/bsdcompat.o
-          sudo cp hostshim/compat.h /usr/local/include/compat.h
-          sudo cp hostshim/libbsdcompat.a /usr/local/lib/libbsdcompat.a
+          # /usr/local/{include,lib} are writable on the GitHub ubuntu image,
+          # so an unconditional `sudo cp` fails there and the file never
+          # lands ("fatal error: '/usr/local/include/compat.h' file not
+          # found" in run 40362101652). Try without sudo first.
+          install_shim() {
+            cp "$1" "$2" 2>/dev/null || sudo cp "$1" "$2"
+          }
+          install_shim hostshim/compat.h        /usr/local/include/compat.h
+          install_shim hostshim/libbsdcompat.a  /usr/local/lib/libbsdcompat.a
           echo "compat: $(ls -la /usr/local/include/compat.h /usr/local/lib/libbsdcompat.a)"
 
       # ------------------------------------------ stage 1c: emulate Apple paths
@@ -397,30 +405,35 @@ jobs:
           ls -l /dev/null
           sudo tee /usr/bin/xcrun >/dev/null <<'EOF'
           #!/bin/bash
-          # Minimal xcrun for building xnu on Linux. Only the queries that
-          # makedefs/MakeInc.cmd makes are supported.
-          args=("$@")
-          # drop a leading -sdk <name> / -sdk=<name>
-          out=()
-          i=0
-          while [ $i -lt ${#args[@]} ]; do
-            a="${args[$i]}"
-            if [ "$a" = "-sdk" ]; then i=$((i+2)); continue; fi
-            case "$a" in -sdk=*) i=$((i+1)); continue;; esac
-            out+=("$a"); i=$((i+1))
+          # Minimal xcrun for building xnu on Linux.
+          #
+          # MakeInc.cmd also calls xcrun as a *wrapper*, i.e.
+          #   $(shell $(XCRUN) -sdk $(SDKROOT) -find clang)
+          # with XCRUN="/usr/bin/xcrun -verbose", so any leftover flags are
+          # followed by the tool to run. Those are stripped, not exec'd --
+          # `exec -s ...` fails with "exec: -s: invalid option".
+          sdk=""
+          rest=()
+          while [ $# -gt 0 ]; do
+            case "$1" in
+              -sdk)   sdk="$2"; shift 2 ;;
+              -sdk=*) sdk="${1#-sdk=}"; shift ;;
+              -verbose) shift ;;
+              *) rest+=("$1"); shift ;;
+            esac
           done
-          set -- "${out[@]}"
-          case "$1" in
-            -show-sdk-path)      echo / ;;
-            -show-sdk-version)   echo 13.3 ;;
+          case "${rest[0]:-}" in
+            -show-sdk-path)          echo / ;;
+            -show-sdk-version)       echo 13.3 ;;
             -show-sdk-platform-path) echo / ;;
+            -show-sdk-build-version) echo 22E252 ;;
             -find)
-              case "$2" in
+              case "${rest[1]:-}" in
                 meson) echo /usr/bin/false ;;
-                *) command -v "$2" || echo /usr/bin/false ;;
+                *) command -v "${rest[1]:-}" || echo /usr/bin/false ;;
               esac ;;
-            -verbose) shift; exec "$@" ;;
-            *) exec "$@" ;;
+            "") echo "xcrun: no command" >&2; exit 1 ;;
+            *) exec "${rest[@]}" ;;
           esac
           EOF
           sudo chmod +x /usr/bin/xcrun
