@@ -69,6 +69,11 @@ env:
   MACOS_VERSION: "13.5"
   KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
   MACHINE_CONFIG: ${{ inputs.machine_config || 'SWEET' }}
+  # Empty tree shaped like an Xcode SDK/platform, so the paths makedefs
+  # derives from `xcrun` have the structure its sed/notdir expect.
+  FAKE_PLATFORMS: /opt/xcodeshim/Platforms
+  # Apple's release manifest maps macOS 13.5 -> the exact open-source tags.
+  RELEASE_URL: https://raw.githubusercontent.com/apple-oss-distributions/distribution-macOS/macos-135/release.json
   # Make the host compat shim global instead of patching xnu's Makefiles.
   #
   # CPATH appends an include path to every compile the GNU-make-driven build
@@ -406,7 +411,7 @@ jobs:
           ls -l /dev/null
           # An empty tree that mimics the shape of an Xcode SDK so the paths
           # makedefs derives from `xcrun` look the way its sed/notdir expects.
-          FAKE_PLATFORMS=/opt/xcodeshim/Platforms
+          # FAKE_PLATFORMS comes from the job env; stage 1d installs into it.
           sudo mkdir -p "$FAKE_PLATFORMS/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
           sudo chmod -R 0777 /opt/xcodeshim
           sudo tee /usr/bin/xcrun >/dev/null <<'EOF'
@@ -493,6 +498,32 @@ jobs:
           echo "PLATFORMPATH=$PLATFORMPATH"
           echo "PLATFORM=$PLATFORM"
           test "$PLATFORM" = MacOSX
+
+      # --------------------------------------- stage 1d: AvailabilityVersions
+      # bsd/sys/make_symbol_aliasing.sh runs
+      #   ${SDKROOT}/${DRIVERKITROOT}/usr/local/libexec/availability.pl
+      # and xnu cannot generate _symbol_aliasing.h without it:
+      #   Unable to locate .../availability.pl (or not executable)
+      # The tool is open source, so build it instead of taking dxb's
+      # "sed the SDKROOT out of make_symbol_aliasing.sh" shortcut.
+      - name: "Stage 1d: install availability.pl from AvailabilityVersions"
+        id: availability
+        continue-on-error: true
+        run: |
+          set -x
+          SDK="$FAKE_PLATFORMS/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
+          AV_TAG=$(curl -s "$RELEASE_URL" | jq -r '.projects[] | select(.project=="AvailabilityVersions") | .tag')
+          echo "AvailabilityVersions tag: $AV_TAG"
+          git clone -q --depth 1 --branch "$AV_TAG" \
+            https://github.com/apple-oss-distributions/AvailabilityVersions.git AvailabilityVersions
+          cd AvailabilityVersions
+          make install DSTROOT="$SDK" DRIVERKITROOT=
+          ls -la "$SDK/usr/local/libexec/availability.pl"
+          head -1 "$SDK/usr/local/libexec/availability.pl"
+          # `make` copies without the exec bit; the consumer tests -x.
+          chmod +x "$SDK/usr/local/libexec/availability.pl"
+          perl "$SDK/usr/local/libexec/availability.pl" --help >/dev/null 2>&1 || true
+          echo "sdkrooth=$(dirname "$(dirname "$(dirname "$(dirname "$SDK")")")")"
 
       # ------------------------------------------------- stage 2: dxb tree
       - name: "Stage 2: fetch darwin-xnu-build and select the ginkgo series"
@@ -686,10 +717,35 @@ jobs:
 
           # cctools-port carries the Mach-O host headers (<mach-o/swap.h>,
           # <mach/mach_init.h>) that Apple's SDK would otherwise provide.
-          MACHD_INC=$(dirname "$(dirname "$(find "$CCT" -name swap.h -path '*mach-o*' | head -1)")")
+          MACHD_INC=$(dirname "$(dirname "$(dirname "$(find "$CCT" -name swap.h -path '*mach-o*' | head -1)")")")
           echo "mach-o headers: $MACHD_INC"
           test -d "$MACHD_INC/mach-o" || echo "WARNING: $MACHD_INC/mach-o missing"
           test -d "$MACHD_INC/mach"   || echo "WARNING: $MACHD_INC/mach missing"
+          # cctools ships mach-o/ and architecture/ but not Apple's mach/.
+          # kextsymboltool only wants mach_task_self() to key a buffer on the
+          # current task, which never leaves the process on Linux, so a trivial
+          # identity plus the two typedefs satisfy it.
+          if [ ! -d "$MACHD_INC/mach" ]; then
+            mkdir -p "$MACHD_INC/mach"
+            cat > "$MACHD_INC/mach/mach_types.h" <<'MACHEOF'
+          #ifndef _HOST_MACH_MACH_TYPES_H
+          #define _HOST_MACH_MACH_TYPES_H
+          #include <stdint.h>
+          typedef uint32_t mach_port_t;
+          typedef int kern_return_t;
+          #define KERN_SUCCESS 0
+          #define MACH_PORT_NULL ((mach_port_t)0)
+          #endif
+          MACHEOF
+            cat > "$MACHD_INC/mach/mach_init.h" <<'MACHEOF'
+          #ifndef _HOST_MACH_MACH_INIT_H
+          #define _HOST_MACH_MACH_INIT_H
+          #include <mach/mach_types.h>
+          #define mach_task_self() ((mach_port_t)1)
+          #endif
+          MACHEOF
+            echo "created minimal mach/ headers under $MACHD_INC"
+          fi
           CFLAGS="-isysroot / -g -O0 -I/usr/local/include -I$MACHD_INC -I$XROOT/EXTERNAL_HEADERS"
           CFLAGS="$CFLAGS -include /usr/local/include/compat.h"
           for d in kextsymboltool setsegname installfile replacecontents; do
