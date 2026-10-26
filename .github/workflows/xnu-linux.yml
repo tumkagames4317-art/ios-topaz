@@ -3140,8 +3140,16 @@ jobs:
           #      mig reports six re-declarations; this counts them at source.
           echo "DUMP: -D_MACHNINE in env: $(env | grep -c MACHNINE)"
           echo "DUMP: MACHNINE in MIGFLAGS: $(echo "${MIGFLAGS:-<unset>}")"
-          export MIGCOM_SHIM_DUMP="$RUNNER_TEMP/migcom-streams"
+          # Two edits were fighting over this variable: one set it to
+          # $GITHUB_WORKSPACE at the top of the step so the upload step would
+          # collect it, and this line reset it to $RUNNER_TEMP. $RUNNER_TEMP is
+          # exactly why run 40406236502's Stage 6 captures were written but never
+          # uploaded -- the artifact only ever contained the Stage 5 probes,
+          # whose streams are clean, which is why the failures looked
+          # unexplained. One value only, and it must be under the workspace.
+          export MIGCOM_SHIM_DUMP="$GITHUB_WORKSPACE/migcom-streams"
           rm -rf "$MIGCOM_SHIM_DUMP"; mkdir -p "$MIGCOM_SHIM_DUMP"
+          echo "DUMP: writing captures to $MIGCOM_SHIM_DUMP"
 
           make_flags=(
             SDKROOT=macosx HOST_SDKROOT=macosx
