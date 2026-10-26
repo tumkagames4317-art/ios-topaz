@@ -686,8 +686,10 @@ jobs:
 
           # cctools-port carries the Mach-O host headers (<mach-o/swap.h>,
           # <mach/mach_init.h>) that Apple's SDK would otherwise provide.
-          MACHD_INC=$(dirname "$(find "$CCT" -name swap.h -path '*mach-o*' | head -1)")
+          MACHD_INC=$(dirname "$(dirname "$(find "$CCT" -name swap.h -path '*mach-o*' | head -1)")")
           echo "mach-o headers: $MACHD_INC"
+          test -d "$MACHD_INC/mach-o" || echo "WARNING: $MACHD_INC/mach-o missing"
+          test -d "$MACHD_INC/mach"   || echo "WARNING: $MACHD_INC/mach missing"
           CFLAGS="-isysroot / -g -O0 -I/usr/local/include -I$MACHD_INC -I$XROOT/EXTERNAL_HEADERS"
           CFLAGS="$CFLAGS -include /usr/local/include/compat.h"
           for d in kextsymboltool setsegname installfile replacecontents; do
@@ -733,8 +735,8 @@ jobs:
             DSTROOT="$FAKEROOT" FAKEROOT_DIR="$FAKEROOT"
             OBJROOT="$OBJROOT" SYMROOT="$GITHUB_WORKSPACE/dxb/build/xnu.sym"
             CC=clang CXX=clang++
-            HOST_CC="clang -include /usr/local/include/compat.h"
-            HOST_CXX="clang++ -include /usr/local/include/compat.h"
+            HOST_CC="clang -include /usr/local/include/compat.h -I$GITHUB_WORKSPACE/cctools-port/cctools/include"
+            HOST_CXX="clang++ -include /usr/local/include/compat.h -I$GITHUB_WORKSPACE/cctools-port/cctools/include"
             HOST_LDFLAGS="-L/usr/local/lib -lbsdcompat"
             LDFLAGS="-L/usr/local/lib -lbsdcompat"
             HOST_BISON=bison HOST_FLEX=flex HOST_GM4=m4
