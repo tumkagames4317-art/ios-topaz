@@ -76,6 +76,24 @@
 #define _XNU_CONST_STRING_COMPAT_H_
 
 /*
+ * GUARD ON __ASSEMBLER__ TOO. A force-included header arrives in EVERY
+ * translation unit, including the kernel's .s files, which clang runs in
+ * assembler-with-cpp mode. A typedef is not valid there, and the diagnostic
+ * is not a C one:
+ *
+ *     xnu-const-string-compat.h:95:15: error: unexpected token in argument list
+ *        typedef const char *const_UNDLabel;
+ *
+ * "token in argument list" is the ASSEMBLER complaining, not the C parser.
+ * 317 occurrences across 16 bsd/kern and osfmk/arm TUs in run 40418831581.
+ * A C typedef header that is force-included must expand to nothing for the
+ * assembler. Verified locally with clang 18: __ASSEMBLER__ is defined in
+ * assembler-with-cpp mode and this guard makes the same .s preprocess clean,
+ * while C and C++ still resolve all thirteen typedefs.
+ */
+#if !defined(__ASSEMBLER__)
+
+/*
  * NO #include HERE. This file is force-included before every kernel header,
  * so at this point the kernel's type machinery does not exist yet. An
  * `#include <stdint.h>` pulls in EXTERNAL_HEADERS/stdint.h, whose
@@ -109,5 +127,7 @@ typedef const char *const_vfs_path_t;
  * uint8_t and there is no NUL terminator.
  */
 typedef const unsigned char *const_gssd_byte_buffer;
+
+#endif /* !__ASSEMBLER__ */
 
 #endif /* _XNU_CONST_STRING_COMPAT_H_ */
