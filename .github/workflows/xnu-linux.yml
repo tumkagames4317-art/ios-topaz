@@ -2307,8 +2307,55 @@ jobs:
               if [ -x "$RUNNER_TEMP/cross/bin/migcom" ]; then
                 mv "$RUNNER_TEMP/cross/bin/migcom" "$RUNNER_TEMP/cross/bin/migcom-apple-src" || true
               fi
-              cp "$RUNNER_TEMP/cross/bin/migcom-debian" "$RUNNER_TEMP/cross/bin/migcom"
-              echo "  INSTALL: prebuilt migcom in place at cross/bin/migcom"
+              # cross/bin/migcom becomes a FILTER, not the raw binary.
+              #
+              # mig.sh forwards Apple-only switches straight to migcom
+              # (mig.sh:118-124 put them in migflags). GNU migcom rejects them
+              # outright -- run 40391072037 measured:
+              #     -maxonstack 1024: mig: fatal: unknown flag: '-maxonstack'
+              #     -mach_msg2:       mig: fatal: unknown flag: '-mach_msg2'
+              # and -novouchers is in the same class: it is Apple's, and it is
+              # what MakeInc.def:895 puts in MIGFLAGS unconditionally, so the
+              # real kernel build always passes it:
+              #     MIGFLAGS = $(DEFINES) $(INCFLAGS) -novouchers ...
+              # Debian's own migcom accepts only
+              #     -header -user -server -sheader -iheader -list -prefix
+              #     -subrprefix
+              # (Debian mig(1) manpage).
+              #
+              # Dropping these changes NOTHING the kernel build consumes:
+              #   -novouchers   voucher fields in generated RPC stubs; xnu's
+              #                 mach headers here carry no voucher support that
+              #                 mig would act on for this config, and the flag
+              #                 only suppresses emission GNU mig never does.
+              #   -mach_msg2    Mach msg2 packing; xnu 8796 SWEET does not use
+              #                 msg2 for these subsystems.
+              #   -maxonstack   server-side stack hints, in server code this
+              #                 profile does not compile (-server /dev/null).
+              # Each drop is ECHOED once, so this is never silent.
+              {
+                echo '#!/bin/bash'
+                echo '# migcom shim: drop Apple-only switches GNU migcom rejects.'
+                echo '# Real binary: '"$RUNNER_TEMP"'/cross/bin/migcom-debian'
+                echo 'real="'"$RUNNER_TEMP"'/cross/bin/migcom-debian"'
+                echo 'args=(); dropped=""'
+                echo 'while [ $# -gt 0 ]; do'
+                echo '  case "$1" in'
+                echo '    -novouchers|-mach_msg2|-split)'
+                echo '      dropped="$dropped $1"; shift ;;'
+                echo '    -maxonstack|-max_descrs|-max_reply_descrs)'
+                echo '      dropped="$dropped $1 $2"; shift 2 ;;'
+                echo '    *) args+=("$1"); shift ;;'
+                echo '  esac'
+                echo 'done'
+                echo 'if [ -n "$dropped" ]; then'
+                echo '  echo "migcom-shim: dropped:$dropped" >&2'
+                echo 'fi'
+                echo 'exec "$real" "${args[@]}"'
+              } > "$RUNNER_TEMP/cross/bin/migcom"
+              chmod +x "$RUNNER_TEMP/cross/bin/migcom"
+              echo "  INSTALL: prebuilt migcom in place at cross/bin/migcom (with Apple-flag shim)"
+              echo "  INSTALL: raw binary at cross/bin/migcom-debian"
             else
               echo "::error::INSTALL: prebuilt migcom missing after extraction"
               find "$MIGPKG" -maxdepth 4 | head -30
@@ -2421,6 +2468,21 @@ jobs:
             # It also selects the SERVERPAIRS/IsaKernelServer branches that
             # decide which generated files migcom produces.
             KSW="-DKERNEL=1 -DKERNEL_PRIVATE=1 -DKERNEL_SERVER=1 -D__APPLE_API_UNSTABLE=1 -DPRIVATE=1 -DARCH_arm64=1 -DARM64=1"
+            # INCLUDE PATHS. A .defs is #include-ed by a driver of its own:
+            #     lockd_mach.defs:30  #include <mach/std_types.defs>
+            #     lockd_mach.defs:31  #include <mach/mach_types.defs>
+            # The real kernel build passes these through INCFLAGS, which
+            # MakeInc.def:895 folds into MIGFLAGS. The probe passed none, so
+            # run 40391072037 reported
+            #     lockd_mach.defs:30:10: fatal error: mach/std_types.defs:
+            #     No such file or directory
+            # and then, because mig.sh ran the preprocessor separately to dump
+            # its output, a misleading "PREPROCESSED: exit 0, 0 lines". The
+            # include failure is the real cause; the 0 lines was a second,
+            # silent run through our shim without the paths.
+            # `-I` goes to mig, never to migcom: it is a CPP flag, and mig.sh
+            # routes unrecognised -* into cppflags (mig.sh:129).
+            GINCS="-I$XNUTREE/osfmk -I$XNUTREE/bsd -I$XNUTREE/osfmk/mach -I$XNUTREE/iokit"
             printf '  declared `routine` directives in %s: %s\n' \
               "$(basename "$gdefs")" \
               "$(grep -cE '^[[:space:]]*routine[[:space:]]|^[[:space:]]*simpleroutine[[:space:]]' "$gdefs" 2>/dev/null || echo 0)"
@@ -2429,7 +2491,7 @@ jobs:
             if MIGCC="$RUNNER_TEMP/cross/bin/migcc-shim" \
                MIGCOM="$RUNNER_TEMP/cross/bin/migcom" \
                "$RUNNER_TEMP/cross/bin/mig" \
-                 -D__MACH30__ -DMACH_KERNEL_PRIVATE -DKERNEL_USER=1 $KSW "$@" \
+                 -D__MACH30__ -DMACH_KERNEL_PRIVATE -DKERNEL_USER=1 $KSW $GINCS "$@" \
                  -user "$wd/$gbase.c" -header "$wd/$gbase.h" \
                  -server /dev/null -sheader /dev/null \
                  "$gdefs" 2>"$wd/mig.err"; then
