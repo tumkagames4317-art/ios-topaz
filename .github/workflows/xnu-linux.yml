@@ -2412,7 +2412,15 @@ jobs:
             # macros, cpp removes them before migcom ever sees them. These
             # are added so the routines are visible; the declared-vs-emitted
             # count below is what tells us whether that worked.
-            KSW="-DKERNEL=1 -DKERNEL_PRIVATE=1 -D__APPLE_API_UNSTABLE=1 -DPRIVATE=1 -DARCH_arm64=1 -DARM64=1"
+            # THE GATE, FOUND BY COUNTING. Run 40391072037: task.defs
+            # declares 59 `routine` directives; task.h emitted 0. The guard
+            # listing printed alongside showed every one of them behind
+            #     #if KERNEL_SERVER  /  #ifdef KERNEL_SERVER  /  #if !KERNEL
+            # KERNEL_SERVER was never defined. Not KERNEL_PRIVATE, not
+            # __APPLE_API_UNSTABLE, not the arch macros -- KERNEL_SERVER.
+            # It also selects the SERVERPAIRS/IsaKernelServer branches that
+            # decide which generated files migcom produces.
+            KSW="-DKERNEL=1 -DKERNEL_PRIVATE=1 -DKERNEL_SERVER=1 -D__APPLE_API_UNSTABLE=1 -DPRIVATE=1 -DARCH_arm64=1 -DARM64=1"
             printf '  declared `routine` directives in %s: %s\n' \
               "$(basename "$gdefs")" \
               "$(grep -cE '^[[:space:]]*routine[[:space:]]|^[[:space:]]*simpleroutine[[:space:]]' "$gdefs" 2>/dev/null || echo 0)"
