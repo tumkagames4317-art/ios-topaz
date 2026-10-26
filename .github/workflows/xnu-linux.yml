@@ -2321,32 +2321,46 @@ jobs:
           # FLAGS: which Apple-mig options does Hurd migcom accept?
           # Verdict per flag, no blind stripping.
           # ===============================================================
-          echo "=== FLAGS: Apple-mig option compatibility ==="
-          ACCT="$RUNNER_TEMP/acct"; rm -rf "$ACCT"; mkdir -p "$ACCT"
-          LOCKD_DEFS="$GITHUB_WORKSPACE/dxb/xnu/osfmk/lockd/lockd_mach.defs"
-          probe_flag() {
-            pname="$1"; shift
-            # Syntax taken from the Debian mig source package's own test
-            # suite (tests/generate-only/subsystem-user.defs):
-            #     subsystem KernelUser user 100;
-            # i.e. single-line, `subsystem <Name> <id>;`. The previous probe
-            # used `subsystem` then `KernelUser` on separate lines, which is
-            # not valid -- that produced "bad argument" for every row and made
-            # three of them meaningless. Read the grammar, do not iterate.
-            printf 'subsystem KernelUser probe 100;\n' > "$ACCT/p.defs"
-            out="$ACCT/probe.h"; errlog="$ACCT/probe.err"; rm -f "$out" "$errlog"
-            if "$RUNNER_TEMP/cross/bin/migcom" -header "$out" "$@" "$ACCT/p.defs" \
-                 >/dev/null 2>"$errlog"; then
-              echo "  $pname: ACCEPTED (exit 0)"
+          # TREE CENSUS
+          #
+          # Before diagnosing include resolution, prove the include SOURCE
+          # exists. Tonight every wrong answer came from asserting a path
+          # from a name instead of listing it: lockd.defs, task.defs, the
+          # .defs/.h oracle, x86_64-linux-gnu-ar, ld64, mig -- six of them.
+          # A one-line census settles it.
+          # ===============================================================
+          XNUTREE="$GITHUB_WORKSPACE/dxb/xnu"
+          echo "=== TREE CENSUS ==="
+          echo "  .defs files in tree : $(find "$XNUTREE" -name '*.defs' 2>/dev/null | wc -l) (Apple tag xnu-8796.121.2 has 82)"
+          echo "  osfmk/mach/*.defs   : $(ls "$XNUTREE"/osfmk/mach/*.defs 2>/dev/null | wc -l) files"
+          echo "  --- first 20 in osfmk/mach ---"
+          ls "$XNUTREE"/osfmk/mach/*.defs 2>/dev/null | sed "s|.*/||" | head -20
+          for want in std_types.defs mach_types.defs port.defs; do
+            if [ -f "$XNUTREE/osfmk/mach/$want" ]; then
+              echo "  PRESENT: osfmk/mach/$want"
             else
-              prc=$?
-              echo "  $pname: REJECTED (exit $prc) -- $(head -1 "$errlog")"
+              echo "  ABSENT : osfmk/mach/$want  <-- include source missing"
             fi
-          }
-          probe_flag "baseline (no flag)"
-          probe_flag "-maxonstack 1024" -maxonstack 1024
-          probe_flag "-novouchers" -novouchers
-          probe_flag "-mach_msg2" -mach_msg2
+          done
+
+          # ===============================================================
+          # FLAGS -- recorded fact, not a live probe.
+          #
+          # Run 40388982459 measured, with the Debian prebuilt migcom:
+          #     -maxonstack 1024 : REJECTED, exit 1,
+          #                        "mig: fatal: unknown flag: '-maxonstack'"
+          # That verdict is unambiguous because the failure text names the
+          # FLAG. The other three rows (-novouchers, -mach_msg2, baseline)
+          # all failed with "bad argument: <path>", which is the probe's
+          # own .defs input being rejected -- not a verdict about the flag.
+          # They were INCONCLUSIVE even after the grammar was corrected
+          # from the Debian source tests (subsystem KernelUser user 100;),
+          # so the probe is DELETED rather than repaired: a probe that
+          # cannot produce a verdict manufactures rows that read as data.
+          # Consequence, already applied: -maxonstack is not passed.
+          # ===============================================================
+          echo "=== FLAGS (recorded, not probed) ==="
+          echo "  -maxonstack 1024: REJECTED (exit 1, unknown flag) -- not passed"
 
           # ===============================================================
           # LOCKD + TASK: generate real headers and COMPILE them.
@@ -2376,10 +2390,24 @@ jobs:
             # never to migcom. Verified: the Debian binary's option set is
             # -header -iheader -user -server -sheader -list -prefix
             # -subrprefix, with no -I.
+            # KERNEL SWITCHES. Run 40389783165 produced a valid 11-line
+            # task.h with the /* Module task */ banner and ZERO routines,
+            # while Apple's task.defs is 15410 bytes of routine bodies. The
+            # most likely gate is the preprocessor: if the routines sit
+            # behind #ifdef KERNEL_PRIVATE / __APPLE_API_UNSTABLE / arch
+            # macros, cpp removes them before migcom ever sees them. These
+            # are added so the routines are visible; the declared-vs-emitted
+            # count below is what tells us whether that worked.
+            KSW="-DKERNEL=1 -DKERNEL_PRIVATE=1 -D__APPLE_API_UNSTABLE=1 -DPRIVATE=1"
+            printf '  declared `routine` directives in %s: %s\n' \
+              "$(basename "$gdefs")" \
+              "$(grep -cE '^[[:space:]]*routine[[:space:]]|^[[:space:]]*simpleroutine[[:space:]]' "$gdefs" 2>/dev/null || echo 0)"
+            echo "  --- preprocessor guards in $(basename "$gdefs") (first 12) ---"
+            grep -nE '^[[:space:]]*#if' "$gdefs" 2>/dev/null | head -12 || echo "    (none)"
             if MIGCC="$RUNNER_TEMP/cross/bin/migcc-shim" \
                MIGCOM="$RUNNER_TEMP/cross/bin/migcom" \
                "$RUNNER_TEMP/cross/bin/mig" \
-                 -D__MACH30__ -DMACH_KERNEL_PRIVATE -DKERNEL_USER=1 "$@" \
+                 -D__MACH30__ -DMACH_KERNEL_PRIVATE -DKERNEL_USER=1 $KSW "$@" \
                  -user "$wd/$gbase.c" -header "$wd/$gbase.h" \
                  -server /dev/null -sheader /dev/null \
                  "$gdefs" 2>"$wd/mig.err"; then
@@ -2397,6 +2425,12 @@ jobs:
               # instead of theorising about a file we cannot read locally.
               MIGCC="$RUNNER_TEMP/cross/bin/migcc-shim"
               pp="$wd/preprocessed.c"
+              # The exact command line mig runs, captured from set -x in the
+              # log above; echo it here so the include path question is
+              # answered by the real invocation rather than by assumption.
+              echo "  CPP CMDLINE (reconstructed, mig.sh:183 passes -arch which the shim strips):"
+              echo "    migcc-shim -E -arch <arm64> -D__MACH30__ -DMACH_KERNEL_PRIVATE -DKERNEL_USER=1 $KSW -I <defsdir> <args> <defs>"
+              echo "  mig.sh adds -I \"\${sourcedir}\" itself at line 180/183; extra -I args travel via cppflags."
               if "$MIGCC" -E -D__MACH30__ -DMACH_KERNEL_PRIVATE -DKERNEL_USER=1 \
                    -I "$(dirname "$gdefs")" -I "$GITHUB_WORKSPACE/dxb/xnu/osfmk" \
                    -I "$GITHUB_WORKSPACE/dxb/xnu/EXTERNAL_HEADERS" -I "$MIGPKG" \
@@ -2416,6 +2450,16 @@ jobs:
             fi
             echo "  $gbase.h: $(wc -l < "$wd/$gbase.h") lines"
             echo "  OutBuf[0] occurrences: $(grep -c 'OutBuf\[0\]' "$wd/$gbase.h" || true)"
+            # DECLARED vs EMITTED: the honest measure, needing no oracle.
+            # A header that compiles but carries no thunks proves only that
+            # migcom accepts the file; it says nothing about translation.
+            EMIT=$(grep -cE '^kern_return_t[[:space:]]+[a-zA-Z_]+[[:space:]]*\(' "$wd/$gbase.h" 2>/dev/null || echo 0)
+            echo "  routines emitted ($gbase.h defines): $EMIT"
+            if [ "$EMIT" -gt 0 ]; then
+              echo "  TRANSLATION: routines present -- mig translated routine bodies"
+            else
+              echo "  TRANSLATION: no routines emitted -- compiles, but proves nothing about routine translation"
+            fi
             echo "  --- first 26 lines ---"
             head -26 "$wd/$gbase.h"
             if clang -fsyntax-only -x c -std=gnu99 -D__MACH30__ -DKERNEL -DPRIVATE \
