@@ -206,21 +206,37 @@ echo "migcom-shim: hoisted subsystem statement to top of input" >&2
 # integer_t/natural_t are covered because machine_types.defs:80-81 declares
 # them; mach_msg_type_number_t appears in NO .defs in the tree.
 #
-# The correct declaration is spelled exactly as machine_types.defs declares
-# natural_t, so it lands in the same size/alignment family:
-#     type mach_msg_type_number_t = natural_t;
-# It is injected immediately after the hoisted `subsystem ...;` statement so
-# it precedes every use and sits inside a valid basic-type context.
+# The declaration must name a type that is ALREADY DEFINED at the point of
+# injection. Two candidates existed and the difference matters:
+#
+#   = natural_t   machine_types.defs:81. WRONG HERE. natural_t is itself
+#                 declared inside machine_types.defs, which std_types.defs
+#                 #includes; the injection point is right after the hoisted
+#                 `subsystem ...;`, which is BEFORE those #includes are
+#                 reached. It would forward-reference its own base type and
+#                 fail exactly as mach_msg_type_number_t just did. Caught by
+#                 simulating the deliverable locally and printing line
+#                 numbers: injection at line 4, natural_t defined at line 11.
+#
+#   = uint32_t    std_types.defs:75. CORRECT. std_types.defs is the first
+#                 .defs every subsystem pulls in, and every one of the eight
+#                 affected routines is in a file that includes it before any
+#                 routine. uint32_t is the same width as natural_t
+#                 (machine_types.defs:81 spells it `type natural_t =
+#                 uint32_t;`) and matches message.h:857
+#                 `typedef natural_t mach_msg_type_number_t;`.
+#
+# So the injected line is `type mach_msg_type_number_t = uint32_t;`.
 if ! grep -qE '^[[:blank:]]*type[[:blank:]]+mach_msg_type_number_t' "$hoisted"; then
   # Insert right after the semicolon that terminates `subsystem ...;`.
   # grab is set when the subsystem line is seen, and the insert happens on
   # the FIRST subsequent line containing ';' -- which is that terminator.
   awk '
     !grab && /^[ \t]*subsystem([ \t]|$)/ { grab = 1; print; next }
-    grab && !done && /;/ { print; print "type mach_msg_type_number_t = natural_t;"; done = 1; next }
+    grab && !done && /;/ { print; print "type mach_msg_type_number_t = uint32_t;"; done = 1; next }
     { print }
   ' "$hoisted" > "$final" && cp "$final" "$hoisted"
-  echo "migcom-shim: injected type mach_msg_type_number_t = natural_t (Apple built-in, absent from all .defs)" >&2
+  echo "migcom-shim: injected type mach_msg_type_number_t = uint32_t (Apple built-in, absent from all .defs)" >&2
 fi
 
 exec "$real" "${args[@]}" < "$hoisted"
