@@ -1,3 +1,102 @@
+## 01:05 MSK 2026-10-27 -- Stage 6: mig subsystem parses; six builtin collisions reduced to one fatal diagnostic
+
+Written while run `40408775964` was in flight, so its result is NOT in here.
+
+### Where the build actually is
+Stage 6 (`make installhdrs` + `make install`) runs Apple's `mig.sh` driver,
+which pipes cpp output into migcom. Over tonight that pipeline went from
+"nothing parses" to "the subsystem parses and every Apple-only token class is
+rewritten". Measured on run `40408119356` (`c8970ff`):
+    syntax errors: 0
+    Stage 6 verdict: installhdrs=2 install=2
+So the build still fails, on ONE remaining diagnostic class.
+
+### The one remaining error, stated honestly
+Every real mig invocation emits, once:
+    "std_types.defs", line 84: overriding previous definition of int64
+and `lineno-1` (error.c:57/69) means real file line 85:
+    std_types.defs:85   type int64 = int64_t;
+
+The stream migcom receives was downloaded from the run artifact and parsed in
+full. It is CLEAN:
+    234 type declarations, 234 DISTINCT names, 0 duplicates
+    `type int64 = int64_t;`            line 43, exactly once
+    `type int64_t = MACH_MSG_TYPE_INTEGER_64;`  line 34, exactly once
+    CR count 0                              (not a CRLF artefact)
+    std_types.defs opened exactly once      (include guard works)
+    streql is plain strcmp                  (mig_string.h:43)
+Both source-level explanations are REFUTED:
+  * init_type() inserts exactly char, short, int, uintptr_t, intptr_t
+    (type.c:977-985). int64 is not among them, and the literal "int64"
+    appears ZERO times in GNU mig's source tree.
+  * the alias chain cannot leak a name: itCheckDecl sets it->itName = name
+    unconditionally at type.c:401, before parser.y:338 tests for a duplicate.
+So the collision is inside migcom and invisible from outside. NO MECHANISM IS
+CLAIMED. Four mechanisms were proposed and refuted tonight (double include,
+two-pass parse, guard typo, alias chain); all four came from reasoning between
+source sites rather than reading one.
+
+### What was fixed, and the two that must not be "fixed"
+Dropped re-declarations of GNU mig's built-in integer types
+(short/int/uintptr_t/intptr_t). Against GNU's own table these are redundant by
+construction and the IPC names match exactly:
+    short -> int16_t -> INTEGER_16 == builtin INTEGER_16
+    int -> int32_t -> INTEGER_32 == builtin INTEGER_32
+    uintptr_t -> uint64_t -> INTEGER_64 == builtin INTEGER_64
+    intptr_t -> int64_t -> INTEGER_64 == builtin INTEGER_64
+`char` is deliberately KEPT: the .defs says MACH_MSG_TYPE_CHAR while the
+builtin is INTEGER_8, and lexxer.l has both (170 and 172) as distinct tokens.
+Dropping it would have produced a header that compiles and is wrong.
+Also dropped, safely: Apple-only argv switches and the `, const` parameter
+qualifier ("const" does not occur in lexxer.l at all; IPCFlags is exactly
+islong/isnotlong/dealloc/notdealloc/servercopy/countinout/retcode).
+
+### What run 40408775964 is testing
+It rebuilds migcom from the Debian source tarball with exactly one site
+changed, parser.y:338-339 in the TypeDecl action:
+    error("overriding previous definition of %s", name)
+  ->warn("TOLERATED duplicate type declaration: %s (patched: error -> warn)")
+Every other error() stays fatal. parser.c is pre-generated and shipped, so the
+block regenerates it with bison, textually patches it as a fallback, and
+ASSERTS the patch landed before using the result. `set +e` wraps it; on any
+failure the stock Debian binary stays in place.
+Two-sided controls in the same output: a fresh control stream must parse and
+exit 0 (proves the binary still works), and a stream with a REAL duplicate
+must still emit the new diagnostic (proves the check was not silenced).
+The census also now prints, per stream, which files cpp entered and how many
+times, plus the std_types.defs open count and the natural_t declaration count
+(must be exactly 1 -- a control that survives even a broken binary).
+
+### Next concrete action
+Read `40408775964`. In order of what matters:
+  1. Did the patched migcom get built and used? Look for
+     "USING PATCHED migcom" and both control lines.
+  2. Do `lockd_mach.h`, `task.h`, `mach_exc_server.h` now exist?
+     If yes: STOP chasing int64, go to the compile. The collision is then a
+     logged, tolerated warning and we evaluate it by whether the kernel builds.
+  3. Does `std_types.defs opens` print 1? If it prints >1 the include guard is
+     the answer and everything above is downstream of it.
+If the patched binary did not build, the fallback is the stock Debian binary
+and the `int64` diagnostic remains fatal -- then the next cheapest move is to
+have the shim drop `type int64 = int64_t;` and re-add `type int64 = int64_t;`
+verbatim AFTER the last std_types.defs block, so the name is inserted exactly
+once no matter what migcom already holds.
+
+### Commit and run trail (topaz, newest first)
+  ccf182b  rebuild migcom with TypeDecl error->warn + marker census  (run 40408775964)
+  3645527  census reads $MIGCOM_SHIM_DUMP, not $RUNNER_TEMP
+  c8970ff  census after build_rc; print first 40 stream lines verbatim (run 40408119356)
+  8138fe5  (lead) MIGCOM_SHIM_DUMP -> $GITHUB_WORKSPACE so artifacts carry it
+  fd7c52d  drop `, const`; census post-injection stream only      (run 40407187428)
+  8e71288  drop builtin integer re-declarations                   (run 40406236502)
+  16b2202  stream census + MIGCOM_SHIM_DUMP
+
+### Honest milestone state
+ld64: DONE and proven. SETUP: 6/6. Debian migcom runs inside the real build.
+Stage 6: subsystem parses, every Apple token class rewritten, five of six
+builtin collisions cleared. KERNEL ARTIFACT: ABSENT. No `<subsystem>.h` has
+been generated yet, so nothing downstream has been proved.
+
 ## 17:20 MSK 2026-10-26 -- BREAKTHROUGH: XNU boots to BSD init; deviceTreeP was a PA in the QEMU harness
 
 The kernel now runs far past `arm_vm_init`, initialises BSD, and parks in
