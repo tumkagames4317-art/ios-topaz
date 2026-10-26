@@ -1888,7 +1888,23 @@ jobs:
           # the full output in the artifact-uploaded log instead.
           if git clone -q --depth 1 https://github.com/PureDarwin/iig-tools.git "$IIGSRC"; then
             echo "=== iig-tools configure ==="
-            cmake -S "$IIGSRC" -B "$IIGSRC/build" -DCMAKE_BUILD_TYPE=Release 2>&1 | tail -20
+            # PIN THE HOST TOOLCHAIN. Stage 1 installs ld64 (a Mach-O linker)
+            # into $RUNNER_TEMP/cross/bin and puts that directory on
+            # GITHUB_PATH, so it shadows the HOST linker for everything
+            # downstream. Run 40387620538 showed the consequence:
+            #     ld: warning: directory not found for option
+            #         '-F/System/Library/Frameworks/'
+            #     ld: unknown option: -plugin
+            # -F and -plugin are ld64-only; no GNU ld or lld emits either.
+            # That is the same class of bug as the x86_64-linux-gnu-ar
+            # shadowing fixed earlier. Pinning the compilers stops CMake
+            # probing PATH at all; CMAKE_LINKER removes the error at its root.
+            cmake -S "$IIGSRC" -B "$IIGSRC/build" -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_C_COMPILER=/usr/bin/cc \
+              -DCMAKE_CXX_COMPILER=/usr/bin/c++ \
+              -DCMAKE_LINKER=/usr/bin/ld \
+              -DCMAKE_AR=/usr/bin/ar \
+              -DCMAKE_RANLIB=/usr/bin/ranlib 2>&1 | tail -20
             cfg_rc=${PIPESTATUS[0]}
             echo "configure rc=$cfg_rc"
             echo "=== iig-tools build ==="
@@ -1896,22 +1912,45 @@ jobs:
             bld_rc=${PIPESTATUS[0]}
             echo "build rc=$bld_rc"
             if [ "$cfg_rc" -ne 0 ] || [ "$bld_rc" -ne 0 ] || [ ! -x "$IIGSRC/build/iig" ]; then
+              # Do NOT exit. iig and mig solve different halves of the build
+              # (iig: DriverKit/*.iig -> IO*.h; mig: mach/*.defs -> *_mach.h),
+              # so a broken iig must not prevent the mig sections from running.
+              # The mig experiment spent four runs unexecuted because an
+              # earlier stage exited first; that will not happen again.
               echo "::error::iig-tools failed to build (configure=$cfg_rc build=$bld_rc binary=$([ -x "$IIGSRC/build/iig" ] && echo yes || echo no))"
-              exit 1
+              echo "::warning::continuing WITHOUT iig so the mig sections can report"
+              IIG_OK=0
+            else
+              IIG_OK=1
             fi
-            cp "$IIGSRC/build/iig" "$RUNNER_TEMP/cross/bin/iig"
-            chmod +x "$RUNNER_TEMP/cross/bin/iig"
-            echo "iig: built from PureDarwin/iig-tools"
+            if [ "${IIG_OK:-0}" = 1 ]; then
+              cp "$IIGSRC/build/iig" "$RUNNER_TEMP/cross/bin/iig"
+              chmod +x "$RUNNER_TEMP/cross/bin/iig"
+              echo "iig: built from PureDarwin/iig-tools"
+            fi
           else
             echo "::error::could not clone PureDarwin/iig-tools (iig is Apple-closed-source)"
-            exit 1
+            echo "::warning::continuing WITHOUT iig so the mig sections can report"
+            IIG_OK=0
           fi
+          # Host toolchain identity, so the next time a HOST build links we can
+          # see whether cross/bin shadowed it without reading the whole log.
+          # This is the exact signature that produced
+          #     ld: unknown option: -plugin
+          for t in cc c++ ld ar ranlib nm; do
+            printf '  host %-7s %s\n' "$t" "$(for d in /usr/bin /bin; do [ -x "$d/$t" ] && echo "$d/$t" && break; done)"
+          done
+          echo "  PATH head: $(echo "$PATH" | cut -d: -f1-3)"
+          echo "  iig available: $([ "${IIG_OK:-0}" = 1 ] && echo yes || echo 'NO (skipped, not fatal)')"
+
           # Prove it on the real thing before the kernel build depends on it:
           # generate one DriverKit header exactly as iokit/DriverKit/Makefile
           # does, and require a non-empty result.
           iigprobe="$RUNNER_TEMP/iigprobe"
           rm -rf "$iigprobe"; mkdir -p "$iigprobe"
-          if "$RUNNER_TEMP/cross/bin/iig" \
+          if [ "${IIG_OK:-0}" != 1 ]; then
+            echo "iig probe: SKIPPED (iig unavailable -- not fatal this run)"
+          elif "$RUNNER_TEMP/cross/bin/iig" \
                --def "$GITHUB_WORKSPACE/dxb/xnu/iokit/DriverKit/IOService.iig" \
                --header "$iigprobe/IOService.h" \
                --impl "$iigprobe/IOService.iig.cpp" \
@@ -1920,11 +1959,11 @@ jobs:
               echo "iig: probe OK ($(wc -l < "$iigprobe/IOService.h") header lines, $(wc -l < "$iigprobe/IOService.iig.cpp") impl lines)"
             else
               echo "::error::iig produced empty output for IOService.iig"
-              exit 1
+              echo "::warning::continuing WITHOUT iig so the mig sections can report"
             fi
           else
             echo "::error::iig failed on iokit/DriverKit/IOService.iig"
-            exit 1
+            echo "::warning::continuing WITHOUT iig so the mig sections can report"
           fi
 
           # ---------------------------------------------------------------
