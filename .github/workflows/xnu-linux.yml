@@ -1552,73 +1552,6 @@ jobs:
           fi
           CFLAGS="-isysroot / -g -O0 -isystem $CCTOOLS_FOREIGN_INCLUDE -I/usr/local/include -I$MACHD_INC -I$XROOT/EXTERNAL_HEADERS"
           CFLAGS="$CFLAGS -include /usr/local/include/compat.h"
-          setup_failed=""
-          for d in config kextsymboltool setsegname installfile replacecontents; do
-            echo "== SETUP/$d"
-            # Create the output dir HERE, per subdir. The earlier version
-            # mkdir'd only three of the five once, so `config` and
-            # `replacecontents` failed with
-            #     error: unable to open output file
-            #     '.../xnu.obj/SETUP/config/externs.o': 'No such file or directory'
-            # for every translation unit. A missing mkdir looked like a
-            # mysterious compile failure.
-            mkdir -p "$OBJROOT/SETUP/$d"
-            ok=1
-            # Each SETUP subdir is compiled from inside its own directory and
-            # may include a header that lives beside it. SETUP/config does
-            #     externs.c:26:10: error: 'config.h' file not found with
-            #         <angled> include; use "quotes" instead
-            # so put the subdir itself on the include path.
-            ( cd "$XROOT/SETUP/$d" && for f in *.c; do
-                clang $CFLAGS -I"$XROOT/SETUP/$d" -c \
-                  -o "$OBJROOT/SETUP/$d/${f%.c}.o" "$f" || exit 1
-              done ) || { ok=0; echo "COMPILE FAILED: SETUP/$d"; setup_failed="$setup_failed $d(compile)"; }
-            if [ "$ok" = 1 ] && ls "$OBJROOT/SETUP/$d"/*.o >/dev/null 2>&1; then
-              # Print the exact command and the archive's symbol table so the
-              # link order and the archive contents are observed, not assumed.
-              echo "LINK CMD: clang -o $OBJROOT/SETUP/$d/$d $OBJROOT/SETUP/$d/*.o -L/usr/local/lib -lbsdcompat"
-              echo "ARCHIVE SYMBOLS (/usr/local/lib/libbsdcompat.a):"
-              nm -g --defined-only /usr/local/lib/libbsdcompat.a 2>&1 | head -20 || true
-              clang -o "$OBJROOT/SETUP/$d/$d" "$OBJROOT/SETUP/$d"/*.o \
-                -L/usr/local/lib -lbsdcompat || { echo "LINK FAILED: SETUP/$d"; setup_failed="$setup_failed $d(link)"; }
-              ls -la "$OBJROOT/SETUP/$d/" | head -20
-            fi
-          done
-          echo '--- output dirs (a missing dir here explains a stub compile) ---'
-          for d in config kextsymboltool setsegname installfile replacecontents; do
-            if [ -d "$OBJROOT/SETUP/$d" ]; then
-              echo "  $d: $(ls -1 "$OBJROOT/SETUP/$d" | tr '\n' ' ')"
-            else
-              echo "  $d: DIR MISSING"
-            fi
-          done
-          echo '--- which tools got built ---'
-          find "$OBJROOT/SETUP" -maxdepth 2 -type f -executable -exec ls -la {} \; || true
-          echo "Stage 5b verdict:${setup_failed:- all SETUP tools built}"
-          if [ -n "$setup_failed" ]; then
-            echo "::error::Stage 5b could not build:$setup_failed"
-            exit 1
-          fi
-
-      # ------------------------------------------- stage 6: the real thing
-      - name: "Stage 6: make installhdrs + install (this is the build)"
-        id: build
-        if: inputs.deep != 'false'
-        continue-on-error: true
-        run: |
-          set -x
-          export PATH="$RUNNER_TEMP/cross/bin:/usr/local/bin:$PATH"
-          XROOT="$GITHUB_WORKSPACE/dxb/xnu"
-          FAKEROOT="$GITHUB_WORKSPACE/dxb/fakeroot"
-          OBJROOT="$GITHUB_WORKSPACE/dxb/build/xnu.obj"
-          mkdir -p "$FAKEROOT" "$OBJROOT"
-          cd "$XROOT"
-
-          # HOST_* must be passed explicitly: MakeInc.cmd resolves them with
-          # `xcrun -find` and an empty value turns `$(HOST_BISON) -y -d ...`
-          # into a bare `y -d ...` (that is what run 40359414251 hit).
-          # HOST_OS_VERSION was also empty, producing -mmacosx-version-min=
-          # with no value.
           # kextsymboltool needs symbols that only cctools provides:
           #   NXGetLocalArchInfo            libmacho/arch.c
           #   swap_mach_header_64,          libstuff/bytesex.c
@@ -1662,6 +1595,99 @@ jobs:
               echo "::error::cctools archive does not define $sym"
             fi
           done
+
+          setup_failed=""
+          for d in config kextsymboltool setsegname installfile replacecontents; do
+            echo "== SETUP/$d"
+            # Create the output dir HERE, per subdir. The earlier version
+            # mkdir'd only three of the five once, so `config` and
+            # `replacecontents` failed with
+            #     error: unable to open output file
+            #     '.../xnu.obj/SETUP/config/externs.o': 'No such file or directory'
+            # for every translation unit. A missing mkdir looked like a
+            # mysterious compile failure.
+            mkdir -p "$OBJROOT/SETUP/$d"
+            ok=1
+            # Each SETUP subdir is compiled from inside its own directory and
+            # may include a header that lives beside it. SETUP/config does
+            #     externs.c:26:10: error: 'config.h' file not found with
+            #         <angled> include; use "quotes" instead
+            # so put the subdir itself on the include path.
+            ( cd "$XROOT/SETUP/$d" && for f in *.c; do
+                clang $CFLAGS -I"$XROOT/SETUP/$d" -c \
+                  -o "$OBJROOT/SETUP/$d/${f%.c}.o" "$f" || exit 1
+              done ) || { ok=0; echo "COMPILE FAILED: SETUP/$d"; setup_failed="$setup_failed $d(compile)"; }
+            if [ "$ok" = 1 ] && ls "$OBJROOT/SETUP/$d"/*.o >/dev/null 2>&1; then
+              # kextsymboltool needs NXGetLocalArchInfo (libmacho/arch.c),
+              # the swap_* family (libstuff/bytesex.c) and uuid_generate.
+              # Those two archives are noinst_LTLIBRARIES, so `make install`
+              # never installs them; they are staged in Stage 5b from the
+              # cctools build tree. Without them the link fails with
+              #     undefined reference to `NXGetLocalArchInfo'
+              #     undefined reference to `swap_mach_header_64'
+              #     undefined reference to `uuid_generate'   (40378282825)
+              # The archives must come AFTER the objects that need them.
+              SETUP_LIBS="-L/usr/local/lib -lbsdcompat"
+              # Resolve these here rather than reusing CT_ARCHIVES/CT_LIBS:
+              # those are computed further down in this same script, so at
+              # this point they are still unset. Derive from the staged
+              # copies directly so this block is order-independent.
+              ct_lib="$RUNNER_TEMP/cross/lib"
+              ct_flags=""
+              for lib in macho stuff; do
+                if [ -f "$ct_lib/lib$lib.a" ]; then
+                  ct_flags="$ct_flags -l$lib"
+                else
+                  echo "::warning::missing $ct_lib/lib$lib.a"
+                fi
+              done
+              if [ -n "$ct_flags" ]; then
+                SETUP_LIBS="$SETUP_LIBS -L$ct_lib $ct_flags -luuid"
+              else
+                echo "::warning::no cctools archives; kextsymboltool will not link"
+              fi
+              # Print the exact command so link order is observed, not assumed.
+              echo "LINK CMD: clang -o $OBJROOT/SETUP/$d/$d $OBJROOT/SETUP/$d/*.o $SETUP_LIBS"
+              clang -o "$OBJROOT/SETUP/$d/$d" "$OBJROOT/SETUP/$d"/*.o \
+                $SETUP_LIBS || { echo "LINK FAILED: SETUP/$d"; setup_failed="$setup_failed $d(link)"; }
+              ls -la "$OBJROOT/SETUP/$d/" | head -20
+            fi
+          done
+          echo '--- output dirs (a missing dir here explains a stub compile) ---'
+          for d in config kextsymboltool setsegname installfile replacecontents; do
+            if [ -d "$OBJROOT/SETUP/$d" ]; then
+              echo "  $d: $(ls -1 "$OBJROOT/SETUP/$d" | tr '\n' ' ')"
+            else
+              echo "  $d: DIR MISSING"
+            fi
+          done
+          echo '--- which tools got built ---'
+          find "$OBJROOT/SETUP" -maxdepth 2 -type f -executable -exec ls -la {} \; || true
+          echo "Stage 5b verdict:${setup_failed:- all SETUP tools built}"
+          if [ -n "$setup_failed" ]; then
+            echo "::error::Stage 5b could not build:$setup_failed"
+            exit 1
+          fi
+
+      # ------------------------------------------- stage 6: the real thing
+      - name: "Stage 6: make installhdrs + install (this is the build)"
+        id: build
+        if: inputs.deep != 'false'
+        continue-on-error: true
+        run: |
+          set -x
+          export PATH="$RUNNER_TEMP/cross/bin:/usr/local/bin:$PATH"
+          XROOT="$GITHUB_WORKSPACE/dxb/xnu"
+          FAKEROOT="$GITHUB_WORKSPACE/dxb/fakeroot"
+          OBJROOT="$GITHUB_WORKSPACE/dxb/build/xnu.obj"
+          mkdir -p "$FAKEROOT" "$OBJROOT"
+          cd "$XROOT"
+
+          # HOST_* must be passed explicitly: MakeInc.cmd resolves them with
+          # `xcrun -find` and an empty value turns `$(HOST_BISON) -y -d ...`
+          # into a bare `y -d ...` (that is what run 40359414251 hit).
+          # HOST_OS_VERSION was also empty, producing -mmacosx-version-min=
+          # with no value.
 
           make_flags=(
             SDKROOT=macosx HOST_SDKROOT=macosx
