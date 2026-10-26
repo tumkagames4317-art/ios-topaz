@@ -3118,6 +3118,19 @@ jobs:
           MIGCC="$RUNNER_TEMP/cross/bin/migcc-shim"
           export MIG MIGCOM MIGCC
 
+          # Capture the exact bytes fed to migcom, and settle two questions the
+          # log has not answered in four runs:
+          #   1) is the removed MACHNINE define still in this environment?
+          #      Committed in 11bacbb, removed in c1f8999 -- but if anything
+          #      exported or baked it earlier in the job, machine_types.defs
+          #      becomes a no-op on FIRST entry and natural_t vanishes.
+          #   2) does cpp emit the basic types once or twice?
+          #      mig reports six re-declarations; this counts them at source.
+          echo "DUMP: -D_MACHNINE in env: $(env | grep -c MACHNINE)"
+          echo "DUMP: MACHNINE in MIGFLAGS: $(echo "${MIGFLAGS:-<unset>}")"
+          export MIGCOM_SHIM_DUMP="$RUNNER_TEMP/migcom-streams"
+          rm -rf "$MIGCOM_SHIM_DUMP"; mkdir -p "$MIGCOM_SHIM_DUMP"
+
           make_flags=(
             SDKROOT=macosx HOST_SDKROOT=macosx
             HOST_OS_VERSION=13.3
@@ -3224,6 +3237,26 @@ jobs:
           find "$OBJROOT/SETUP" -maxdepth 2 -type f -executable | sort || true
           echo '--- first real error, in order ---'
           grep -nE 'fatal error:|error:' "$GITHUB_WORKSPACE/build.log" | head -10 || echo "(no error: lines)"
+          # --- what did cpp actually emit? ---------------------------------
+          # mig reports six type RE-declarations (error.c:69 prints lineno-1,
+          # so its :84/:90/:38/:39/:61/:62 are really :85/:91/:39/:40/:62/:63,
+          # all genuine `type` lines). Either cpp emitted them twice, or migcom
+          # duplicated them internally. These counts decide which, and they
+          # decide it from the bytes rather than from reasoning about guards.
+          echo '===================== MIGCOM STREAM CENSUS ====================='
+          for f in "$RUNNER_TEMP"/migcom-streams/*.stream; do
+            [ -f "$f" ] || continue
+            echo "-- $(basename "$f") ($(wc -l < "$f") lines)"
+            echo "   MACHNINE guard occurrences: $(grep -c 'MACHNINE_TYPES_DEFS' "$f" || true)   (2 = ifndef+define, expect 2)"
+            echo "   type short  declarations:   $(grep -cE '^[[:blank:]]*type[[:blank:]]+short[[:blank:]]*=' "$f" || true)   (2 => cpp emitted twice)"
+            echo "   type int    declarations:   $(grep -cE '^[[:blank:]]*type[[:blank:]]+int[[:blank:]]*=' "$f" || true)"
+            echo "   type natural_t declarations:$(grep -cE '^[[:blank:]]*type[[:blank:]]+natural_t[[:blank:]]*=' "$f" || true)   (0 => guard fired on FIRST entry)"
+            echo "   type int64  declarations:   $(grep -cE '^[[:blank:]]*type[[:blank:]]+int64[[:blank:]]*=' "$f" || true)"
+            echo "   file-opening #line markers (first 12):"
+            grep -nE '^[[:blank:]]*# *[0-9]+ "' "$f" | head -12 | sed 's/^/      /'
+          done
+          echo '===================== END MIGCOM STREAM CENSUS ====================='
+
           echo "Stage 6 verdict: installhdrs=$hdrs_rc install=$build_rc"
           if [ "$build_rc" != 0 ] || [ "$hdrs_rc" != 0 ]; then
             echo "::error::Stage 6 failed (installhdrs=$hdrs_rc install=$build_rc)"

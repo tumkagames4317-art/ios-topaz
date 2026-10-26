@@ -262,6 +262,28 @@ fi
 
 echo "migcom-shim: hoisted subsystem statement to top of input" >&2
 
+# --- (4a) MIGCOM_SHIM_DUMP: capture the EXACT stream fed to migcom ----------
+# Off by default. When MIGCOM_SHIM_DUMP names a directory, write the hoisted
+# stream there as <label>.stream so the log can answer questions we keep
+# guessing at:
+#     grep -c 'MACHNINE_TYPES_DEFS' <label>.stream   expect 2 (ifndef+define)
+#     grep -cE '^[[:blank:]]*type[[:blank:]]+short[[:blank:]]*=' <label>.stream
+#                                                    2 => cpp emitted it twice
+#     grep -nE '^[[:blank:]]*# *[0-9]+ "' <label>.stream   which file each block opens
+# argv goes on line 1 in a comment so the file is self-describing.
+if [ -n "${MIGCOM_SHIM_DUMP:-}" ]; then
+  mkdir -p "$MIGCOM_SHIM_DUMP" 2>/dev/null || true
+  _lbl=$(printf '%s' "${args[*]}" | tr -c 'A-Za-z0-9._-' '_' | cut -c1-80)
+  [ -n "$_lbl" ] || _lbl="stream"
+  _dst="$MIGCOM_SHIM_DUMP/$_lbl.stream"
+  {
+    printf '# migcom-shim argv: %s\n' "${args[*]}"
+    printf '# MACHNINE in env: %s\n' "$(env | grep -c MACHNINE || true)"
+    cat "$hoisted"
+  } > "$_dst" 2>/dev/null || true
+  echo "migcom-shim: DUMP wrote $_dst ($(wc -l < "$hoisted") stream lines)" >&2
+fi
+
 # --- (4b) PROVENANCE for duplicate type declarations ------------------------
 # GNU mig treats a repeated `type X = ...` as FATAL (parser.y:339 calls
 # error(); error() prints with no severity prefix; and warn() at error.c:55 is
