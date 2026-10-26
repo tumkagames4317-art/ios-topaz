@@ -2517,7 +2517,7 @@ jobs:
                     make -j"$(nproc)" migcom \
                       CC="$HOSTCC" CFLAGS="-O1 -w" \
                       TARGET_CC="$HOSTCC" \
-                      TARGET_CPPFLAGS="-I$XNUMACH" \
+                      TARGET_CPPFLAGS="-I$XNUMACH -I$GITHUB_WORKSPACE/dxb/xnu/bsd -I$GITHUB_WORKSPACE/dxb/xnu/EXTERNAL_HEADERS" \
                       TARGET_CFLAGS="-O1 -w" 2>&1 | tail -45
                     exit "${PIPESTATUS[0]}"
                   )
