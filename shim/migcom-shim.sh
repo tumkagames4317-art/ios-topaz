@@ -73,8 +73,9 @@ done
 inp=$(mktemp)
 real_out=$(mktemp)
 real_out2=$(mktemp)
+final=$(mktemp)
 hoisted=$(mktemp)
-trap 'rm -f "$inp" "$real_out" "$real_out2" "$hoisted"' EXIT
+trap 'rm -f "$inp" "$real_out" "$real_out2" "$hoisted" "$final"' EXIT
 
 cat > "$inp"
 
@@ -189,4 +190,37 @@ if [ "$awk_rc" -ne 0 ]; then
 fi
 
 echo "migcom-shim: hoisted subsystem statement to top of input" >&2
+
+# --- (5) supply mach_msg_type_number_t, which Apple's mig has built in -----
+# Run 40396625873 got past SameCount (9 markers converted) and then failed at
+#     task.defs, line 278: type 'mach_msg_type_number_t' not defined
+# twice more at :296 and :563 -- exactly the CountCnt parameters the SameCount
+# rewrite above inserts.
+#
+# Why it is not defined: Apple's mig treats mach_msg_type_number_t as a
+# BASIC TYPE. bootstrap_cmds migcom.tproj/type.c:653 sets it directly
+#     it->itName = "mach_msg_type_number_t";
+# and :623 calls itCheckDecl("mach_msg_type_number_t", itElement).
+# GNU mig's built-ins (type.c init_type, 897-...) are only:
+#     unsigned char, kern_return_t, char *, mach_port_t
+# integer_t/natural_t are covered because machine_types.defs:80-81 declares
+# them; mach_msg_type_number_t appears in NO .defs in the tree.
+#
+# The correct declaration is spelled exactly as machine_types.defs declares
+# natural_t, so it lands in the same size/alignment family:
+#     type mach_msg_type_number_t = natural_t;
+# It is injected immediately after the hoisted `subsystem ...;` statement so
+# it precedes every use and sits inside a valid basic-type context.
+if ! grep -qE '^[[:blank:]]*type[[:blank:]]+mach_msg_type_number_t' "$hoisted"; then
+  # Insert right after the semicolon that terminates `subsystem ...;`.
+  # grab is set when the subsystem line is seen, and the insert happens on
+  # the FIRST subsequent line containing ';' -- which is that terminator.
+  awk '
+    !grab && /^[ \t]*subsystem([ \t]|$)/ { grab = 1; print; next }
+    grab && !done && /;/ { print; print "type mach_msg_type_number_t = natural_t;"; done = 1; next }
+    { print }
+  ' "$hoisted" > "$final" && cp "$final" "$hoisted"
+  echo "migcom-shim: injected type mach_msg_type_number_t = natural_t (Apple built-in, absent from all .defs)" >&2
+fi
+
 exec "$real" "${args[@]}" < "$hoisted"
