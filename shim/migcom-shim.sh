@@ -179,16 +179,33 @@ if ! grep -qE '^[[:blank:]]*subsystem([[:blank:]]|$)' "$real_out2"; then
 fi
 
 awk '
-  BEGIN { grab = 0; nb = 0; ss = "" }
+  BEGIN { grab = 0; nb = 0; ss = ""; nl = 0 }
   {
     line = $0
     sub(/^[ \t]+/, "", line)
   }
+  # A line-directive must NEVER enter the subsystem block. GNU migs grammar is
+  #     Subsystem : SubsystemStart SubsystemMods SubsystemName SubsystemBase
+  # and SubsystemMods (parser.y:229-245) accepts only syKernelUser /
+  # syKernelServer. cpp emits `# 64 "exc.defs"` markers constantly, and exc.defs
+  # really is
+  #     subsystem
+  #     #if KERNEL_SERVER || KOBJECT_SERVER   -> KernelServer
+  #     #if KERNEL_USER                       -> KernelUser
+  #              exc 2401;
+  # so after cpp the block has # markers interleaved. Hoisting them verbatim
+  # produced `subsystem # 64 ... KernelServer ...` and GNU mig filed no
+  # subsystem at all, then every routine hit
+  #     mig: fatal: no SubSystem declaration     (global.c:76, after yyparse)
+  # which is what 12 MIG targets died on in run 40399841763 / a120648.
+  # Keep the markers in the residual stream; drop them from the hoisted block.
+  !grab && /^[ \t]*#/ { lines[++n] = $0; next }
   !grab && line ~ /^subsystem([ \t]|$)/ { grab = 1 }
   grab {
+    if ($0 ~ /^[ \t]*#/) next      # line-directive inside the block: skip
     ss = ss $0 "\n"
     # The statement ends at the first semicolon, which may be on the
-    # `subsystem` line itself or after intervening #ifdef/#endif lines.
+    # `subsystem` line itself or after the mode keywords and name.
     if ($0 ~ /;/) { grab = 0; nb++ }
     next
   }
@@ -199,7 +216,6 @@ awk '
     for (i = 1; i <= n; i++) print lines[i]
   }
 ' "$real_out2" > "$hoisted"
-
 awk_rc=$?
 if [ "$awk_rc" -ne 0 ]; then
   echo "migcom-shim: WARNING: could not hoist subsystem (awk rc=$awk_rc); passing through unchanged" >&2
