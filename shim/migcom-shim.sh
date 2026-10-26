@@ -280,6 +280,14 @@ echo "migcom-shim: hoisted subsystem statement to top of input" >&2
   awk '
     /^[ \t]*#/ && /"/ {
       # cpp line marker: # <num> "<file>" [flags]
+      # A marker RESETS the logical line number; it does not report the line
+      # of anything. cpp only emits a marker when the numbering is about to
+      # jump, so every line after it advances the count by one. The first
+      # version of this dump printed the MARKER number for each declaration,
+      # which is why it claimed std_types.defs:65 for both `int64` and `char`
+      # when they are really on :85 and :91 -- and why it reported a bogus
+      # "same file:line x2", sending the lead and me hunting for a double
+      # include that does not exist. Track the number; do not read it.
       f = $0
       sub(/^[ \t]*#[ \t]*[0-9]+[ \t]+"/, "", f)
       sub(/".*$/, "", f)
@@ -287,7 +295,7 @@ echo "migcom-shim: hoisted subsystem statement to top of input" >&2
       l = $0
       sub(/^[ \t]*#[ \t]*/, "", l)
       sub(/[ \t]+".*$/, "", l)
-      curline = l
+      curline = l + 0          # marker N means the NEXT line is N
       next
     }
     /^[ \t]*type[ \t]+(short|int|uintptr_t|intptr_t|int64|char|natural_t)[ \t]*=/ {
@@ -296,7 +304,10 @@ echo "migcom-shim: hoisted subsystem statement to top of input" >&2
       sub(/[ \t]*=.*$/, "", n)
       print "    " n " @ " cur ":" curline
       seen[cur ":" curline]++
+      curline++
+      next
     }
+    { curline++ }
     END {
       d = 0
       for (k in seen) if (seen[k] > 1) { print "    DUPLICATE (same file:line " k " x" seen[k] ")" ; d++ }

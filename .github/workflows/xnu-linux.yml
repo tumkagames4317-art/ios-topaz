@@ -1,5 +1,10 @@
 name: xnu-linux
 
+# HOUSE RULE (cost us one reconstructed edit):
+#   Run `git status` BEFORE any command that discards work --
+#   git checkout -- <path>, git restore, git reset --hard, git stash drop.
+#   Uncommitted edits in this tree are the only copy.
+#
 # Build kernel.development.sweet for platform=ginkgo on a Linux runner.
 #
 # Why this exists: xnu.yml runs on macos-14 and every dispatch since
