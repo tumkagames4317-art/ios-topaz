@@ -1556,17 +1556,31 @@ jobs:
             fi
             # Classify the failure, because the three classes need three
             # different remedies and "17 skipped" is what let this sit for a
-            # whole night:
-            #   NO-BASE   repository lacks the necessary blob
-            #             -> generated against a tree state we do not have
-            #   INDEX     does not exist/match index
-            #             -> plumbing; a created file was never staged
-            #   CONFLICT  patch does not apply
-            #             -> genuine context mismatch
+            # whole night.
+            #
+            # ORDER MATTERS. `git apply --3way` prints a CASCADE and matching
+            # on the phrase it emits FIRST misclassifies. On a patch with no
+            # reachable base it prints all of:
+            #
+            #   error: repository lacks the necessary blob to perform 3-way merge.
+            #   Falling back to direct application...
+            #   error: patch failed: bsd/dev/sweet_ufs.c:305
+            #   error: bsd/dev/sweet_ufs.c: patch does not apply
+            #
+            # The blob line is the reason the MERGE was skipped. The "patch does
+            # not apply" line is the reason the PATCH failed. This block tested
+            # the blob phrase first, so run 40422249992 labelled 0034 -- a
+            # genuine context conflict -- as [NO-BASE]. Test the OUTCOME before
+            # the reason:
+            #
+            #   INDEX     does not exist/match index   plumbing, never staged
+            #   CONFLICT  patch does not apply         genuine context mismatch
+            #   NO-BASE   lacks the blob AND did not fail on its own context
             threeway=$(git apply --3way "$p" 2>&1 || true)
             case "$threeway" in
-              *"lacks the necessary blob"*) cls=NO-BASE ;;
               *"does not exist in index"*|*"does not match index"*) cls=INDEX ;;
+              *"patch does not apply"*|*"patch failed:"*) cls=CONFLICT ;;
+              *"lacks the necessary blob"*) cls=NO-BASE ;;
               *) cls=CONFLICT ;;
             esac
             git checkout -- . 2>/dev/null || true
@@ -2691,6 +2705,11 @@ jobs:
             #     typedef u_int8_t uint8_t;
             # Decide once, from the argv, and let both blocks below share it.
             echo 'XNU_NEEDS_PRELUDE=-1'
+            # SDK headers the kernel normally gets from Xcode. Added to the
+            # include path (not force-included) so <TargetConditionals.h> and
+            # <mach/mig_support.h> resolve exactly where they are referenced,
+            # and only for C/C++ translation units.
+            echo 'XNU_SDK_SHIM_I="-I${GITHUB_WORKSPACE}/shim"'
             echo 'XNU_LANG=""'
             echo 'for ((_i=0; _i<${#args[@]}; _i++)); do'
             echo '  _a="${args[$_i]}"'
@@ -2713,6 +2732,9 @@ jobs:
             echo '      *.s|*.S|*.asm|*.sx) XNU_NEEDS_PRELUDE=-1 ;;'
             echo '    esac'
             echo '  done'
+            echo 'fi'
+            echo 'if [ "$XNU_NEEDS_PRELUDE" = "1" ]; then'
+            echo '  args=("$XNU_SDK_SHIM_I" "${args[@]}")'
             echo 'fi'
             echo 'if [ "$XNU_NEEDS_PRELUDE" = "1" ] && [ -f "${GITHUB_WORKSPACE}/shim/xnu-kalloc-compat.h" ]; then'
             echo '  args=(-include "${GITHUB_WORKSPACE}/shim/xnu-kalloc-compat.h" "${args[@]}")'
@@ -3829,6 +3851,11 @@ jobs:
             #     typedef u_int8_t uint8_t;
             # Decide once, from the argv, and let both blocks below share it.
             echo 'XNU_NEEDS_PRELUDE=-1'
+            # SDK headers the kernel normally gets from Xcode. Added to the
+            # include path (not force-included) so <TargetConditionals.h> and
+            # <mach/mig_support.h> resolve exactly where they are referenced,
+            # and only for C/C++ translation units.
+            echo 'XNU_SDK_SHIM_I="-I${GITHUB_WORKSPACE}/shim"'
             echo 'XNU_LANG=""'
             echo 'for ((_i=0; _i<${#args[@]}; _i++)); do'
             echo '  _a="${args[$_i]}"'
@@ -3851,6 +3878,9 @@ jobs:
             echo '      *.s|*.S|*.asm|*.sx) XNU_NEEDS_PRELUDE=-1 ;;'
             echo '    esac'
             echo '  done'
+            echo 'fi'
+            echo 'if [ "$XNU_NEEDS_PRELUDE" = "1" ]; then'
+            echo '  args=("$XNU_SDK_SHIM_I" "${args[@]}")'
             echo 'fi'
             echo 'if [ "$XNU_NEEDS_PRELUDE" = "1" ] && [ -f "${GITHUB_WORKSPACE}/shim/xnu-kalloc-compat.h" ]; then'
             echo '  args=(-include "${GITHUB_WORKSPACE}/shim/xnu-kalloc-compat.h" "${args[@]}")'
