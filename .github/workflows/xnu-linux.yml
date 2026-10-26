@@ -140,12 +140,22 @@ jobs:
             echo "llvm install attempt $attempt failed; retrying after 10s"
             sleep 10
           done
-          sudo update-alternatives --install /usr/bin/clang    clang    /usr/bin/clang-15    100
-          sudo update-alternatives --install /usr/bin/clang++  clang++  /usr/bin/clang++-15  100
-          sudo update-alternatives --install /usr/bin/ld.lld   ld.lld   /usr/bin/ld.lld-15   100
+          # clang-15 is a reproducibility preference, not a requirement: the
+          # image already ships clang 18 + bison + flex + perl. Register the
+          # alternatives only when clang-15 is really there, so a mirror that
+          # never delivers LLVM leaves a working toolchain instead of a
+          # failing step (update-alternatives would otherwise die on a
+          # missing /usr/bin/clang-15 and take the whole job with it).
+          if [ -x /usr/bin/clang-15 ]; then
+            sudo update-alternatives --install /usr/bin/clang    clang    /usr/bin/clang-15    100
+            sudo update-alternatives --install /usr/bin/clang++  clang++  /usr/bin/clang++-15  100
+            sudo update-alternatives --install /usr/bin/ld.lld   ld.lld   /usr/bin/ld.lld-15   100
+          else
+            echo "clang-15 not installed; falling back to the image toolchain"
+          fi
           clang --version
-          llvm-ar-15 --version | head -1
-          for t in clang bison flex m4 perl git jq curl make; do
+          llvm-ar-15 --version | head -1 || llvm-ar --version | head -1
+          for t in clang bison flex m4 perl git jq curl make ld.lld llvm-ar; do
             printf '%-8s %s\n' "$t" "$(command -v $t || echo MISSING)"
           done
           perl -MList::Util=pairs -e 'print "perl List::Util ok\n"'
