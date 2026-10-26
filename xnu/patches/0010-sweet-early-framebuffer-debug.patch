@@ -145,7 +145,7 @@ new file mode 100644
 index 0000000..8f4c808
 --- /dev/null
 +++ b/osfmk/arm64/sweet_early.c
-@@ -0,0 +1,130 @@
+@@ -0,0 +1,137 @@
 +/*
 + * Redmi Note 10 Pro bootstrap console. No allocation, locks, ADT parsing or
 + * per-CPU state: panic() can reach this before a current thread exists.
@@ -255,7 +255,14 @@ index 0000000..8f4c808
 +void
 +sweet_early_panic(const char *fmt, va_list *args)
 +{
-+	if (early_disabled || early_panicking) {
++	/*
++	 * Deliberately ignore early_disabled. arm_vm_init turns the console off
++	 * just before TTBR0 is invalidated, and a panic in that window is
++	 * precisely what this hook exists for. Drawing into an already dead
++	 * mapping is harmless; staying silent throws away the only diagnostic
++	 * channel the board has.
++	 */
++	if (early_panicking) {
 +		return;
 +	}
 +	early_panicking = 1;
