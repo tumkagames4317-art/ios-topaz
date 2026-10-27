@@ -4335,6 +4335,17 @@ jobs:
           # than something we have to remember to grep for.
           nerr=$(grep -c '::error::' "$GITHUB_WORKSPACE"/*.log 2>/dev/null | awk -F: '{s+=$2} END{print s+0}')
           echo "############ truth check ############"
+          # If this run carried skip_patches, say so BEFORE any count, so the
+          # number cannot be read without the fact that it describes a tree
+          # that deliberately lost patches. Artifacts from such a run are not
+          # kernel candidates and the label travels with the log.
+          if [ -n "${SKIP_PATCHES:-}" ]; then
+            echo "################################################################"
+            echo "## MEASUREMENT-ONLY TREE: skip_patches=${SKIP_PATCHES}"
+            echo "## NOT A KERNEL CANDIDATE. Error counts below describe a tree"
+            echo "## missing those patches; they measure the shims, not the port."
+            echo "################################################################"
+          fi
           echo "::error:: count in build logs: ${nerr:-0}"
           echo "If this is non-zero while the run concludes 'success', the run is lying."
           echo "############ kernels produced ############"
