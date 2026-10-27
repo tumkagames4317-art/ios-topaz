@@ -4351,6 +4351,67 @@ jobs:
           echo "############ kernels produced ############"
           find dxb/fakeroot -name 'kernel.*' -exec ls -la {} \; 2>/dev/null || true
 
+      # ---------------------------------------------- collapsecnt (exception ports)
+      - name: "Stage 6b: collapse GNU mig's exception-port arity to Apple's 7"
+        # continue-on-error ON THE NEW STEP ONLY, never on Stage 6 (lead rule 3).
+        # If the transform refuses, the header is left byte-identical by design
+        # and Stage 6 still runs and still reports its counts -- we lose the
+        # fix for this class, not the measurement of every other class.
+        if: always()
+        continue-on-error: true
+        run: |
+          # Thread/task exception_ports prototypes: GNU mig emits 11 parameters
+          # where Apple's kern/thread.h and kern/task.h declare 7, because mig
+          # adds a *CountCnt parameter the way Apple's own mig does not, and
+          # renders `exception_handler_array_t` where Apple writes
+          # `exception_port_array_t`. `conflicting types` follows.
+          #
+          # shim/collapsecnt.sh does the transform under four gates and installs
+          # ONLY through `cat "$tmp/new" > "$hdr"`, so a refusal leaves the
+          # header untouched rather than half-written. The oracle is Apple's
+          # own header -- untouched by us, which is the whole reason it is worth
+          # comparing against.
+          set -o pipefail
+          SH="$GITHUB_WORKSPACE/shim/collapsecnt.sh"
+          if [ ! -f "$SH" ]; then
+            echo "::error::collapsecnt.sh is not present -- the fix is NOT in force"
+            exit 1
+          fi
+          echo "collapsecnt present: $(wc -c < "$SH") bytes"
+          # Positive control BEFORE touching anything: prove the pattern the
+          # script keys on actually occurs in this tree. If it does not, the
+          # transform is vacuous and a green result would mean nothing.
+          n_markers=$(grep -rlE 'exception_handler_array_t|CountCnt'                         dxb/build/xnu.obj/EXPORT_HDRS                         $(find dxb -name '*_server.h' -printf '%p ' 2>/dev/null)                         2>/dev/null | wc -l)
+          echo "generated headers carrying an exception-port shape: $n_markers"
+          if [ "$n_markers" -eq 0 ]; then
+            echo "::warning::no generated header carries the shape; nothing to do"
+            echo "collapsecnt: VACUOUS (0 candidate headers)" | tee -a "$GITHUB_WORKSPACE/build.log"
+            exit 0
+          fi
+          n_refuse=0; n_done=0
+          while read -r hdr; do
+            for spec in \
+              "thread_act:thread_set_exception_ports:image/thread_act.h" \
+              "thread_act:thread_swap_exception_ports:" \
+              "thread_act:thread_get_exception_ports_info:" ; do
+              routine=${spec#*:}; routine=${routine%%:*}
+              oracle=kern/thread.h
+              case "$hdr" in *task*) oracle=kern/task.h ;; esac
+              if bash "$SH" "$hdr" "dxb/xnu/osfmk/$oracle" "$routine" 7 \
+                   >> "$GITHUB_WORKSPACE/build.log" 2>&1; then
+                n_done=$((n_done+1))
+              else
+                n_refuse=$((n_refuse+1))
+              fi
+            done
+          done < <(grep -rlE 'exception_handler_array_t|CountCnt' \
+                     dxb/build/xnu.obj/EXPORT_HDRS \
+                     $(find dxb -name '*_server.h' -printf '%p ' 2>/dev/null) \
+                     2>/dev/null)
+          echo "collapsecnt: $n_done applied, $n_refuse refused (refusal leaves the header untouched)"
+          echo "collapsecnt: applied=$n_done refused=$n_refuse at $(date -u)" \
+            | tee -a "$GITHUB_WORKSPACE/build.log"
+
       - name: Snapshot generated headers (conflicting-types evidence)
         if: always()
         run: |
