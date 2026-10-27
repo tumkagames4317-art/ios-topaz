@@ -1636,15 +1636,57 @@ jobs:
             #   CONFLICT  patch does not apply         genuine context mismatch
             #   NO-BASE   lacks the blob AND did not fail on its own context
             threeway=$(git apply --3way "$p" 2>&1 || true)
+            # The four lines are a CASCADE carrying TWO INDEPENDENT FACTS, and
+            # neither may be inferred from a single line. Testing one phrase
+            # first just moves which class swallows the others -- it did that
+            # twice: first NO-BASE swallowed CONFLICT (40422249992), then
+            # CONFLICT swallowed NO-BASE (40424319776, this patch, 0047).
+            #
+            #   INDEX   does not exist / does not match index   -> never staged
+            #   NO-BASE "lacks the necessary blob" PRESENT ANYWHERE -> we do not
+            #           have the tree the patch was cut from; the "patch does
+            #           not apply" beneath it is the FALLBACK's opinion, not a
+            #           verdict about whether the patch and tree disagree
+            #   CONFLICT blob ABSENT and "patch does not apply" present -> the
+            #           merge was actually attempted and failed on context
+            #   UNCLASSIFIED  anything else. A default is a conclusion; this is
+            #           an admission, and the admissions have been right.
             case "$threeway" in
-              *"does not exist in index"*|*"does not match index"*) cls=INDEX ;;
-              *"patch does not apply"*|*"patch failed:"*) cls=CONFLICT ;;
-              *"lacks the necessary blob"*) cls=NO-BASE ;;
-              *) cls=CONFLICT ;;
+              *"does not exist in index"*|*"does not match index"*)
+                cls=INDEX ;;
+              *"lacks the necessary blob"*)
+                cls=NO-BASE ;;
+              *"patch does not apply"*|*"patch failed:"*)
+                cls=CONFLICT ;;
+              *)
+                cls=UNCLASSIFIED ;;
             esac
-            git checkout -- . 2>/dev/null || true
-            git reset -q 2>/dev/null || true
-            git add -A 2>/dev/null || true
+            # UNDO THIS PATCH ONLY -- nothing subtree-wide.
+            #
+            # Plain `git reset` is --mixed to HEAD, which UNSTAGES EVERY PATCH
+            # APPLIED SO FAR and destroys exactly the staged state af37e6d
+            # exists to build. It was harmless only because every path reaching
+            # this line used to end in `exit 1`; an allowlisted skip takes the
+            # same path and would have silently un-staged the whole tree.
+            # `git reset --hard` would be worse: it discards the applied file
+            # content as well.
+            #
+            # So scope the undo to the files THIS patch touches, and only where
+            # git can reverse it cleanly. Anything left in a conflicted state is
+            # exactly what we want to see rather than paper over.
+            files=$(grep -E '^\+\+\+ b/' "$p" | sed 's|^+++ b/||')
+            for f in $files; do
+              if git apply --reverse --check "$p" >/dev/null 2>&1; then
+                git apply --reverse "$p" >/dev/null 2>&1 || true
+                break
+              fi
+              # Patch did not land, so restore just this file from the index,
+              # falling back to HEAD for files git has never tracked.
+              if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then
+                git checkout -- "$f" 2>/dev/null || true
+              fi
+            done
+            git add -A -- $files 2>/dev/null || true
             case " $ALLOW_SKIP " in
               *" $name "*)
                 n_skip=$((n_skip+1))
