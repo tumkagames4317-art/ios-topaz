@@ -1501,6 +1501,27 @@ jobs:
             echo "  ALLOW-SKIP  $a" >> "$PATCH_REPORT"
           done
 
+          # ------------------------------------------------------------------
+          # ONE FILE PER PATCH NUMBER. Night of 2026-10-26/27: a re-anchored
+          # 0034 was committed as 0034b BESIDE the old 0034. Both matched
+          # ../patches/*.patch, both would apply, and both define REG_CAP and
+          # CAP_64AS -- so the second would either fail or duplicate the
+          # defines. Nothing anywhere would have said so; the loop reports a
+          # patch failure, not "you have two files for one number".
+          #
+          # A duplicate-name check is the cheapest guard here and it makes the
+          # collision impossible to reintroduce rather than merely fixed.
+          # ------------------------------------------------------------------
+          dupes=$(ls ../patches/*.patch 2>/dev/null | xargs -n1 basename \
+                  | sed -E 's/^([0-9]{4})[a-z]?-.*/\1/' | sort | uniq -d)
+          if [ -n "$dupes" ]; then
+            echo "::error::two patch files share a number: $(echo $dupes | tr '\n' ' ')"
+            ls ../patches/*.patch | xargs -n1 basename | grep -E "^($(echo $dupes | tr ' ' '|'))" || true
+            echo "Exactly one file per 4-digit number, or the apply order is ambiguous."
+            exit 1
+          fi
+          echo "patch numbering: $(ls ../patches/*.patch | wc -l) files, one per number"
+
           n_ok=0; n_3way=0; n_skip=0
           for p in ../patches/*.patch; do
             [ -e "$p" ] || continue
@@ -4307,17 +4328,6 @@ jobs:
           # than something we have to remember to grep for.
           nerr=$(grep -c '::error::' "$GITHUB_WORKSPACE"/*.log 2>/dev/null | awk -F: '{s+=$2} END{print s+0}')
           echo "############ truth check ############"
-          # If this run carried skip_patches, say so BEFORE any count, so the
-          # number cannot be read without the fact that it describes a tree
-          # that deliberately lost patches. Artifacts from such a run are not
-          # kernel candidates and the label travels with the log.
-          if [ -n "${SKIP_PATCHES:-}" ]; then
-            echo "################################################################"
-            echo "## MEASUREMENT-ONLY TREE: skip_patches=${SKIP_PATCHES}"
-            echo "## NOT A KERNEL CANDIDATE. Error counts below describe a tree"
-            echo "## missing those patches; they measure the shims, not the port."
-            echo "################################################################"
-          fi
           echo "::error:: count in build logs: ${nerr:-0}"
           echo "If this is non-zero while the run concludes 'success', the run is lying."
           echo "############ kernels produced ############"
