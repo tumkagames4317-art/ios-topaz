@@ -58,23 +58,6 @@ on:
       deep:
         description: also attempt the mig/migcom host tools and the ld64 link
         default: "true"
-      skip_patches:
-        # DIAGNOSTIC ONLY, and empty by default so the normal path keeps the
-        # fail-hard policy from 537ed78. A comma-separated list of patch
-        # basenames to leave out of this run, e.g. "0034".
-        #
-        # Why this exists: 0034-sweet-ufs-dma-above-4g.patch cannot apply at
-        # all (its context, "requests outstanding from the bootloader", occurs
-        # nowhere else in the repository -- 0028 creates bsd/dev/sweet_ufs.c
-        # without that text), so Stage 3 now correctly refuses and Stages 4-6
-        # never run. That is the right default. But it also means no change to
-        # the toolchain shims can be measured, because the build stops before
-        # any kernel object is compiled. This input lets a run skip a known-
-        # dead patch to get a measurement, and the skip is announced loudly in
-        # the log and in the summary so a skipped run can never be mistaken
-        # for a clean one.
-        description: "DIAGNOSTIC: comma-separated patch prefixes to skip (e.g. 0034)"
-        default: ""
 
 concurrency:
   # Strictly per-run. Several people dispatch this workflow on the same
@@ -96,10 +79,6 @@ env:
   MACOS_VERSION: "13.5"
   KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
   MACHINE_CONFIG: ${{ inputs.machine_config || 'SWEET' }}
-  # DIAGNOSTIC ONLY. Empty unless someone passes skip_patches, and Stage 3
-  # announces every skip with "SKIPPED BY REQUEST" so such a run is never
-  # mistaken for a clean build. See the input's comment for why it exists.
-  SKIP_PATCHES: ${{ inputs.skip_patches || '' }}
   # Empty tree shaped like an Xcode SDK/platform, so the paths makedefs
   # derives from `xcrun` have the structure its sed/notdir expect.
   FAKE_PLATFORMS: /opt/xcodeshim/Platforms
@@ -1523,47 +1502,9 @@ jobs:
           done
 
           n_ok=0; n_3way=0; n_skip=0
-          # DIAGNOSTIC SKIP (see the skip_patches input). Empty by default, so
-          # this loop is fail-hard in every normal run. When set, each skipped
-          # patch is printed with a banner that says SKIPPED BY REQUEST and the
-          # run summary carries the same string, because a build that silently
-          # lost a patch is the exact failure mode 537ed78 exists to prevent.
-          SKIP_LIST="$(echo "${SKIP_PATCHES:-}" | tr ',' ' ')"
-          if [ -n "${SKIP_LIST// /}" ]; then
-            echo "::warning::skip_patches is set -- this run is a DIAGNOSTIC, not a clean build"
-            # The warning above goes to the STEP log. The step log is not the
-            # artefact we analyse -- build.log is. A bypass visible only in the
-            # channel nobody reads is the same defect as the `*-topaz-*` filter
-            # and the bare `SKIPPED` lines: state that persists unannounced.
-            # So the marker goes into build.log as well, so that every count in
-            # this log is accompanied by the fact that it describes a tree that
-            # deliberately lost patches.
-            {
-              echo "################################################################"
-              echo "## MEASUREMENT-ONLY TREE"
-              echo "## skip_patches=${SKIP_PATCHES}"
-              echo "## Every error count in this log describes a tree that is"
-              echo "## MISSING the patches named below. Any number here measures"
-              echo "## the toolchain shims, NOT a kernel candidate."
-              echo "################################################################"
-            } >> "$GITHUB_WORKSPACE/build.log"
-            for sk in $SKIP_LIST; do
-              echo "  SKIPPED BY REQUEST: patches matching '$sk*'"
-              echo "SKIPPED BY REQUEST: $sk*" >> "$PATCH_REPORT"
-            done
-          fi
           for p in ../patches/*.patch; do
             [ -e "$p" ] || continue
             name=$(basename "$p")
-            _skipped=0
-            for sk in $SKIP_LIST; do
-              case "$name" in "$sk"*) _skipped=1 ;; esac
-            done
-            if [ "$_skipped" = "1" ]; then
-              echo "SKIPPED BY REQUEST  $name  (skip_patches=${SKIP_PATCHES})" | tee -a "$PATCH_REPORT"
-              n_skip=$((n_skip + 1))
-              continue
-            fi
             if git apply --check "$p" >/dev/null 2>&1; then
               git apply "$p"
               # ------------------------------------------------------------------
@@ -4257,17 +4198,6 @@ jobs:
           # decide it from the bytes rather than from reasoning about guards.
 
           echo "Stage 6 verdict: installhdrs=$hdrs_rc install=$build_rc"
-
-          # A run that skipped a patch did not build the tree anyone asked for.
-          # Say so at the top of the summary, in the same words Stage 3 used,
-          # so nobody reads a diagnostic result as a shipping one.
-          if [ -n "${SKIP_PATCHES// /}" ]; then
-            echo "::warning::DIAGNOSTIC RUN -- skipped patches: ${SKIP_PATCHES}. Not a clean build."
-            echo "DIAGNOSTIC RUN -- skipped patches: ${SKIP_PATCHES}"
-            echo "  The numbers below describe a tree that is missing those patches."
-          else
-            echo "No patches skipped (clean tree)."
-          fi
 
           # --- REPLAY: feed a captured stream straight back to the real migcom
           # The captures and migcom's own errors still disagree. Every stream we
