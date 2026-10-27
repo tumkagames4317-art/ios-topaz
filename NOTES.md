@@ -58,6 +58,119 @@ from 257; treat that as a prediction, not a result, until counted.
 
 Cleared: drop the skip_patches workaround for 0034 -- the real fix (ae4d530)
 is in, and skipping was proven to break the order-coupled 0047 anyway.
+## 03:55 MSK 2026-10-27 -- 0034 re-anchored and validated; Actions disabled by minute quota
+
+`KERNEL ARTIFACT: ABSENT`. Last measured: 46/139 patches, no compiler reached.
+Nothing since that measurement has run in CI, because Actions is disabled.
+
+### The blocker is now access, not code
+
+    gh workflow run ... -> HTTP 422: Actions has been disabled for this repository.
+
+Not a workflow bug (`actions/permissions` still says enabled, both workflows
+active). The billing API explains it: ~3,172 billable minutes this period
+(276 macOS at 10x = 2,760, plus 412 Linux) against the Free plan's 2,000. No
+dispatch is possible until the quota resets or the plan changes. **Do not spend
+another hour debugging the workflow before checking this.**
+
+### What is fixed and unmeasured (all committed, all locally validated)
+
+    0034-sweet-ufs-dma-above-4g.patch   RE-ANCHORED. Content unchanged.
+    bee8ade  one-patch-file-per-number guard in Stage 3 (fires both ways)
+    d9eaac1  skip_patches reverted, MEASUREMENT-ONLY banner removed
+    b7c8184  collapsecnt.sh wired as Stage 6b (never yet executed)
+    2bd7e3d  classifier: blob phrase => NO-BASE anywhere; git reset scoped
+    af37e6d  git add -A after every applied patch
+    537ed78  a failed patch is a hard failure; continue-on-error off Stage 3
+
+`0034` was dead because its base was never committed here (the whole patch set
+arrived as one bulk import, c6940af, carrying payloads and never applied tree
+states). It could not simply be skipped: it introduces `REG_CAP`, `CAP_64AS`
+and the DMA report in the attach printf, and EIGHT later patches require them
+(0047, 0054, 0060, 0069, 0072, 0080, 0088, 0127). Skipping it poisoned all of
+them; the one measurement run that tried stopped at 0047.
+
+Re-anchored by taking all 12 payload lines BYTE-IDENTICAL from 0034's own
+payload (asserted mechanically, `IDENTICAL: True`) and recomputing only the
+`@@` headers and context against the file the tree actually produces. No value,
+condition or printf format was chosen. That was the authoring boundary.
+
+### The reconstruction recipe -- keep this, it is the technique that worked
+
+Build the tree the way CI builds it, then test the patch against THAT:
+
+    robocopy <pristine xnu clone> <work> /E /XD .git
+    cd <work>; git init; git add -A; git commit -m base     # 4996 files
+    # apply 0001..0033 in order, `git add -A` after each
+    git apply --check <candidate.patch>
+
+Result: `sweet_ufs.c` is 620 lines with the anchors 0034 wants at 45/56/324/599,
+not 42/54/305/580. Testing against a reading of the file instead of against a
+built tree is what produced four wrong `@@` headers in a row.
+
+**Assert the repo root before any local test:**
+    [ "$(git rev-parse --show-toplevel)" = "$EXPECTED" ] || exit 1
+There is a stray git repo rooted at `C:/Users/User`, so anything created under
+`%TEMP%` is inside it and `git apply` reports `Skipped patch ...` with **rc 0**
+while creating nothing. That silently invalidated several local results tonight.
+
+### Verification that a re-anchor is correct (not merely applicable)
+
+Applicability is not enough -- a patch that applies but does not produce what
+its consumers need is the same "success reported, artifact wrong" shape:
+
+    consumers satisfied   REG_CAP, CAP_64AS, "DMA at 0x%llx", su.dma_pa,
+                          "64-bit DMA addressing", "no 64-bit addressing"
+                          -> 6/6 FOUND, MISSING=0 (MISSING>0 must exit 1)
+    the dependency test   0047 --check rc=0   (was NO-BASE before)
+
+The second line is the real proof: the dependent patch stops failing.
+
+### Two sentences that are now standing rules
+
+    "A decreasing error count is not evidence of progress if the denominator is shrinking."
+    "A check that has only ever seen good input has never been tested.
+     Prove it FIRES on bad input, locally, before it is allowed to decide a run."
+
+### Three silent-success mechanisms found tonight, all the same shape
+
+  * `*-topaz-*` filtered before apply -> 50 patches, no status line at all
+  * bare `SKIPPED` -> 17 patches, step log only, never in build.log
+  * `continue-on-error` on Stage 3 -> `exit 1` fired, Stage 6 built anyway,
+    run concluded `success`
+
+In each case the mechanism was visible in a log we had, and absence was read as
+agreement. A skip that is allowed is a decision; a skip that is silent is a lie.
+
+### Deliberately degraded, named so it is not silent
+
+  1. kalloc `type_discriminator` signatures (shim/xnu-kalloc-compat.h)
+  2. the `, const` drop (shim/xnu-const-string-compat.h)
+  3. 0034's DMA guard was absent until this re-anchor. Now present but
+     UNVERIFIED at runtime -- no run has compiled a tree carrying it.
+
+### Next concrete action, in order
+
+  1. **Re-enable Actions** (quota / plan). Nothing else can be measured without it.
+  2. Dispatch `platform=ginkgo`, no inputs. Expect Stage 3 to pass 0034 and reach
+     0047, and **0047 to APPLY** rather than fail NO-BASE. If it applies, the next
+     failure is one patch further down the same chain -- a better problem.
+  3. First failure: classify from the FOUR-line cascade, blob phrase anywhere =>
+     NO-BASE, else `patch does not apply` => CONFLICT, else UNCLASSIFIED.
+  4. Only after Stage 3 is green: read `CC / AS / C++` and the site count
+     TOGETHER, and say which tree they describe.
+
+### Runs and commits
+
+  runs: 40424319776 (skip_patches, 46 patches, stopped 0047),
+        40422754021 (34 patches, 0034 [CONFLICT]),
+        40422249992 (34 patches, 0034 [NO-BASE]),
+        40421681404 (33 patches, 0034 INDEX)
+  commits: bee8ade d9eaac1 ae4d530* f56b605* b071846* 2bd7e3d b7c8184 cedd99d
+           88bc6ef* 180b8b0 276dbf4* af37e6d 537ed78 f9a7c6b
+  (* = repository owner, committed outside our loop)
+
+
 ## 03:30 MSK 2026-10-27 -- Stage 3 is the blocker now: 0034 never applied, and the tree shipped a duplicate
 
 ### Where the build actually is
