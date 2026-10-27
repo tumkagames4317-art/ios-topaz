@@ -1,3 +1,153 @@
+## 03:30 MSK 2026-10-27 -- Stage 3 is the blocker now: 0034 never applied, and the tree shipped a duplicate
+
+### Where the build actually is
+
+    latest Stage-6 run         40420909266 (topaz @ af37e6d)
+    build.log                  2,846,606 lines
+    errors                     257   (was 881, then 582)
+    installhdrs=0 install=2    KERNEL ARTIFACT: ABSENT
+
+    40422754021 / 40424160774  RED at Stage 3, not Stage 6
+    Stage 4/5/6               never ran
+
+**No run has reached Stage 6 since `40420909266`.** Everything since then is
+blocked in Stage 3 by the patch chain, so the three shim changes below are
+committed and syntactically validated but **unmeasured**.
+
+### The blocking defect: 0034 was never applicable
+
+`0034-sweet-ufs-dma-above-4g.patch` failed at `bsd/dev/sweet_ufs.c:305`. It is
+not stale, it is **dead**:
+
+* its anchor `printf("SWEET UFS: requests outstanding from the bootloader\n");`
+  occurs **nowhere else in the repository** -- grepping every `.patch` and `.c`,
+  the only hit is inside 0034's own context;
+* `0028-sweet-ufs-root-device.patch` **creates** the file from `/dev/null`, and
+  the text it creates there is `the host will not clear its request doorbell
+  (0x%x)` followed by `return EBUSY;`.
+
+**So 0034 has never applied in any run.** Every earlier "green" build was built
+without the highmem DMA guard. That is precisely what `537ed78` (patch failure
+is fatal) exists to catch, so that change is correct -- it did not break
+anything, it surfaced a defect that had been silently swallowing a patch.
+
+`git apply --3way` says "repository lacks the necessary blob" for the same
+reason: the 588-line version 0034 was authored against never existed here.
+
+### How the correct patch was found, and by whom
+
+I reconstructed `bsd/dev/sweet_ufs.c` the way CI does -- a scratch git repo with
+`core.autocrlf=false`, fed only the `sweet_ufs.c` sections of 0028 then 0030,
+`git add -A` + commit after each -- giving a **620-line** file. Against it:
+
+    xnu/patches/0034-sweet-ufs-dma-above-4g.patch              rc=128
+        error: patch fragment without header ...:66: @@ -588,9 +596,9 @@
+    xnu/patches/0034b-sweet-ufs-dma-above-4g-reanchored.patch  rc=0
+
+`0034b` (authored in a parallel session) is correct and applies cleanly. My own
+independent re-anchor attempt returned rc=128 "patch fragment without header"
+because I had **computed** the hunk line numbers instead of **deriving** them
+from the file, so my numbers disagreed with my own hunk bodies. Same lesson as
+the top of this file: derive from the artifact, do not reason about it.
+
+I restored `0034` to its HEAD state and threw my version away.
+
+### WARNING -- HEAD currently has BOTH 0034 and 0034b, and that is still red
+
+    $ ls xnu/patches/0034*
+    0034-sweet-ufs-dma-above-4g.patch               (dead anchor, still present)
+    0034b-sweet-ufs-dma-above-4g-reanchored.patch   (correct)
+
+Stage 3 globs `../patches/*.patch`, which is **byte order**, so `0034` sorts
+first, fails, and stops the run before `0034b` is ever reached. And if 0034 is
+fixed in place *without* deleting 0034b, both add `REG_CAP`, `CAP_64AS` and the
+DMA guard to the same file and the second duplicates them.
+
+**`0034b` must REPLACE `0034`.** Delete one of them. As of `b071846` this was
+still unfixed; it is the single blocking item.
+
+### `skip_patches` does NOT work around this -- do not retry it
+
+`88bc6ef` added an off-by-default `skip_patches` input. It works as designed
+(`40424160774` printed `SKIPPED BY REQUEST  0034-sweet-ufs-dma-above-4g.patch`
+and advanced the chain), but it does not unblock anything: skipping 0034 makes
+`0047-sweet-persistent-console-log.patch` fail at `bsd/dev/sweet_ufs.c:37`,
+because 0047's context was authored against the tree **with** 0034's two
+inserted `#define` lines. **The sweet_ufs chain is order-coupled.**
+
+16 patches touch `bsd/dev/sweet_ufs.c` (0028 0030 0034 0047 0054 0060 0069 0072
+0077 0080 0083 0087 0088 0115 0127 0147), so any change to an early one shifts
+the rest. Treat that file as a serialized chain, never as independent patches.
+
+### Landed but UNMEASURED (all need a green Stage 3 to prove)
+
+1. **`276dbf4` -- the two SDK headers.** 257 errors were dominated by two
+   headers that are not in the xnu tree:
+   `osfmk/kern/debug.h:43` `#include <TargetConditionals.h>` (38x) and GNU mig's
+   unconditional `#include <mach/mig_support.h>` (`server.c:47`, `user.c:91` --
+   Apple's mig does not emit it, which is why upstream never ships it; 34x, every
+   generated `*_server.c`/`*_user.c`). `shim/mach/mig_support.h` is a
+   **forwarder**: every symbol is already declared at `osfmk/mach/mig.h:157-167`
+   and implemented in `osfmk/kern/ipc_mig.c` (verified: that file compiles with
+   0 errors and yields `ipc_mig.o` in the same run). It adds only
+   `mig_external` + `mig_unlikely`/`mig_likely`, each `#ifndef`-guarded.
+   `shim/TargetConditionals.h` asserts only what this build implies.
+   Both reached by `-I$(GITHUB_WORKSPACE)/shim` -- **not** force-included -- and
+   only for C/C++.
+2. **`+sha2+sha3` on the target `-march`.** 77 `invalid operand for instruction`
+   were `sha256su0 q0, q1` from `osfmk/arm64/corecrypto/sha256_compress_arm64.s`.
+   `-march=armv8.2-a+crypto+crc` alone was not enough.
+3. **`b7c8184` -- `collapsecnt.sh` wired into Stage 6b** (parallel session) for
+   the 278 exception-port errors. Also unmeasured.
+
+### Regression I introduced and fixed: preludes in the assembler
+
+`17b62ce`/`a234268` force-included the C compat headers on **every** invocation,
+so `.s`/`.S` units got C declarations and GNU as tried to assemble them -- 980
+errors in `40418094458`, 388 alone from `EXTERNAL_HEADERS/stdint.h:29`
+(`typedef u_int8_t uint8_t;`). `a0e81dc` classifies the invocation first:
+`-x <lang>` wins if present, else a decisive suffix scan, and **the default is
+disable** (opt-in, never opt-out).
+
+Two defects in my own first attempt, both caught by **running the generated
+shim** rather than reading it:
+
+* `assembler*` sat in the *enable* arm, so `-x assembler` turned the prelude
+  **on** -- the precise inversion the guard exists to prevent;
+* the default was enable and inferred "C" from any non-flag token, so
+  `foo.o bar.o -o out` injected headers into a link step.
+
+15/15 on the real generated shim: C/C++/ObjC/`.i`/`-x c` enable;
+`.s`/`.S`/`-x assembler`/`-x assembler-with-cpp`/link-only/mixed enable nothing.
+
+### Open, in priority order
+
+1. **Delete `0034-sweet-ufs-dma-above-4g.patch`, keep `0034b`.** Nothing else
+   matters until Stage 3 is green.
+2. Then measure 1-3 above from a real Stage 6 log.
+3. Remaining source-level errors seen in `40420909266`, neither mine:
+   * `osfmk/kern/host_notify.c:202` -- `msg` undeclared (4x). Line 200 declares
+     `__Request__host_calendar_changed_t msg;` and `host_notify_reply.defs:37`
+     is a `simpleroutine` that parses fine, yet `calendar_changed` appears
+     **nowhere** in `genhdr-snapshot/`. GNU mig is not emitting the `__Request__`
+     type for simpleroutines the way Apple's does.
+   * `osfmk/ipc/mach_kernelrpc.c:280` -- `expected expression` (4x), on
+     `_Static_assert(sizeof(MACH_PORT_INFO_OUT)...`; likely keys off the
+     SameCount collapse.
+
+### Runs and commits (this stretch)
+
+    88bc6ef  ci: off-by-default skip_patches input  (measured nothing; see above)
+    276dbf4  fix(cc): the two SDK headers the kernel build gets from Xcode
+    a0e81dc  fix(cc): preludes must never be force-included into assembly
+    (parallel) b7c8184 wire collapsecnt.sh / b071846 0034b / 537ed78 fail-hard
+
+    40424160774  RED Stage 3 -- 0034 skipped by request, 0047 then failed
+    40422754021  RED Stage 3 -- PATCH FAILED 0034 [CONFLICT]
+    40420909266  success  257 errors  (+sha2 pending, SDK headers absent)
+    40419596108  success  582 errors
+    40418094458  success  1,564 errors  (asm regression, mine)
+
 ## 02:15 MSK 2026-10-27 -- Stage 6 compiles XNU for real; 15,798 errors -> 215 sites
 
 ### Working method -- READ THIS BEFORE THE TECHNICAL FINDINGS
