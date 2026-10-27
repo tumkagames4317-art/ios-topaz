@@ -1,3 +1,63 @@
+ci(blocker): GitHub Actions is DISABLED -- Free-plan minute quota exhausted
+
+    gh workflow run xnu-linux.yml -R tumkagames4317-art/ios-topaz --ref topaz -f platform=ginkgo
+    could not create workflow dispatch event: HTTP 422:
+    Actions has been disabled for this repository.
+
+Not transient (retried), not a workflow bug: actions/permissions still reports
+{"enabled": true} and both workflows report state "active". Only the dispatch
+endpoint refuses.
+
+The billing API says why. Current period, repo ios-topaz:
+
+    Actions Linux          412.0 minutes
+    Actions macOS 3-core   276.0 minutes
+    Actions storage         48.0 GB-h
+
+macOS is billed at 10x on this plan, so 276 macOS minutes = 2,760 billable,
+plus 412 Linux = ~3,172 against the Free plan's 2,000 included minutes.
+
+This is the same constraint the workflow header has documented since it was
+written ("the account is on the Free plan (2,000 included minutes, macOS
+billed 10x) and the repository has zero self-hosted runners"). Moving the
+build to ubuntu-latest was meant to stop the 10x burn; ~30 iterations tonight
+used the rest anyway.
+
+Confirmations:
+
+  * POST /actions/runs/<old>/rerun is ACCEPTED (returns {}), not 422 -- but
+    the re-run then sits at status "queued" forever and cannot even be
+    cancelled: "Cannot cancel a workflow re-run that has not yet queued"
+    (HTTP 409). That is a queue that never dispatches, i.e. no quota.
+  * actions/runners -> {"total_count": 0}. No self-hosted fallback.
+
+CONSEQUENCE FOR THE DELIVERABLE
+
+A verified kernel.development.sweet cannot be produced until the quota resets
+or billing/runners change. The code path is ready and committed; it needs to
+execute once.
+
+Last measured Stage 6 (40420909266, af37e6d):
+
+    installhdrs=0  install=2   KERNEL ARTIFACT: ABSENT   257 errors
+
+Committed since, all UNMEASURED:
+
+    276dbf4   shim/TargetConditionals.h + shim/mach/mig_support.h
+              targets the 38 + 34 'file not found' errors
+    (in-tree) +sha2+sha3 on the target -march
+              targets the 77 'invalid operand for instruction' (sha256su0)
+    b7c8184   collapsecnt.sh wired into Stage 6b (parallel session)
+              targets the 278 exception-port 'conflicting types'
+    ae4d530   0034 replaced so Stage 3 can pass at all
+
+NEXT CONCRETE ACTION
+
+Wait for quota, then ONE dispatch. Expect a green Stage 3 and a large drop
+from 257; treat that as a prediction, not a result, until counted.
+
+Cleared: drop the skip_patches workaround for 0034 -- the real fix (ae4d530)
+is in, and skipping was proven to break the order-coupled 0047 anyway.
 ## 03:30 MSK 2026-10-27 -- Stage 3 is the blocker now: 0034 never applied, and the tree shipped a duplicate
 
 ### Where the build actually is
