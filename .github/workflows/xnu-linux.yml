@@ -1512,14 +1512,47 @@ jobs:
           # A duplicate-name check is the cheapest guard here and it makes the
           # collision impossible to reintroduce rather than merely fixed.
           # ------------------------------------------------------------------
-          dupes=$(ls ../patches/*.patch 2>/dev/null | xargs -n1 basename \
-                  | sed -E 's/^([0-9]{4})[a-z]?-.*/\1/' | sort | uniq -d)
-          if [ -n "$dupes" ]; then
-            echo "::error::two patch files share a number: $(echo $dupes | tr '\n' ' ')"
-            ls ../patches/*.patch | xargs -n1 basename | grep -E "^($(echo $dupes | tr ' ' '|'))" || true
-            echo "Exactly one file per 4-digit number, or the apply order is ambiguous."
+          # ------------------------------------------------------------------
+          # A SUFFIXED variant is the hazard, not a repeated number.
+          #
+          # The first version of this guard flagged any number appearing
+          # twice, and would have blocked Stage 3 on a healthy tree: 0013 is
+          # TWO unrelated patches that have coexisted since the bulk import
+          # (0013-sweet-kmem-rng-without-corecrypto, 0013-sweet-tolerate-
+          # missing-memory-map). A repeated plain number applies in a stable
+          # byte order and has always worked.
+          #
+          # 0034 + 0034b is different: a suffixed file is a REPLACEMENT for
+          # the same slot, so both matching the glob means either the old dead
+          # anchor runs first (proven: 2 applied, then FAILURE 0034 :305) or
+          # the content lands twice (duplicate REG_CAP / CAP_64AS defines).
+          # Only that shape is refused.
+          # ------------------------------------------------------------------
+          dupes=""
+          for p in ../patches/*.patch; do
+            [ -e "$p" ] || continue
+            n=$(basename "$p")
+            n=${n%%-*}
+            case "$n" in
+              [0-9][0-9][0-9][0-9]) continue ;;
+              [0-9][0-9][0-9][0-9]*)
+                base=$(printf '%s' "$n" | sed -E 's/[^0-9].*$//')
+                if ls ../patches/"$base"-*.patch >/dev/null 2>&1; then
+                  dupes="$dupes $base"
+                fi
+                ;;
+              *) continue ;;
+            esac
+          done
+          dupes=$(echo $dupes | tr ' ' '\n' | sort -u | tr '\n' ' ')
+          if [ -n "${dupes// /}" ]; then
+            echo "::error::a suffixed patch collides with a plain one:$dupes"
+            echo "A suffixed file is a REPLACEMENT for its slot, not an addition."
+            echo "Proof this shape is the hazard: both present => 2 applied then"
+            echo "FAILURE 0034 :305; ordinary repeated numbers (0013) are fine."
             exit 1
           fi
+          echo "patch numbering: $(ls ../patches/*.patch | wc -l) files, no suffixed collision"
           echo "patch numbering: $(ls ../patches/*.patch | wc -l) files, one per number"
 
           n_ok=0; n_3way=0; n_skip=0
@@ -2894,7 +2927,7 @@ jobs:
             #   234 type declarations, 234 DISTINCT names, 0 duplicates
             #   `type int64 = int64_t;` present once (line 43 of the capture)
             #   CR count 0; streql is plain strcmp (mig_string.h:43)
-            #   std_types.defs opens exactly once (one `# 1 "…std_types.defs" 1`)
+            #   std_types.defs opens exactly once (one `# 1 "вЂ¦std_types.defs" 1`)
             # yet migcom reports `overriding previous definition of int64` once
             # per invocation. itCheckDecl sets it->itName unconditionally
             # (type.c:401), so the alias chain cannot be the cause either, and
